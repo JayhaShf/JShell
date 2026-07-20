@@ -20,6 +20,14 @@ pub enum AuthMethod {
     Config,
 }
 
+fn default_protocol() -> String {
+    "ssh".to_string()
+}
+
+fn default_baud_rate() -> u32 {
+    115200
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
@@ -48,6 +56,10 @@ pub struct Session {
     pub proxy_user: String,
     #[serde(default)]
     pub proxy_password: String,
+    #[serde(default = "default_protocol")]
+    pub protocol: String,
+    #[serde(default = "default_baud_rate")]
+    pub baud_rate: u32,
 }
 
 impl Session {
@@ -70,6 +82,8 @@ impl Session {
             proxy_port: None,
             proxy_user: String::new(),
             proxy_password: String::new(),
+            protocol: "ssh".to_string(),
+            baud_rate: 115200,
         }
     }
 
@@ -99,6 +113,32 @@ impl Session {
             proxy_port: None,
             proxy_user: String::new(),
             proxy_password: String::new(),
+            protocol: "ssh".to_string(),
+            baud_rate: 115200,
+        }
+    }
+
+    pub fn serial(port_name: String, baud_rate: u32) -> Self {
+        let name = format!("serial://{port_name}@{baud_rate}");
+        Self {
+            id: Uuid::new_v4().to_string(),
+            name,
+            host: port_name,
+            port: 0,
+            user: String::new(),
+            auth: AuthMethod::Password,
+            password: String::new(),
+            private_key_path: String::new(),
+            private_key_inline: String::new(),
+            passphrase: String::new(),
+            last_used: None,
+            proxy_type: "none".to_string(),
+            proxy_host: String::new(),
+            proxy_port: None,
+            proxy_user: String::new(),
+            proxy_password: String::new(),
+            protocol: "serial".to_string(),
+            baud_rate,
         }
     }
 }

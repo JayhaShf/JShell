@@ -56,6 +56,55 @@ impl Ashell {
     }
 
     pub(crate) fn connect_ssh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.session_protocol == "serial" {
+            let session_name = self.session_name_input.read(cx).value().trim().to_string();
+            let port_name = self.host_input.read(cx).value().trim().to_string();
+            let baud_rate = self
+                .baud_rate_input
+                .read(cx)
+                .value()
+                .trim()
+                .parse::<u32>()
+                .unwrap_or(115200);
+
+            if port_name.is_empty() {
+                self.status = "Serial port path is required".into();
+                cx.notify();
+                return;
+            }
+
+            let name = if session_name.is_empty() {
+                port_name.clone()
+            } else {
+                session_name
+            };
+
+            let existing_id = self.editing_session_id.clone();
+            let existing_last_used = existing_id
+                .as_deref()
+                .and_then(|id| self.config.get(id))
+                .and_then(|session| session.last_used.clone());
+
+            let mut session = Session::serial(port_name, baud_rate);
+            session.name = name;
+            if let Some(id) = existing_id {
+                session.id = id;
+            }
+            session.last_used = existing_last_used;
+
+            self.config.upsert(session.clone());
+            if let Err(err) = self.config.save() {
+                tracing::warn!("failed to save config: {err:#}");
+            }
+
+            self.open_serial_session(session, cx);
+            self.editing_session_id = None;
+            self.active_dialog = None;
+            window.close_dialog(cx);
+            cx.notify();
+            return;
+        }
+
         tracing::info!("[ui] user initiating new ssh connection from form");
         let session_name = self.session_name_input.read(cx).value().trim().to_string();
         let host = self.host_input.read(cx).value().trim().to_string();
@@ -153,6 +202,7 @@ impl Ashell {
         self.editing_session_id = None;
         self.ssh_auth_method = AuthMethod::Password;
         self.ssh_config_selected = None;
+        self.session_protocol = "ssh".to_string();
         Self::set_input_value(&self.session_name_input, "", window, cx);
         Self::set_input_value(&self.host_input, "", window, cx);
         Self::set_input_value(&self.port_input, "22", window, cx);
@@ -161,6 +211,7 @@ impl Ashell {
         Self::set_input_value(&self.key_path_input, "", window, cx);
         Self::set_input_value(&self.key_inline_input, "", window, cx);
         Self::set_input_value(&self.passphrase_input, "", window, cx);
+        Self::set_input_value(&self.baud_rate_input, "115200", window, cx);
         self.ssh_proxy_type = "none".to_string();
         Self::set_input_value(&self.proxy_host_input, "", window, cx);
         Self::set_input_value(&self.proxy_port_input, "", window, cx);
@@ -176,6 +227,7 @@ impl Ashell {
     ) {
         self.editing_session_id = Some(session.id.clone());
         self.ssh_auth_method = session.auth;
+        self.session_protocol = session.protocol.clone();
         Self::set_input_value(&self.session_name_input, session.name.clone(), window, cx);
         Self::set_input_value(&self.host_input, session.host.clone(), window, cx);
         Self::set_input_value(&self.port_input, session.port.to_string(), window, cx);
@@ -196,6 +248,12 @@ impl Ashell {
         Self::set_input_value(
             &self.passphrase_input,
             session.passphrase.clone(),
+            window,
+            cx,
+        );
+        Self::set_input_value(
+            &self.baud_rate_input,
+            session.baud_rate.to_string(),
             window,
             cx,
         );
@@ -389,6 +447,11 @@ impl Ashell {
         cx.notify();
     }
 
+    pub(crate) fn set_session_protocol(&mut self, protocol: String, cx: &mut Context<Self>) {
+        self.session_protocol = protocol;
+        cx.notify();
+    }
+
     pub(crate) fn refresh_ssh_config(&mut self) {
         self.ssh_config_entries =
             crate::session::ssh_config::parse_ssh_config().unwrap_or_default();
@@ -448,7 +511,11 @@ impl Ashell {
             cx.notify();
             return;
         };
-        self.open_ssh_session(session, cx);
+        if session.protocol == "serial" {
+            self.open_serial_session(session, cx);
+        } else {
+            self.open_ssh_session(session, cx);
+        }
     }
 
     pub(crate) fn selector_entries(&self) -> Vec<SelectorEntry> {
@@ -613,6 +680,57 @@ impl Ashell {
         cx.notify();
     }
 
+    pub(crate) fn open_serial_session(&mut self, session: Session, cx: &mut Context<Self>) {
+        tracing::info!(
+            "[session] opening serial tab for session '{}' ({})",
+            session.name,
+            session.host
+        );
+        let id = Uuid::new_v4().to_string();
+        let backend = crate::backend::serial::spawn_serial_client(
+            self.runtime.handle(),
+            id.clone(),
+            session.clone(),
+            self.events_tx.clone(),
+        );
+        self.tabs.push(TerminalTab::new_serial(
+            id.clone(),
+            &session,
+            crate::terminal::BackendTx::Serial(backend),
+            self.events_tx.clone(),
+        ));
+        self.active_tab = Some(id.clone());
+        self.connection_progress = Some(crate::app::ConnectionProgress {
+            tab_id: id.clone(),
+            title: rust_i18n::t!("connecting").into(),
+            lines: vec![rust_i18n::t!("starting_connection").into()],
+            failed: false,
+        });
+        self.pane_root = PaneLayout::Single(id.clone());
+        self.focused_pane_path = vec![];
+        let group_id = Uuid::new_v4().to_string();
+        self.tab_groups.push(TabGroup {
+            id: group_id.clone(),
+            title: session.name.clone(),
+            pane_root: PaneLayout::Single(id.clone()),
+            sftp: None,
+        });
+        self.active_group = Some(group_id.clone());
+        self.tabs_scroll_handle.scroll_to_item(self.tabs.len() - 1);
+        if let Some(session_id) = self.active_session_id() {
+            if let Some(index) = self
+                .config
+                .sessions()
+                .iter()
+                .position(|s| s.id == session_id)
+            {
+                self.saved_scroll_handle.scroll_to_item(index);
+            }
+        }
+        self.status = "serial tab opened".into();
+        cx.notify();
+    }
+
     pub(crate) fn remove_saved_session(&mut self, session_id: String, cx: &mut Context<Self>) {
         self.config.remove(&session_id);
         if let Err(err) = self.config.save() {
@@ -646,20 +764,30 @@ impl Ashell {
         self.tabs[ix].send_backend(BackendCommand::Close);
 
         if let Some(session) = session {
-            // SSH tab: spawn new SSH connection
-            let backend = ssh::spawn_ssh_terminal(
-                self.runtime.handle(),
-                tab_id.to_string(),
-                session.clone(),
-                cols,
-                rows,
-                self.events_tx.clone(),
-            );
-
-            // Swap the backend — the Term's internal listener shares the
-            // same Arc<Mutex<BackendTx>>, so user input is automatically
-            // routed to the new backend. Terminal history is preserved.
-            self.tabs[ix].set_backend(backend);
+            let tab_kind = self.tabs[ix].kind;
+            match tab_kind {
+                crate::terminal::TabKind::Serial => {
+                    let backend = crate::backend::serial::spawn_serial_client(
+                        self.runtime.handle(),
+                        tab_id.to_string(),
+                        session.clone(),
+                        self.events_tx.clone(),
+                    );
+                    self.tabs[ix].set_backend(crate::terminal::BackendTx::Serial(backend));
+                }
+                crate::terminal::TabKind::Ssh => {
+                    let backend = ssh::spawn_ssh_terminal(
+                        self.runtime.handle(),
+                        tab_id.to_string(),
+                        session.clone(),
+                        cols,
+                        rows,
+                        self.events_tx.clone(),
+                    );
+                    self.tabs[ix].set_backend(backend);
+                }
+                _ => {}
+            }
             self.tabs[ix].connected = false;
             self.tabs[ix].status = "connecting".into();
             self.tabs[ix].disconnected_reason = None;
@@ -680,20 +808,22 @@ impl Ashell {
                     .and_then(|t| t.session.clone());
 
                 if let Some(session) = group_session {
-                    if let Some(old_handle) = self.sftp_handles.remove(&group_id) {
-                        old_handle.close();
-                    }
-                    let sftp_handle = crate::sftp::spawn_sftp(
-                        self.runtime.handle(),
-                        group_id.clone(),
-                        session,
-                        self.events_tx.clone(),
-                    );
-                    self.sftp_handles.insert(group_id.clone(), sftp_handle);
+                    if session.protocol != "serial" {
+                        if let Some(old_handle) = self.sftp_handles.remove(&group_id) {
+                            old_handle.close();
+                        }
+                        let sftp_handle = crate::sftp::spawn_sftp(
+                            self.runtime.handle(),
+                            group_id.clone(),
+                            session,
+                            self.events_tx.clone(),
+                        );
+                        self.sftp_handles.insert(group_id.clone(), sftp_handle);
 
-                    if let Some(group) = self.tab_groups.iter_mut().find(|g| g.id == group_id) {
-                        if let Some(sftp) = group.sftp.as_mut() {
-                            sftp.status = rust_i18n::t!("sftp_connecting").to_string();
+                        if let Some(group) = self.tab_groups.iter_mut().find(|g| g.id == group_id) {
+                            if let Some(sftp) = group.sftp.as_mut() {
+                                sftp.status = rust_i18n::t!("sftp_connecting").to_string();
+                            }
                         }
                     }
                 }
@@ -1046,7 +1176,11 @@ impl Ashell {
     }
 
     pub(crate) fn session_detail(&self, session: &Session) -> String {
-        format!("{}@{}:{}", session.user, session.host, session.port)
+        if session.protocol == "serial" {
+            format!("Serial: {}@{}", session.host, session.baud_rate)
+        } else {
+            format!("{}@{}:{}", session.user, session.host, session.port)
+        }
     }
 
     pub(crate) fn split_current_pane(&mut self, direction: &str, cx: &mut Context<Self>) {
@@ -1111,6 +1245,25 @@ impl Ashell {
                 );
                 self.sftp_handles.insert(new_id.clone(), sftp_handle);
                 TerminalTab::new_ssh(new_id.clone(), &session, backend, self.events_tx.clone())
+            }
+            TabKind::Serial => {
+                let Some(session) = current_tab.session.clone() else {
+                    self.status = "cannot split: no session info".into();
+                    cx.notify();
+                    return;
+                };
+                let backend = crate::backend::serial::spawn_serial_client(
+                    self.runtime.handle(),
+                    new_id.clone(),
+                    session.clone(),
+                    self.events_tx.clone(),
+                );
+                TerminalTab::new_serial(
+                    new_id.clone(),
+                    &session,
+                    crate::terminal::BackendTx::Serial(backend),
+                    self.events_tx.clone(),
+                )
             }
         };
         tab.resize(DEFAULT_COLS, DEFAULT_ROWS);

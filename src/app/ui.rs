@@ -1622,6 +1622,13 @@ impl Ashell {
                                                 "ssh".to_string()
                                             }
                                         }
+                                        TabKind::Serial => {
+                                            if let Some((_, session)) = self.active_ssh_session() {
+                                                format!("serial / {}", session.name)
+                                            } else {
+                                                "serial".to_string()
+                                            }
+                                        }
                                     }
                                 } else {
                                     self.active_title()
