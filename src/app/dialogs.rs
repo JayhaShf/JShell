@@ -1400,6 +1400,21 @@ impl Ashell {
                                                 return;
                                             }
 
+                                            if ev.keystroke.key == "backspace"
+                                                && !ev.keystroke.modifiers.control
+                                                && !ev.keystroke.modifiers.alt
+                                                && !ev.keystroke.modifiers.shift
+                                                && !ev.keystroke.modifiers.platform
+                                                && !ev.keystroke.modifiers.function
+                                            {
+                                                this.recording_action = None;
+                                                this.keybind_error = None;
+                                                this.config.set_key_binding(&action, "none");
+                                                this.save_preferences_background();
+                                                cx.notify();
+                                                return;
+                                            }
+
                                             let Some(new_key) = crate::app::keybinding_recorder::normalize_recorded_keystroke(ev) else {
                                                 return;
                                             };

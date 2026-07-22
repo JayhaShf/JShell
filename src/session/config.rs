@@ -1301,4 +1301,11 @@ mod tests {
 
         let _ = fs::remove_file(&path);
     }
+
+    #[test]
+    fn test_key_binding_unbinding_none() {
+        let mut store = ConfigStore::in_memory();
+        store.set_key_binding("OpenSettings", "none");
+        assert_eq!(store.key_bindings().get("OpenSettings").unwrap(), "none");
+    }
 }

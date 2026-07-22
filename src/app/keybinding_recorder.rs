@@ -218,7 +218,7 @@ pub(crate) fn unbind_all_workspace_keys(cx: &mut App, config: &ConfigStore) {
 
             // Unbind both the default and configured keystroke
             bindings.push(KeyBinding::new(&default, Unbind(action_name.into()), None));
-            if configured != default {
+            if configured != default && configured != "none" && !configured.is_empty() {
                 bindings.push(KeyBinding::new(
                     &configured,
                     Unbind(action_name.into()),
@@ -262,7 +262,7 @@ pub(crate) fn find_conflict(
             continue;
         }
         let existing = configured_keystroke(config, action.id).unwrap_or_default();
-        if !existing.is_empty() && existing == new_keystroke {
+        if !existing.is_empty() && existing != "none" && existing == new_keystroke {
             return Some((action.id.to_string(), t!(action.label_key).to_string()));
         }
     }
@@ -282,7 +282,9 @@ fn bind_workspace_actions(cx: &mut App, config: &ConfigStore) {
                 bindings.push(KeyBinding::new(&default, Unbind(action_name.into()), None));
             }
 
-            bindings.push(KeyBinding::new(&configured, $action, None));
+            if configured != "none" && !configured.is_empty() {
+                bindings.push(KeyBinding::new(&configured, $action, None));
+            }
         };
     }
 
