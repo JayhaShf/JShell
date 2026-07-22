@@ -2036,6 +2036,41 @@ impl Ashell {
                                         )
                                 )
                                 .page(
+                                    SettingPage::new(t!("settings_config_file").to_string())
+                                        .icon(IconName::File)
+                                        .group(
+                                            SettingGroup::new()
+                                                .title(t!("settings_config_file").to_string())
+                                                .item(SettingItem::new(
+                                                    t!("settings_backup_local_desc").to_string(),
+                                                    SettingField::render({
+                                                        let view = view.clone();
+                                                        move |_, window, _cx| {
+                                                            h_flex()
+                                                                .gap_2()
+                                                                .child(
+                                                                    Button::new("backup-export")
+                                                                        .small()
+                                                                        .label(t!("backup_export").to_string())
+                                                                        .on_click(window.listener_for(&view, |this, _, window, cx| {
+                                                                            this.export_local_config(window, cx);
+                                                                        }))
+                                                                )
+                                                                .child(
+                                                                    Button::new("backup-import")
+                                                                        .small()
+                                                                        .label(t!("backup_import").to_string())
+                                                                        .on_click(window.listener_for(&view, |this, _, window, cx| {
+                                                                            this.import_local_config(window, cx);
+                                                                        }))
+                                                                )
+                                                                .into_any_element()
+                                                        }
+                                                    })
+                                                ))
+                                        )
+                                )
+                                .page(
                                     SettingPage::new(t!("settings_sync").to_string())
                                         .icon(IconName::Globe)
                                         .group(

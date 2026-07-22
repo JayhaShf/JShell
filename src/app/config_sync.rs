@@ -126,4 +126,73 @@ impl Ashell {
             let _ = events.send(BackendEvent::SyncFinished(result));
         });
     }
+
+    pub(crate) fn export_local_config(
+        &mut self,
+        window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
+        let local_config = self.config.cache.clone();
+        let file_dialog = rfd::AsyncFileDialog::new()
+            .set_file_name("ashell-config.json")
+            .add_filter("JSON", &["json"])
+            .save_file();
+
+        cx.spawn_in(window, async move |_this, cx| {
+            if let Some(file_handle) = file_dialog.await {
+                let path = file_handle.path().to_path_buf();
+                if let Ok(json_str) = serde_json::to_string_pretty(&local_config) {
+                    let _ = cx
+                        .background_executor()
+                        .spawn(async move {
+                            if let Err(err) = std::fs::write(path, json_str) {
+                                tracing::error!("failed to export local config: {err:#}");
+                            }
+                        })
+                        .await;
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach();
+    }
+
+    pub(crate) fn import_local_config(
+        &mut self,
+        window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
+        let file_dialog = rfd::AsyncFileDialog::new()
+            .add_filter("JSON", &["json"])
+            .pick_file();
+
+        cx.spawn_in(window, async move |this, mut cx| {
+            if let Some(file_handle) = file_dialog.await {
+                let path = file_handle.path().to_path_buf();
+                let read_result = cx
+                    .background_executor()
+                    .spawn(async move { std::fs::read_to_string(path) })
+                    .await;
+
+                if let Ok(json_str) = read_result {
+                    if let Ok(config_file) =
+                        serde_json::from_str::<crate::session::config::ConfigFile>(&json_str)
+                    {
+                        let _ = gpui::AsyncWindowContext::update(&mut cx, |window, cx| {
+                            let _ = this.update(cx, |this, cx| {
+                                this.config.cache = config_file;
+                                if let Err(err) = this.config.save() {
+                                    tracing::error!("failed to save imported config: {err:#}");
+                                } else {
+                                    this.apply_loaded_config(window, cx);
+                                }
+                            });
+                        });
+                    }
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach();
+    }
 }

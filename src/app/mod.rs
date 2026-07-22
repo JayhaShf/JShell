@@ -730,6 +730,74 @@ impl Ashell {
         this
     }
 
+    pub(crate) fn apply_loaded_config(
+        &mut self,
+        window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.follow_system_theme = self.config.follow_system_theme();
+        self.theme_mode = match self.config.theme_mode() {
+            "light" => ThemeMode::Light,
+            "dark" => ThemeMode::Dark,
+            _ => ThemeMode::Dark,
+        };
+        self.light_theme_name = self.config.light_theme_name().to_string().into();
+        self.dark_theme_name = self.config.dark_theme_name().to_string().into();
+        self.ui_font_size = self.config.ui_font_size();
+        self.terminal_font_size = self.config.terminal_font_size();
+        self.cursor_style = self.config.cursor_style();
+        self.ui_font_family = self.config.ui_font_family().to_string().into();
+        self.terminal_font_family = self.config.terminal_font_family().to_string().into();
+        self.show_hidden_files = self.config.show_hidden_files();
+        self.sftp_panel_minimized = self.config.sftp_panel_minimized();
+        self.sidebar_collapsed = self.config.sidebar_collapsed();
+        self.active_title_bar_style = self.config.title_bar_style();
+
+        // Apply theme preferences
+        self.apply_theme_preferences(window, cx);
+
+        // Update inputs
+        Self::set_input_value(
+            &self.sync_endpoint_input,
+            self.config.sync_endpoint().to_string(),
+            window,
+            cx,
+        );
+        Self::set_input_value(
+            &self.sync_username_input,
+            self.config.sync_username().to_string(),
+            window,
+            cx,
+        );
+        Self::set_input_value(
+            &self.sync_s3_endpoint_input,
+            self.config.sync_s3_endpoint().to_string(),
+            window,
+            cx,
+        );
+        Self::set_input_value(
+            &self.sync_s3_region_input,
+            self.config.sync_s3_region().to_string(),
+            window,
+            cx,
+        );
+        Self::set_input_value(
+            &self.sync_s3_bucket_input,
+            self.config.sync_s3_bucket().to_string(),
+            window,
+            cx,
+        );
+        Self::set_input_value(
+            &self.sync_s3_object_key_input,
+            self.config.sync_s3_object_key().to_string(),
+            window,
+            cx,
+        );
+
+        // Notify
+        cx.notify();
+    }
+
     pub(crate) fn on_input_event(
         &mut self,
         input: &Entity<InputState>,
