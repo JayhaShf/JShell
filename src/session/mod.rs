@@ -371,9 +371,7 @@ impl Ashell {
     pub(crate) fn change_terminal_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
         self.terminal_font_size = (self.terminal_font_size + delta).clamp(10.0, 24.0);
         self.config.set_terminal_font_size(self.terminal_font_size);
-        if let Err(err) = self.config.save() {
-            tracing::warn!("failed to save terminal font size: {err:#}");
-        }
+        self.save_preferences_background();
         self.status = format!("terminal font size: {:.0}px", self.terminal_font_size).into();
         cx.notify();
     }
@@ -381,9 +379,7 @@ impl Ashell {
     pub(crate) fn change_ui_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
         self.ui_font_size = (self.ui_font_size + delta).clamp(8.0, 24.0);
         self.config.set_ui_font_size(self.ui_font_size);
-        if let Err(err) = self.config.save() {
-            tracing::warn!("failed to save UI font size: {err:#}");
-        }
+        self.save_preferences_background();
         Theme::global_mut(cx).font_size = px(self.ui_font_size);
         self.status = format!("UI font size: {:.0}px", self.ui_font_size).into();
         cx.notify();
@@ -397,9 +393,7 @@ impl Ashell {
     ) {
         self.ui_font_family = family.into();
         self.config.set_ui_font_family(family);
-        if let Err(err) = self.config.save() {
-            tracing::warn!("failed to save UI font family: {err:#}");
-        }
+        self.save_preferences_background();
         crate::app::theme::set_theme_font_names(Theme::global_mut(cx), &self.ui_font_family);
         cx.notify();
         window.refresh();
@@ -408,9 +402,7 @@ impl Ashell {
     pub(crate) fn change_terminal_font_family(&mut self, family: &str, cx: &mut Context<Self>) {
         self.terminal_font_family = family.into();
         self.config.set_terminal_font_family(family);
-        if let Err(err) = self.config.save() {
-            tracing::warn!("failed to save terminal font family: {err:#}");
-        }
+        self.save_preferences_background();
         cx.notify();
     }
 
@@ -421,15 +413,13 @@ impl Ashell {
     ) {
         self.cursor_style = style;
         self.config.set_cursor_style(style);
-        if let Err(err) = self.config.save() {
-            tracing::warn!("failed to save cursor style: {err:#}");
-        }
+        self.save_preferences_background();
         cx.notify();
     }
 
     pub(crate) fn reset_layout(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.config.set_layout_state(None, None, None);
-        let _ = self.config.save();
+        self.save_preferences_background();
 
         self.is_layout_reset = true;
         self.workspace_panels = cx.new(|_| crate::app::resizable::ResizableState::default());

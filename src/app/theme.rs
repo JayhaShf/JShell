@@ -126,9 +126,7 @@ impl Ashell {
         }
         rust_i18n::set_locale(&active_locale);
         gpui_component::set_locale(&active_locale);
-        if let Err(err) = self.config.save() {
-            tracing::warn!("failed to save language preferences: {err:#}");
-        }
+        self.save_preferences_background();
         window.refresh();
         cx.notify();
     }
@@ -168,8 +166,6 @@ impl Ashell {
             self.light_theme_name.to_string(),
             self.dark_theme_name.to_string(),
         );
-        if let Err(err) = self.config.save() {
-            tracing::warn!("failed to save theme preferences: {err:#}");
-        }
+        self.save_preferences_background();
     }
 }

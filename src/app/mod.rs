@@ -327,6 +327,8 @@ pub(crate) struct Ashell {
     pub(crate) hovered_url: Option<HoveredUrl>,
     pub(crate) cmd_ctrl_pressed: bool,
     pub(crate) _subscriptions: Vec<gpui::Subscription>,
+    pub(crate) save_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    pub(crate) save_latest_seq: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -718,6 +720,8 @@ impl Ashell {
             hovered_url: None,
             cmd_ctrl_pressed: false,
             _subscriptions,
+            save_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            save_latest_seq: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
 
         this.apply_theme_preferences(window, cx);
@@ -784,9 +788,29 @@ impl Ashell {
         cx.notify();
     }
 
+    pub(crate) fn save_preferences_background(&mut self) {
+        let local_config = self.config.cache.clone();
+        let config_store = self.config.clone();
+        let latest_seq = self.save_latest_seq.clone();
+        let current_seq = latest_seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let save_lock = self.save_lock.clone();
+
+        self.runtime.spawn(async move {
+            let _guard = save_lock.lock().await;
+            if current_seq < latest_seq.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Err(err) = config_store.save_merged_preferences(local_config) {
+                    tracing::error!("failed to save merged preferences in background: {err:#}");
+                }
+            })
+            .await;
+        });
+    }
+
     pub(crate) fn start_event_pump(&self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
-            let mut idle_frames = 0u32;
             let mut last_blink_time = std::time::Instant::now();
             loop {
                 cx.background_executor()
@@ -808,15 +832,8 @@ impl Ashell {
                                 >= std::time::Duration::from_millis(600);
                         if changed || system_sampled || blink_due {
                             cx.notify();
-                            idle_frames = 0;
                             if blink_due {
                                 last_blink_time = now;
-                            }
-                        } else {
-                            idle_frames += 1;
-                            if idle_frames >= 60 {
-                                cx.notify();
-                                idle_frames = 0;
                             }
                         }
                     })
@@ -1331,8 +1348,9 @@ impl Ashell {
         };
         let size = bounds.size;
         if size.width.as_f32() > 400.0 && size.height.as_f32() > 300.0 {
-            tracing::info!("[ui] saving layout state...");
-            let mut config = ConfigStore::load().unwrap_or_else(|_| ConfigStore::in_memory());
+            self.save_latest_seq
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut config = self.config.clone();
             let saved_bounds = match current_bounds {
                 gpui::WindowBounds::Fullscreen(b) => {
                     crate::session::config::SavedWindowBounds::Fullscreen {

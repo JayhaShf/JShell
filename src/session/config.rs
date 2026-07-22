@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf};
+use std::{fs, path::PathBuf, sync::OnceLock};
 
 use anyhow::{Context, Result};
 use argon2::Argon2;
@@ -364,9 +364,10 @@ impl Default for ConfigFile {
     }
 }
 
+#[derive(Clone)]
 pub struct ConfigStore {
-    path: PathBuf,
-    cache: ConfigFile,
+    pub(crate) path: PathBuf,
+    pub(crate) cache: ConfigFile,
 }
 
 impl ConfigStore {
@@ -828,6 +829,65 @@ impl ConfigStore {
 
         Ok(())
     }
+
+    pub fn save_merged_preferences(&self, local_config: ConfigFile) -> Result<()> {
+        if self.path.as_os_str().is_empty() {
+            return Ok(());
+        }
+        let hardware_uuid = get_hardware_uuid();
+
+        let mut disk_config = if self.path.exists() {
+            if let Ok(raw_bytes) = fs::read(&self.path) {
+                match decrypt_config(&raw_bytes, &hardware_uuid) {
+                    Ok(loaded) => loaded,
+                    Err(_) => serde_json::from_slice::<ConfigFile>(&raw_bytes)
+                        .unwrap_or_else(|_| self.cache.clone()),
+                }
+            } else {
+                self.cache.clone()
+            }
+        } else {
+            self.cache.clone()
+        };
+
+        // Merge UI preference fields
+        disk_config.follow_system_theme = local_config.follow_system_theme;
+        disk_config.theme_mode = local_config.theme_mode;
+        disk_config.light_theme_name = local_config.light_theme_name;
+        disk_config.dark_theme_name = local_config.dark_theme_name;
+        disk_config.locale = local_config.locale;
+        disk_config.terminal_font_size = local_config.terminal_font_size;
+        disk_config.ui_font_size = local_config.ui_font_size;
+        disk_config.right_click_copy_paste = local_config.right_click_copy_paste;
+        disk_config.keyword_highlight = local_config.keyword_highlight;
+        disk_config.ui_font_family = local_config.ui_font_family;
+        disk_config.terminal_font_family = local_config.terminal_font_family;
+        disk_config.title_bar_style = local_config.title_bar_style;
+        disk_config.cursor_style = local_config.cursor_style;
+        disk_config.window_bounds = local_config.window_bounds;
+        disk_config.workspace_panels = local_config.workspace_panels;
+        disk_config.body_panels = local_config.body_panels;
+        disk_config.show_hidden_files = local_config.show_hidden_files;
+        disk_config.lock_layout = local_config.lock_layout;
+        disk_config.monitoring_position = local_config.monitoring_position;
+        disk_config.sidebar_collapsed = local_config.sidebar_collapsed;
+        disk_config.sftp_panel_minimized = local_config.sftp_panel_minimized;
+
+        let encrypted_bytes = encrypt_config(&disk_config, &hardware_uuid)?;
+        fs::write(&self.path, encrypted_bytes)
+            .with_context(|| format!("failed to write {}", self.path.display()))?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(mut perms) = fs::metadata(&self.path).map(|m| m.permissions()) {
+                perms.set_mode(0o600);
+                let _ = fs::set_permissions(&self.path, perms);
+            }
+        }
+
+        Ok(())
+    }
 }
 
 pub trait ProxyStream:
@@ -838,8 +898,6 @@ impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + Sync + 'st
     for T
 {
 }
-
-use std::sync::OnceLock;
 
 #[derive(Debug, Clone)]
 pub struct EnvProxy {
@@ -1033,64 +1091,60 @@ struct EncryptedConfigEnvelope {
     payload: String,
 }
 
-fn get_hardware_uuid() -> String {
-    #[cfg(target_os = "macos")]
-    {
-        if let Ok(output) = std::process::Command::new("ioreg")
-            .args(&["-rd1", "-c", "IOPlatformExpertDevice"])
-            .output()
-        {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                if line.contains("IOPlatformUUID") {
-                    if let Some(uuid) = line.split('"').nth(3) {
-                        let uuid = uuid.trim().to_string();
-                        if !uuid.is_empty() {
-                            return uuid;
+static HARDWARE_UUID_CACHE: OnceLock<String> = OnceLock::new();
+
+pub fn get_hardware_uuid() -> String {
+    HARDWARE_UUID_CACHE
+        .get_or_init(|| {
+            #[cfg(target_os = "macos")]
+            {
+                if let Ok(output) = std::process::Command::new("ioreg")
+                    .args(&["-rd1", "-c", "IOPlatformExpertDevice"])
+                    .output()
+                {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    for line in stdout.lines() {
+                        if line.contains("IOPlatformUUID") {
+                            if let Some(uuid) = line.split('"').nth(3) {
+                                let uuid = uuid.trim().to_string();
+                                if !uuid.is_empty() {
+                                    return uuid;
+                                }
+                            }
                         }
                     }
                 }
             }
-        }
-    }
 
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(uuid) = std::fs::read_to_string("/sys/class/dmi/id/product_uuid") {
-            let uuid = uuid.trim().to_string();
-            if !uuid.is_empty() {
-                return uuid;
+            #[cfg(target_os = "linux")]
+            {
+                if let Ok(uuid) = std::fs::read_to_string("/sys/class/dmi/id/product_uuid") {
+                    let uuid = uuid.trim().to_string();
+                    if !uuid.is_empty() {
+                        return uuid;
+                    }
+                }
+                if let Ok(id) = std::fs::read_to_string("/etc/machine-id") {
+                    let id = id.trim().to_string();
+                    if !id.is_empty() {
+                        return id;
+                    }
+                }
+                if let Ok(id) = std::fs::read_to_string("/var/lib/dbus/machine-id") {
+                    let id = id.trim().to_string();
+                    if !id.is_empty() {
+                        return id;
+                    }
+                }
             }
-        }
-        if let Ok(id) = std::fs::read_to_string("/etc/machine-id") {
-            let id = id.trim().to_string();
-            if !id.is_empty() {
-                return id;
-            }
-        }
-        if let Ok(id) = std::fs::read_to_string("/var/lib/dbus/machine-id") {
-            let id = id.trim().to_string();
-            if !id.is_empty() {
-                return id;
-            }
-        }
-    }
 
-    #[cfg(target_os = "windows")]
-    {
-        if let Ok(output) = std::process::Command::new("reg")
-            .args(&[
-                "query",
-                "HKLM\\SOFTWARE\\Microsoft\\Cryptography",
-                "/v",
-                "MachineGuid",
-            ])
-            .output()
-        {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                if line.contains("MachineGuid") {
-                    if let Some(guid) = line.split_whitespace().last() {
+            #[cfg(target_os = "windows")]
+            {
+                use winreg::RegKey;
+                use winreg::enums::HKEY_LOCAL_MACHINE;
+                let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+                if let Ok(subkey) = hklm.open_subkey("SOFTWARE\\Microsoft\\Cryptography") {
+                    if let Ok(guid) = subkey.get_value::<String, _>("MachineGuid") {
                         let guid = guid.trim().to_string();
                         if !guid.is_empty() {
                             return guid;
@@ -1098,23 +1152,10 @@ fn get_hardware_uuid() -> String {
                     }
                 }
             }
-        }
-        if let Ok(output) = std::process::Command::new("wmic")
-            .args(&["csproduct", "get", "uuid"])
-            .output()
-        {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let lines: Vec<&str> = stdout.lines().collect();
-            if lines.len() >= 2 {
-                let uuid = lines[1].trim().to_string();
-                if !uuid.is_empty() {
-                    return uuid;
-                }
-            }
-        }
-    }
 
-    "ashell-default-hardware-uuid-fallback".to_string()
+            "ashell-default-hardware-uuid-fallback".to_string()
+        })
+        .clone()
 }
 
 fn encrypt_config(config: &ConfigFile, password: &str) -> Result<Vec<u8>> {
@@ -1206,5 +1247,58 @@ mod tests {
 
         // Decrypt with wrong password should fail
         assert!(decrypt_config(&encrypted, "wrong-password").is_err());
+    }
+
+    #[test]
+    fn test_save_merged_preferences() {
+        let temp_dir = std::env::temp_dir();
+        let path = temp_dir.join(format!("ashell-test-config-{}.json", Uuid::new_v4()));
+        let mut store = ConfigStore {
+            path: path.clone(),
+            cache: ConfigFile::default(),
+        };
+
+        let session = Session {
+            id: "test-session-id".to_string(),
+            name: "Test Session".to_string(),
+            host: "1.2.3.4".to_string(),
+            port: 22,
+            user: "root".to_string(),
+            auth: AuthMethod::Password,
+            password: "pwd".to_string(),
+            private_key_path: String::new(),
+            private_key_inline: String::new(),
+            passphrase: String::new(),
+            last_used: None,
+            proxy_type: String::new(),
+            proxy_host: String::new(),
+            proxy_port: None,
+            proxy_user: String::new(),
+            proxy_password: String::new(),
+            protocol: "ssh".to_string(),
+            baud_rate: 115200,
+        };
+        store.cache.sessions.push(session.clone());
+        store.save().unwrap();
+
+        let mut local_config = ConfigFile::default();
+        local_config.ui_font_size = 18.0;
+        local_config.terminal_font_size = 20.0;
+        local_config.show_hidden_files = true;
+
+        store.save_merged_preferences(local_config).unwrap();
+
+        let loaded_bytes = fs::read(&path).unwrap();
+        let decrypted = decrypt_config(&loaded_bytes, &get_hardware_uuid()).unwrap();
+
+        assert_eq!(decrypted.ui_font_size, 18.0);
+        assert_eq!(decrypted.terminal_font_size, 20.0);
+        assert!(decrypted.show_hidden_files);
+
+        assert_eq!(decrypted.sessions.len(), 1);
+        assert_eq!(decrypted.sessions[0].name, "Test Session");
+        assert_eq!(decrypted.sessions[0].host, "1.2.3.4");
+
+        let _ = fs::remove_file(&path);
     }
 }

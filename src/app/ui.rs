@@ -111,7 +111,7 @@ impl Ashell {
         }
         self.config
             .set_sftp_panel_minimized(self.sftp_panel_minimized);
-        let _ = self.config.save();
+        self.save_preferences_background();
         cx.notify();
     }
 
@@ -293,7 +293,7 @@ impl Ashell {
                         .on_click(cx.listener(|this, checked, _, cx| {
                             this.show_hidden_files = *checked;
                             this.config.set_show_hidden_files(*checked);
-                            let _ = this.config.save();
+                            this.save_preferences_background();
                             cx.notify();
                         })),
                 )
@@ -1593,7 +1593,7 @@ impl Ashell {
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.sidebar_collapsed = true;
                                         this.config.set_sidebar_collapsed(true);
-                                        let _ = this.config.save();
+                                        this.save_preferences_background();
                                         cx.notify();
                                     })),
                             )
@@ -1833,7 +1833,7 @@ impl Ashell {
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.sidebar_collapsed = false;
                                 this.config.set_sidebar_collapsed(false);
-                                let _ = this.config.save();
+                                this.save_preferences_background();
                                 cx.notify();
                             })),
                     ),
@@ -2797,7 +2797,7 @@ impl Render for Ashell {
             .on_action(cx.listener(|this, _: &crate::ToggleSidebar, _, cx| {
                 this.sidebar_collapsed = !this.sidebar_collapsed;
                 this.config.set_sidebar_collapsed(this.sidebar_collapsed);
-                let _ = this.config.save();
+                this.save_preferences_background();
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &crate::ToggleSftpZoom, window, cx| {
