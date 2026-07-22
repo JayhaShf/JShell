@@ -225,9 +225,9 @@ async fn connect_and_authenticate(
     events: &std::sync::mpsc::Sender<BackendEvent>,
 ) -> Result<russh::client::Handle<ClientHandler>> {
     let config = Arc::new(client::Config {
-        inactivity_timeout: Some(std::time::Duration::from_secs(600)),
-        keepalive_interval: Some(std::time::Duration::from_secs(3)),
-        keepalive_max: 2,
+        inactivity_timeout: None,
+        keepalive_interval: Some(std::time::Duration::from_secs(5)),
+        keepalive_max: 3,
         ..Default::default()
     });
     let addr = format!("{}:{}", session.host, session.port);
