@@ -1306,7 +1306,7 @@ impl Ashell {
         cx.notify();
     }
 
-    pub(crate) fn focus_adjacent_pane(&mut self, direction: &str) {
+    pub(crate) fn focus_adjacent_pane(&mut self, direction: &str, cx: &mut Context<Self>) {
         if self.focused_pane_path.is_empty() {
             return;
         }
@@ -1325,6 +1325,7 @@ impl Ashell {
                     self.search_target_tab = None;
                 }
             }
+            cx.notify();
         }
     }
 

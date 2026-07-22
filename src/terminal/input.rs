@@ -42,10 +42,10 @@ impl Ashell {
             && !event.keystroke.modifiers.platform
         {
             match event.keystroke.key.to_ascii_lowercase().as_str() {
-                "h" => self.focus_adjacent_pane("left"),
-                "j" => self.focus_adjacent_pane("down"),
-                "k" => self.focus_adjacent_pane("up"),
-                "l" => self.focus_adjacent_pane("right"),
+                "h" => self.focus_adjacent_pane("left", cx),
+                "j" => self.focus_adjacent_pane("down", cx),
+                "k" => self.focus_adjacent_pane("up", cx),
+                "l" => self.focus_adjacent_pane("right", cx),
                 "q" => {
                     if let Some(active_id) = self.active_tab.clone() {
                         self.close_tab(active_id, cx);

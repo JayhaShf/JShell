@@ -2803,10 +2803,10 @@ impl Render for Ashell {
             .on_action(cx.listener(|this, _: &crate::ToggleSftpZoom, window, cx| {
                 this.toggle_sftp_minimized(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &crate::FocusPaneLeft, _, _| this.focus_adjacent_pane("left")))
-            .on_action(cx.listener(|this, _: &crate::FocusPaneRight, _, _| this.focus_adjacent_pane("right")))
-            .on_action(cx.listener(|this, _: &crate::FocusPaneUp, _, _| this.focus_adjacent_pane("up")))
-            .on_action(cx.listener(|this, _: &crate::FocusPaneDown, _, _| this.focus_adjacent_pane("down")))
+            .on_action(cx.listener(|this, _: &crate::FocusPaneLeft, _, cx| this.focus_adjacent_pane("left", cx)))
+            .on_action(cx.listener(|this, _: &crate::FocusPaneRight, _, cx| this.focus_adjacent_pane("right", cx)))
+            .on_action(cx.listener(|this, _: &crate::FocusPaneUp, _, cx| this.focus_adjacent_pane("up", cx)))
+            .on_action(cx.listener(|this, _: &crate::FocusPaneDown, _, cx| this.focus_adjacent_pane("down", cx)))
             .on_action(cx.listener(|this, _: &crate::SplitPaneLeft, _, cx| this.split_current_pane("left", cx)))
             .on_action(cx.listener(|this, _: &crate::SplitPaneRight, _, cx| this.split_current_pane("right", cx)))
             .on_action(cx.listener(|this, _: &crate::SplitPaneUp, _, cx| this.split_current_pane("up", cx)))
