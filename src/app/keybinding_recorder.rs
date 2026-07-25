@@ -31,7 +31,8 @@ gpui::actions!(
         SplitPaneDown,
         ClosePane,
         Copy,
-        Paste
+        Paste,
+        SaveDocument
     ]
 );
 
@@ -143,7 +144,24 @@ pub(crate) const WORKSPACE_ACTIONS: &[WorkspaceAction] = &[
             "shift-v"
         },
     },
+    WorkspaceAction {
+        id: "SaveDocument",
+        label_key: "settings_save_document",
+        default_suffix: "s",
+    },
 ];
+
+pub(crate) fn action_key_context(action_id: &str) -> Option<&'static str> {
+    match action_id {
+        "OpenSearch" | "ToggleSidebar" | "ToggleSftpZoom" | "FocusPaneLeft" | "FocusPaneRight"
+        | "FocusPaneUp" | "FocusPaneDown" | "SplitPaneLeft" | "SplitPaneRight" | "SplitPaneUp"
+        | "SplitPaneDown" | "ClosePane" | "Copy" | "Paste" => {
+            Some(crate::app::constants::TERMINAL_KEY_CONTEXT)
+        }
+        "SaveDocument" => Some(crate::app::constants::DOCUMENT_KEY_CONTEXT),
+        _ => None,
+    }
+}
 
 pub(crate) fn default_modifier() -> &'static str {
     if cfg!(target_os = "macos") {
@@ -217,12 +235,17 @@ pub(crate) fn unbind_all_workspace_keys(cx: &mut App, config: &ConfigStore) {
             let action_name = $action.name();
 
             // Unbind both the default and configured keystroke
-            bindings.push(KeyBinding::new(&default, Unbind(action_name.into()), None));
+            let context = action_key_context($id);
+            bindings.push(KeyBinding::new(
+                &default,
+                Unbind(action_name.into()),
+                context,
+            ));
             if configured != default && configured != "none" && !configured.is_empty() {
                 bindings.push(KeyBinding::new(
                     &configured,
                     Unbind(action_name.into()),
-                    None,
+                    context,
                 ));
             }
         };
@@ -246,6 +269,7 @@ pub(crate) fn unbind_all_workspace_keys(cx: &mut App, config: &ConfigStore) {
     unbind_action!("ClosePane", crate::ClosePane);
     unbind_action!("Copy", crate::Copy);
     unbind_action!("Paste", crate::Paste);
+    unbind_action!("SaveDocument", crate::SaveDocument);
 
     cx.bind_keys(bindings);
 }
@@ -259,6 +283,9 @@ pub(crate) fn find_conflict(
 ) -> Option<(String, String)> {
     for action in WORKSPACE_ACTIONS {
         if action.id == current_action_id {
+            continue;
+        }
+        if action_key_context(action.id) != action_key_context(current_action_id) {
             continue;
         }
         let existing = configured_keystroke(config, action.id).unwrap_or_default();
@@ -283,7 +310,11 @@ fn bind_workspace_actions(cx: &mut App, config: &ConfigStore) {
             }
 
             if configured != "none" && !configured.is_empty() {
-                bindings.push(KeyBinding::new(&configured, $action, None));
+                bindings.push(KeyBinding::new(
+                    &configured,
+                    $action,
+                    action_key_context($id),
+                ));
             }
         };
     }
@@ -306,6 +337,7 @@ fn bind_workspace_actions(cx: &mut App, config: &ConfigStore) {
     bind_action!("ClosePane", crate::ClosePane);
     bind_action!("Copy", crate::Copy);
     bind_action!("Paste", crate::Paste);
+    bind_action!("SaveDocument", crate::SaveDocument);
 
     cx.bind_keys(bindings);
 }
@@ -348,6 +380,7 @@ impl KeybindingsPage {
                     "ClosePane",
                 ],
             ),
+            ("settings_group_keybind_document", vec!["SaveDocument"]),
         ];
 
         let mut result = Vec::new();
@@ -429,5 +462,25 @@ impl KeybindingsPage {
         }
 
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::action_key_context;
+    use crate::app::constants::{DOCUMENT_KEY_CONTEXT, TERMINAL_KEY_CONTEXT};
+
+    #[test]
+    fn assigns_terminal_and_document_actions_to_separate_contexts() {
+        assert_eq!(
+            action_key_context("FocusPaneLeft"),
+            Some(TERMINAL_KEY_CONTEXT)
+        );
+        assert_eq!(action_key_context("OpenSearch"), Some(TERMINAL_KEY_CONTEXT));
+        assert_eq!(
+            action_key_context("SaveDocument"),
+            Some(DOCUMENT_KEY_CONTEXT)
+        );
+        assert_eq!(action_key_context("OpenSettings"), None);
     }
 }

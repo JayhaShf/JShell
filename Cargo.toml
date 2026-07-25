@@ -17,7 +17,25 @@ directories = "5"
 flate2 = "1"
 gpui = { git = "https://github.com/zed-industries/zed" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit", "runtime_shaders", "wayland", "x11"] }
-gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "ca85b5588f5feea021f1ee86cb13703dc6f30ec4" }
+gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "ca85b5588f5feea021f1ee86cb13703dc6f30ec4", features = [
+    "tree-sitter-bash",
+    "tree-sitter-c",
+    "tree-sitter-cpp",
+    "tree-sitter-css",
+    "tree-sitter-diff",
+    "tree-sitter-go",
+    "tree-sitter-html",
+    "tree-sitter-javascript",
+    "tree-sitter-lua",
+    "tree-sitter-make",
+    "tree-sitter-markdown",
+    "tree-sitter-python",
+    "tree-sitter-rust",
+    "tree-sitter-sql",
+    "tree-sitter-toml",
+    "tree-sitter-typescript",
+    "tree-sitter-yaml",
+] }
 gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "ca85b5588f5feea021f1ee86cb13703dc6f30ec4" }
 menu = { git = "https://github.com/zed-industries/zed" }
 portable-pty = "0.8"

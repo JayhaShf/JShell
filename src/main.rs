@@ -5,6 +5,7 @@ use gpui_component_assets::Assets;
 
 mod app;
 mod backend;
+mod document;
 mod session;
 mod sftp;
 mod sync;
@@ -17,8 +18,8 @@ gpui::actions!(ashell_terminal, [TerminalTabKey, TerminalBacktabKey]);
 
 pub(crate) use app::keybinding_recorder::{
     ClosePane, Copy, FocusPaneDown, FocusPaneLeft, FocusPaneRight, FocusPaneUp, NewSsh, OpenSearch,
-    OpenSession, OpenSettings, OpenTransfers, Paste, SplitPaneDown, SplitPaneLeft, SplitPaneRight,
-    SplitPaneUp, ToggleSftpZoom, ToggleSidebar,
+    OpenSession, OpenSettings, OpenTransfers, Paste, SaveDocument, SplitPaneDown, SplitPaneLeft,
+    SplitPaneRight, SplitPaneUp, ToggleSftpZoom, ToggleSidebar,
 };
 
 pub(crate) use app::{Ashell, PaneLayout, SelectorEntry, SftpContextMenuState, TabGroup};

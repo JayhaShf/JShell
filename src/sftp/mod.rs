@@ -18,7 +18,7 @@ use russh::{
 };
 use russh_sftp::client::SftpSession;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
     task::JoinHandle,
 };
@@ -83,6 +83,24 @@ pub enum SftpCommand {
     ResumeTransfer(String),
     CancelTransfer(String),
     TransferFinished(String),
+    DocumentStat {
+        path: String,
+        reply:
+            tokio::sync::oneshot::Sender<anyhow::Result<crate::document::remote::RemoteMetadata>>,
+    },
+    DocumentRead {
+        path: String,
+        range: Option<crate::document::remote::ByteRange>,
+        reply: tokio::sync::oneshot::Sender<anyhow::Result<Vec<u8>>>,
+    },
+    DocumentWriteAtomic {
+        path: String,
+        bytes: Vec<u8>,
+        permissions: Option<u32>,
+        operation_id: String,
+        reply:
+            tokio::sync::oneshot::Sender<anyhow::Result<crate::document::remote::RemoteMetadata>>,
+    },
     Close,
 }
 
@@ -147,61 +165,107 @@ impl TransferStateFlag {
     }
 }
 
-pub struct SftpHandle {
-    pub commands: UnboundedSender<SftpCommand>,
+struct SftpHandleInner {
+    commands: UnboundedSender<SftpCommand>,
     #[allow(dead_code)]
     join: Option<JoinHandle<()>>,
 }
 
-impl Clone for SftpHandle {
-    fn clone(&self) -> Self {
-        Self {
-            commands: self.commands.clone(),
-            join: None,
-        }
+impl Drop for SftpHandleInner {
+    fn drop(&mut self) {
+        let _ = self.commands.send(SftpCommand::Close);
     }
 }
 
+#[derive(Clone)]
+pub struct SftpHandle {
+    inner: Arc<SftpHandleInner>,
+}
+
 impl SftpHandle {
+    pub(crate) fn send(&self, command: SftpCommand) {
+        let _ = self.inner.commands.send(command);
+    }
+
+    #[cfg(test)]
+    fn from_sender_for_test(commands: UnboundedSender<SftpCommand>) -> Self {
+        Self {
+            inner: Arc::new(SftpHandleInner {
+                commands,
+                join: None,
+            }),
+        }
+    }
+
     pub fn list_dir(&self, path: String) {
-        let _ = self.commands.send(SftpCommand::ListDir(path));
+        self.send(SftpCommand::ListDir(path));
     }
 
     #[allow(dead_code)]
     pub fn preview(&self, path: String) {
-        let _ = self.commands.send(SftpCommand::Preview(path));
+        self.send(SftpCommand::Preview(path));
     }
 
     pub fn download(&self, remote: String, local_dir: String) {
-        let _ = self
-            .commands
-            .send(SftpCommand::Download { remote, local_dir });
+        self.send(SftpCommand::Download { remote, local_dir });
     }
 
     pub fn upload_paths(&self, locals: Vec<String>, remote_dir: String) {
-        let _ = self
-            .commands
-            .send(SftpCommand::UploadPaths { locals, remote_dir });
+        self.send(SftpCommand::UploadPaths { locals, remote_dir });
     }
 
     pub fn edit_file(&self, remote_path: String) {
-        let _ = self.commands.send(SftpCommand::EditFile { remote_path });
-    }
-
-    pub fn close(&self) {
-        let _ = self.commands.send(SftpCommand::Close);
+        self.send(SftpCommand::EditFile { remote_path });
     }
 
     pub fn pause_transfer(&self, id: String) {
-        let _ = self.commands.send(SftpCommand::PauseTransfer(id));
+        self.send(SftpCommand::PauseTransfer(id));
     }
 
     pub fn resume_transfer(&self, id: String) {
-        let _ = self.commands.send(SftpCommand::ResumeTransfer(id));
+        self.send(SftpCommand::ResumeTransfer(id));
     }
 
     pub fn cancel_transfer(&self, id: String) {
-        let _ = self.commands.send(SftpCommand::CancelTransfer(id));
+        self.send(SftpCommand::CancelTransfer(id));
+    }
+
+    pub fn document_stat(
+        &self,
+        path: String,
+        reply: tokio::sync::oneshot::Sender<
+            anyhow::Result<crate::document::remote::RemoteMetadata>,
+        >,
+    ) {
+        self.send(SftpCommand::DocumentStat { path, reply });
+    }
+
+    pub fn document_read(
+        &self,
+        path: String,
+        range: Option<crate::document::remote::ByteRange>,
+        reply: tokio::sync::oneshot::Sender<anyhow::Result<Vec<u8>>>,
+    ) {
+        self.send(SftpCommand::DocumentRead { path, range, reply });
+    }
+
+    pub fn document_write_atomic(
+        &self,
+        path: String,
+        bytes: Vec<u8>,
+        permissions: Option<u32>,
+        operation_id: String,
+        reply: tokio::sync::oneshot::Sender<
+            anyhow::Result<crate::document::remote::RemoteMetadata>,
+        >,
+    ) {
+        self.send(SftpCommand::DocumentWriteAtomic {
+            path,
+            bytes,
+            permissions,
+            operation_id,
+            reply,
+        });
     }
 }
 
@@ -234,8 +298,10 @@ pub fn spawn_sftp(
         }
     });
     SftpHandle {
-        commands: cmd_tx,
-        join: Some(join),
+        inner: Arc::new(SftpHandleInner {
+            commands: cmd_tx,
+            join: Some(join),
+        }),
     }
 }
 
@@ -330,6 +396,46 @@ async fn run_sftp(
                     });
                 }
             },
+            SftpCommand::DocumentStat { path, reply } => {
+                let handle = handle.clone();
+                tokio::spawn(async move {
+                    let result = async {
+                        let sftp = open_sftp_subsystem(&handle).await?;
+                        document_stat_impl(&sftp, &path).await
+                    }
+                    .await;
+                    let _ = reply.send(result);
+                });
+            }
+            SftpCommand::DocumentRead { path, range, reply } => {
+                let handle = handle.clone();
+                tokio::spawn(async move {
+                    let result = async {
+                        let sftp = open_sftp_subsystem(&handle).await?;
+                        document_read_impl(&sftp, &path, range).await
+                    }
+                    .await;
+                    let _ = reply.send(result);
+                });
+            }
+            SftpCommand::DocumentWriteAtomic {
+                path,
+                bytes,
+                permissions,
+                operation_id,
+                reply,
+            } => {
+                let handle = handle.clone();
+                tokio::spawn(async move {
+                    let result = async {
+                        let sftp = open_sftp_subsystem(&handle).await?;
+                        document_write_atomic_impl(&sftp, &path, &bytes, permissions, &operation_id)
+                            .await
+                    }
+                    .await;
+                    let _ = reply.send(result);
+                });
+            }
             SftpCommand::Download { remote, local_dir } => {
                 let id = uuid::Uuid::new_v4().to_string();
                 let flag = TransferStateFlag::new();
@@ -1843,5 +1949,170 @@ impl Handler for SftpClientHandler {
         _server_public_key: &russh::keys::ssh_key::PublicKey,
     ) -> Result<bool, Self::Error> {
         Ok(true)
+    }
+}
+
+async fn open_sftp_subsystem(
+    handle: &Arc<russh::client::Handle<SftpClientHandler>>,
+) -> Result<SftpSession> {
+    let channel = handle
+        .channel_open_session()
+        .await
+        .context("open document sftp channel")?;
+    channel
+        .request_subsystem(true, "sftp")
+        .await
+        .context("request document sftp subsystem")?;
+    SftpSession::new(channel.into_stream())
+        .await
+        .context("document sftp handshake")
+}
+
+async fn document_stat_impl(
+    sftp: &SftpSession,
+    path: &str,
+) -> Result<crate::document::remote::RemoteMetadata> {
+    let metadata = match sftp.metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(russh_sftp::client::error::Error::Status(status))
+            if status.status_code == russh_sftp::protocol::StatusCode::NoSuchFile =>
+        {
+            return Err(crate::document::remote::RemoteFileError::NotFound.into());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    Ok(crate::document::remote::RemoteMetadata {
+        size: metadata.size.unwrap_or(0),
+        mtime: metadata.mtime.unwrap_or(0),
+        permissions: metadata.permissions,
+    })
+}
+
+async fn document_read_impl(
+    sftp: &SftpSession,
+    path: &str,
+    range: Option<crate::document::remote::ByteRange>,
+) -> Result<Vec<u8>> {
+    let mut file = sftp.open(path).await?;
+    let mut bytes = Vec::new();
+    if let Some(range) = range {
+        file.seek(std::io::SeekFrom::Start(range.offset)).await?;
+        file.take(range.length as u64)
+            .read_to_end(&mut bytes)
+            .await?;
+    } else {
+        file.read_to_end(&mut bytes).await?;
+    }
+    Ok(bytes)
+}
+
+async fn document_write_atomic_impl(
+    sftp: &SftpSession,
+    path: &str,
+    bytes: &[u8],
+    permissions: Option<u32>,
+    operation_id: &str,
+) -> Result<crate::document::remote::RemoteMetadata> {
+    let temporary = crate::document::remote::temporary_remote_path(path, operation_id);
+    let backup = crate::document::remote::backup_remote_path(path, operation_id);
+
+    let result = async {
+        let mut file = sftp.create(&temporary).await?;
+        file.write_all(bytes).await?;
+        file.flush().await?;
+        file.sync_all().await?;
+        drop(file);
+
+        if let Some(permissions) = permissions {
+            let mut attributes = russh_sftp::protocol::FileAttributes::empty();
+            attributes.permissions = Some(permissions);
+            sftp.set_metadata(&temporary, attributes).await?;
+        }
+
+        if sftp.rename(&temporary, path).await.is_err() {
+            sftp.rename(path, &backup).await?;
+            if let Err(replace_error) = sftp.rename(&temporary, path).await {
+                let restore_result = sftp.rename(&backup, path).await;
+                return match restore_result {
+                    Ok(()) => Err(replace_error.into()),
+                    Err(restore_error) => Err(anyhow!(
+                        "replace failed: {replace_error}; restore failed: {restore_error}"
+                    )),
+                };
+            }
+            if let Err(remove_error) = sftp.remove_file(&backup).await {
+                tracing::warn!("failed to remove document backup {backup}: {remove_error}");
+            }
+        }
+
+        document_stat_impl(sftp, path).await
+    }
+    .await;
+
+    if result.is_err() && sftp.try_exists(&temporary).await.unwrap_or(false) {
+        let _ = sftp.remove_file(&temporary).await;
+    }
+    result
+}
+
+#[cfg(test)]
+mod handle_tests {
+    use super::*;
+
+    #[test]
+    fn cloned_handle_only_closes_after_last_owner_drops() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = SftpHandle::from_sender_for_test(tx);
+        let document_handle = handle.clone();
+        drop(handle);
+        assert!(rx.try_recv().is_err());
+        drop(document_handle);
+        assert!(matches!(rx.try_recv(), Ok(SftpCommand::Close)));
+    }
+
+    #[test]
+    fn document_requests_are_forwarded_with_payloads() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = SftpHandle::from_sender_for_test(tx);
+
+        let (stat_reply, _stat_receive) = tokio::sync::oneshot::channel();
+        handle.document_stat("/etc/app.conf".into(), stat_reply);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(SftpCommand::DocumentStat { path, .. }) if path == "/etc/app.conf"
+        ));
+
+        let range = crate::document::remote::ByteRange {
+            offset: 4096,
+            length: 512,
+        };
+        let (read_reply, _read_receive) = tokio::sync::oneshot::channel();
+        handle.document_read("/var/log/app.log".into(), Some(range), read_reply);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(SftpCommand::DocumentRead { path, range: Some(actual), .. })
+                if path == "/var/log/app.log" && actual == range
+        ));
+
+        let (write_reply, _write_receive) = tokio::sync::oneshot::channel();
+        handle.document_write_atomic(
+            "/etc/app.conf".into(),
+            b"updated".to_vec(),
+            Some(0o100640),
+            "operation-1".into(),
+            write_reply,
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(SftpCommand::DocumentWriteAtomic {
+                path,
+                bytes,
+                permissions: Some(0o100640),
+                operation_id,
+                ..
+            }) if path == "/etc/app.conf"
+                && bytes == b"updated"
+                && operation_id == "operation-1"
+        ));
     }
 }

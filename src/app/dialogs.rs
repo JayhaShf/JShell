@@ -11,7 +11,7 @@ use gpui_component::{
     input::Input,
     menu::{DropdownMenu as _, PopupMenuItem},
     progress::Progress,
-    scroll::{Scrollbar, ScrollbarShow},
+    scroll::{ScrollableElement as _, Scrollbar, ScrollbarShow},
     switch::Switch,
     v_flex,
 };
@@ -20,6 +20,313 @@ use rust_i18n::t;
 use crate::{Ashell, session::config::AuthMethod, system::format_bytes};
 
 impl Ashell {
+    pub(crate) fn show_window_close_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let documents: Vec<(String, String)> = self
+            .dirty_document_ids()
+            .into_iter()
+            .filter_map(|document_id| {
+                self.documents.get(&document_id).map(|document| {
+                    (
+                        document.title().to_string(),
+                        document.key.remote_path.clone(),
+                    )
+                })
+            })
+            .collect();
+        if documents.is_empty() {
+            self.request_application_close(window, cx);
+            return;
+        }
+
+        let view = cx.entity();
+        window.open_dialog(cx, move |dialog: Dialog, _window, _cx| {
+            let listed_documents = documents.clone();
+            dialog
+                .title(t!("document_close_all_title").to_string())
+                .w(px(600.))
+                .keyboard(false)
+                .close_button(false)
+                .content(move |content, _window, _cx| {
+                    content.child(
+                        v_flex()
+                            .w_full()
+                            .gap_3()
+                            .child(div().child(t!("document_close_all_body").to_string()))
+                            .child(
+                                v_flex()
+                                    .w_full()
+                                    .max_h(px(260.))
+                                    .overflow_y_scrollbar()
+                                    .border_1()
+                                    .border_color(gpui::rgba(0x0000001f))
+                                    .children(listed_documents.iter().enumerate().map(
+                                        |(index, (title, path))| {
+                                            v_flex()
+                                                .w_full()
+                                                .px_3()
+                                                .py_2()
+                                                .when(index > 0, |row| {
+                                                    row.border_t_1()
+                                                        .border_color(gpui::rgba(0x0000001f))
+                                                })
+                                                .child(
+                                                    div()
+                                                        .font_weight(FontWeight::SEMIBOLD)
+                                                        .child(title.clone()),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_size(rems(0.833))
+                                                        .font_family("monospace")
+                                                        .child(path.clone()),
+                                                )
+                                        },
+                                    )),
+                            ),
+                    )
+                })
+                .footer({
+                    let cancel_view = view.clone();
+                    let discard_view = view.clone();
+                    let save_view = view.clone();
+                    h_flex()
+                        .w_full()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("document-close-all-cancel")
+                                .ghost()
+                                .label(t!("cancel").to_string())
+                                .on_click(move |_, window, cx| {
+                                    cancel_view.update(cx, |this, cx| {
+                                        this.cancel_application_close(cx);
+                                    });
+                                    window.close_dialog(cx);
+                                }),
+                        )
+                        .child(
+                            Button::new("document-close-all-discard")
+                                .danger()
+                                .label(t!("document_discard").to_string())
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    discard_view.update(cx, |this, cx| {
+                                        this.discard_all_and_close(window, cx);
+                                    });
+                                }),
+                        )
+                        .child(
+                            Button::new("document-close-all-save")
+                                .primary()
+                                .label(t!("document_save_all").to_string())
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    save_view.update(cx, |this, cx| {
+                                        this.save_all_and_close(window, cx);
+                                    });
+                                }),
+                        )
+                })
+        });
+    }
+
+    pub(crate) fn show_document_close_dialog(
+        &mut self,
+        document_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(path) = self
+            .documents
+            .get(&document_id)
+            .map(|document| document.key.remote_path.clone())
+        else {
+            return;
+        };
+        let view = cx.entity();
+        window.open_dialog(cx, move |dialog: Dialog, _window, _cx| {
+            let body = t!("document_close_unsaved_body", path = path.clone()).to_string();
+            let content_path = path.clone();
+            dialog
+                .title(t!("document_close_unsaved_title").to_string())
+                .w(px(560.))
+                .keyboard(false)
+                .content(move |content, _window, _cx| {
+                    content.child(
+                        v_flex()
+                            .w_full()
+                            .gap_3()
+                            .child(div().child(body.clone()))
+                            .child(
+                                div()
+                                    .px_3()
+                                    .py_2()
+                                    .rounded_md()
+                                    .bg(gpui::rgba(0x00000012))
+                                    .font_family("monospace")
+                                    .child(content_path.clone()),
+                            ),
+                    )
+                })
+                .footer({
+                    let save_view = view.clone();
+                    let discard_view = view.clone();
+                    let save_document_id = document_id.clone();
+                    let discard_document_id = document_id.clone();
+                    h_flex()
+                        .w_full()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("document-close-cancel")
+                                .ghost()
+                                .label(t!("cancel").to_string())
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("document-close-discard")
+                                .danger()
+                                .label(t!("document_discard").to_string())
+                                .on_click(move |_, window, cx| {
+                                    discard_view.update(cx, |this, cx| {
+                                        this.close_document_now(&discard_document_id, window, cx);
+                                    });
+                                    window.close_dialog(cx);
+                                }),
+                        )
+                        .child(
+                            Button::new("document-close-save")
+                                .primary()
+                                .label(t!("document_save").to_string())
+                                .on_click(move |_, window, cx| {
+                                    save_view.update(cx, |this, cx| {
+                                        this.save_and_close_document(
+                                            save_document_id.clone(),
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                    window.close_dialog(cx);
+                                }),
+                        )
+                })
+        });
+    }
+
+    pub(crate) fn show_document_conflict_dialog(
+        &mut self,
+        document_id: String,
+        remote_deleted: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(path) = self
+            .documents
+            .get(&document_id)
+            .map(|document| document.key.remote_path.clone())
+        else {
+            return;
+        };
+        let view = cx.entity();
+        window.open_dialog(cx, move |dialog: Dialog, _window, _cx| {
+            let title = if remote_deleted {
+                t!("document_remote_deleted_title").to_string()
+            } else {
+                t!("document_conflict_title").to_string()
+            };
+            let body = if remote_deleted {
+                t!("document_remote_deleted_body", path = path.clone()).to_string()
+            } else {
+                t!("document_conflict_body", path = path.clone()).to_string()
+            };
+            let content_path = path.clone();
+            dialog
+                .title(title)
+                .w(px(560.))
+                .keyboard(false)
+                .content(move |content, _window, _cx| {
+                    content.child(
+                        v_flex()
+                            .w_full()
+                            .gap_3()
+                            .child(div().child(body.clone()))
+                            .child(
+                                div()
+                                    .px_3()
+                                    .py_2()
+                                    .rounded_md()
+                                    .bg(gpui::rgba(0x00000012))
+                                    .font_family("monospace")
+                                    .child(content_path.clone()),
+                            ),
+                    )
+                })
+                .footer({
+                    let view = view.clone();
+                    let reload_document_id = document_id.clone();
+                    let force_document_id = document_id.clone();
+                    let cancel_document_id = document_id.clone();
+                    h_flex()
+                        .w_full()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("document-conflict-cancel")
+                                .ghost()
+                                .label(t!("cancel").to_string())
+                                .on_click({
+                                    let view = view.clone();
+                                    move |_, window, cx| {
+                                        view.update(cx, |this, cx| {
+                                            this.cancel_document_conflict(&cancel_document_id, cx);
+                                        });
+                                        window.close_dialog(cx);
+                                    }
+                                }),
+                        )
+                        .when(!remote_deleted, |this| {
+                            this.child(
+                                Button::new("document-conflict-reload")
+                                    .secondary()
+                                    .label(t!("document_reload").to_string())
+                                    .on_click({
+                                        let view = view.clone();
+                                        move |_, window, cx| {
+                                            view.update(cx, |this, cx| {
+                                                this.reload_document(
+                                                    reload_document_id.clone(),
+                                                    window,
+                                                    cx,
+                                                );
+                                            });
+                                            window.close_dialog(cx);
+                                        }
+                                    }),
+                            )
+                        })
+                        .child(
+                            Button::new("document-conflict-overwrite")
+                                .danger()
+                                .label(if remote_deleted {
+                                    t!("document_recreate").to_string()
+                                } else {
+                                    t!("document_force_overwrite").to_string()
+                                })
+                                .on_click(move |_, window, cx| {
+                                    view.update(cx, |this, cx| {
+                                        this.force_overwrite_document(
+                                            force_document_id.clone(),
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                    window.close_dialog(cx);
+                                }),
+                        )
+                })
+        });
+    }
+
     pub(crate) fn show_ssh_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_dialog.is_some() {
             return;
@@ -1181,9 +1488,9 @@ impl Ashell {
                     move |_, window, cx| {
                         view.update(cx, |this, cx| {
                             if let Some(handle) = this.active_sftp_handle() {
-                                let _ = handle.commands.send(
-                                    crate::sftp::SftpCommand::DeletePaths(paths_to_delete.clone()),
-                                );
+                                handle.send(crate::sftp::SftpCommand::DeletePaths(
+                                    paths_to_delete.clone(),
+                                ));
                             }
                             if let Some(sftp) = this.active_sftp_mut() {
                                 sftp.selected_entries.clear();
@@ -1304,11 +1611,9 @@ impl Ashell {
                                     move |_, window, cx| {
                                         view.update(cx, |this, cx| {
                                             if let Some(handle) = this.active_sftp_handle() {
-                                                let _ = handle.commands.send(
-                                                    crate::sftp::SftpCommand::DeletePaths(
-                                                        paths_to_delete.clone(),
-                                                    ),
-                                                );
+                                                handle.send(crate::sftp::SftpCommand::DeletePaths(
+                                                    paths_to_delete.clone(),
+                                                ));
                                             }
                                             if let Some(sftp) = this.active_sftp_mut() {
                                                 sftp.selected_entries.clear();

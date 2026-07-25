@@ -155,6 +155,20 @@ impl Ashell {
         cx.notify();
     }
 
+    pub(crate) fn trigger_sftp_context_open_document(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(menu) = self.sftp_context_menu.take() else {
+            return;
+        };
+        if !menu.is_dir {
+            self.open_remote_document(menu.remote_path, window, cx);
+        }
+        cx.notify();
+    }
+
     pub(crate) fn download_sftp_entry(
         &mut self,
         remote_path: String,
@@ -168,7 +182,11 @@ impl Ashell {
             files: false,
             directories: true,
             multiple: false,
-            prompt: Some("Select Download Folder".into()),
+            prompt: Some(
+                rust_i18n::t!("document_select_download_folder")
+                    .to_string()
+                    .into(),
+            ),
         });
         cx.spawn_in(window, async move |this, cx| {
             match path_prompt.await {
@@ -339,7 +357,11 @@ impl Ashell {
             files: false,
             directories: true,
             multiple: false,
-            prompt: Some("Select Download Folder".into()),
+            prompt: Some(
+                rust_i18n::t!("document_select_download_folder")
+                    .to_string()
+                    .into(),
+            ),
         });
 
         cx.spawn_in(window, async move |this, cx| {
@@ -352,7 +374,7 @@ impl Ashell {
                         local_dir
                     );
                     for remote in selected {
-                        let _ = handle.commands.send(crate::sftp::SftpCommand::Download {
+                        handle.send(crate::sftp::SftpCommand::Download {
                             remote,
                             local_dir: local_dir.clone(),
                         });
@@ -383,7 +405,7 @@ impl Ashell {
                     paths.len(),
                     sftp.current_path
                 );
-                let _ = handle.commands.send(crate::sftp::SftpCommand::UploadPaths {
+                handle.send(crate::sftp::SftpCommand::UploadPaths {
                     locals: paths,
                     remote_dir: sftp.current_path.clone(),
                 });

@@ -11,3 +11,4 @@ pub(crate) const TERMINAL_PADDING_X: f32 = 32.0;
 pub(crate) const TERMINAL_PADDING_Y: f32 = 32.0;
 
 pub(crate) const TERMINAL_KEY_CONTEXT: &str = "AshellTerminal";
+pub(crate) const DOCUMENT_KEY_CONTEXT: &str = "AshellDocument";

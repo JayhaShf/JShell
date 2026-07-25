@@ -255,6 +255,13 @@ pub(crate) struct Ashell {
     pub(crate) active_tab: Option<String>,
     pub(crate) tab_groups: Vec<TabGroup>,
     pub(crate) active_group: Option<String>,
+    pub(crate) workspace_tabs: Vec<crate::document::WorkspaceTab>,
+    pub(crate) active_workspace_tab: Option<String>,
+    pub(crate) documents: std::collections::HashMap<String, crate::document::RemoteDocument>,
+    pub(crate) allow_window_close: bool,
+    pub(crate) window_close_prompt_open: bool,
+    pub(crate) window_close_save_queue: Vec<String>,
+    pub(crate) window_close_save_current: Option<String>,
     pub(crate) selector_selection: usize,
     pub(crate) workspace_panels: Entity<ResizableState>,
     pub(crate) body_panels: Entity<ResizableState>,
@@ -638,6 +645,13 @@ impl Ashell {
             active_tab: None,
             tab_groups: Vec::new(),
             active_group: None,
+            workspace_tabs: Vec::new(),
+            active_workspace_tab: None,
+            documents: std::collections::HashMap::new(),
+            allow_window_close: false,
+            window_close_prompt_open: false,
+            window_close_save_queue: Vec::new(),
+            window_close_save_current: None,
             pane_root: PaneLayout::Single(String::new()),
             focused_pane_path: Vec::new(),
             terminal_panel_bounds: None,
@@ -826,9 +840,7 @@ impl Ashell {
                         let base_path = self.sftp_path_input.read(cx).text().to_string();
                         let path = crate::sftp::join_remote(&base_path, &name);
                         if let Some(handle) = self.active_sftp_handle() {
-                            let _ = handle
-                                .commands
-                                .send(crate::sftp::SftpCommand::CreateDir(path));
+                            handle.send(crate::sftp::SftpCommand::CreateDir(path));
                         }
                     }
                     self.sftp_creating_folder = false;
@@ -1296,9 +1308,7 @@ impl Ashell {
 
                 if let Some(session) = group_session {
                     if session.protocol != "serial" {
-                        if let Some(old_handle) = self.sftp_handles.remove(&group_id) {
-                            old_handle.close();
-                        }
+                        self.sftp_handles.remove(&group_id);
                         let sftp_handle = crate::sftp::spawn_sftp(
                             self.runtime.handle(),
                             group_id.clone(),
@@ -1373,9 +1383,7 @@ impl Ashell {
                         sftp.current_path = path.clone();
                         self.pending_sftp_path_sync = Some(path.clone());
                         if let Some(handle) = self.sftp_handles.get(&group.id) {
-                            let _ = handle
-                                .commands
-                                .send(crate::sftp::SftpCommand::ListDir(path));
+                            handle.send(crate::sftp::SftpCommand::ListDir(path));
                         }
                     }
                 }

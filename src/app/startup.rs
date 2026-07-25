@@ -317,6 +317,16 @@ pub(crate) fn open_main_window(cx: &mut App) {
                 );
                 return true;
             }
+            if view_clone.read(cx).allow_window_close {
+                view_clone.read(cx).save_layout_state(window, cx);
+                return true;
+            }
+            if view_clone.read(cx).has_dirty_documents() {
+                view_clone.update(cx, |this, cx| {
+                    this.request_application_close(window, cx);
+                });
+                return false;
+            }
             view_clone.read(cx).save_layout_state(window, cx);
             true
         });

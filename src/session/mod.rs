@@ -20,6 +20,25 @@ use crate::{
 };
 
 impl Ashell {
+    fn register_session_workspace(&mut self, group_id: String) {
+        if !self.workspace_tabs.iter().any(|workspace| {
+            matches!(
+                workspace,
+                crate::document::WorkspaceTab::Session {
+                    group_id: existing,
+                    ..
+                } if existing == &group_id
+            )
+        }) {
+            self.workspace_tabs
+                .push(crate::document::WorkspaceTab::Session {
+                    id: group_id.clone(),
+                    group_id: group_id.clone(),
+                });
+        }
+        self.active_workspace_tab = Some(group_id);
+    }
+
     pub(crate) fn open_local(&mut self, cx: &mut Context<Self>) {
         let id = Uuid::new_v4().to_string();
         match local::spawn_local_terminal(
@@ -44,7 +63,8 @@ impl Ashell {
                     pane_root: PaneLayout::Single(id),
                     sftp: None,
                 });
-                self.active_group = Some(group_id);
+                self.active_group = Some(group_id.clone());
+                self.register_session_workspace(group_id);
                 self.tabs_scroll_handle.scroll_to_item(self.tabs.len() - 1);
                 self.status = "local terminal opened".into();
             }
@@ -645,6 +665,7 @@ impl Ashell {
             }),
         });
         self.active_group = Some(group_id.clone());
+        self.register_session_workspace(group_id.clone());
         self.tabs_scroll_handle.scroll_to_item(self.tabs.len() - 1);
         if let Some(session_id) = self.active_session_id() {
             if let Some(index) = self
@@ -706,6 +727,7 @@ impl Ashell {
             sftp: None,
         });
         self.active_group = Some(group_id.clone());
+        self.register_session_workspace(group_id.clone());
         self.tabs_scroll_handle.scroll_to_item(self.tabs.len() - 1);
         if let Some(session_id) = self.active_session_id() {
             if let Some(index) = self
@@ -799,9 +821,7 @@ impl Ashell {
 
                 if let Some(session) = group_session {
                     if session.protocol != "serial" {
-                        if let Some(old_handle) = self.sftp_handles.remove(&group_id) {
-                            old_handle.close();
-                        }
+                        self.sftp_handles.remove(&group_id);
                         let sftp_handle = crate::sftp::spawn_sftp(
                             self.runtime.handle(),
                             group_id.clone(),
@@ -984,10 +1004,15 @@ impl Ashell {
                     self.tabs.retain(|t| t.id != *tab_id);
                 }
             }
-            if let Some(handle) = self.sftp_handles.remove(&group.id) {
-                handle.close();
-            }
+            self.sftp_handles.remove(&group.id);
             self.tab_groups.remove(group_ix.unwrap());
+            self.workspace_tabs.retain(|workspace| {
+                !matches!(
+                    workspace,
+                    crate::document::WorkspaceTab::Session { group_id, .. }
+                        if group_id == &group.id
+                )
+            });
             self.pane_root.remove_tab(&id);
         } else {
             // Just remove this tab from the group
@@ -1018,9 +1043,11 @@ impl Ashell {
             self.net_rx_history.clear();
             self.net_tx_history.clear();
             self.system_status = None;
-            for (_, handle) in self.sftp_handles.drain() {
-                handle.close();
-            }
+            self.sftp_handles.clear();
+            self.active_workspace_tab = self
+                .workspace_tabs
+                .first()
+                .map(|workspace| workspace.id().to_string());
             return;
         }
 
@@ -1047,6 +1074,7 @@ impl Ashell {
                     .find(|g| g.pane_root.contains(&new_id))
                 {
                     self.active_group = Some(g.id.clone());
+                    self.active_workspace_tab = Some(g.id.clone());
                     self.pane_root = g.pane_root.clone();
                 }
                 self.focus_pane_with_id(new_id);
@@ -1450,7 +1478,8 @@ impl Ashell {
         // Load new group state
         if let Some(group) = self.tab_groups.iter().find(|g| g.id == group_id) {
             self.pane_root = group.pane_root.clone();
-            self.active_group = Some(group_id);
+            self.active_group = Some(group_id.clone());
+            self.active_workspace_tab = Some(group_id);
             let ids = group.pane_root.tab_ids();
             if let Some(&first_id) = ids.first() {
                 self.active_tab = Some(first_id.to_string());
@@ -1460,6 +1489,31 @@ impl Ashell {
         }
         self.sync_system_tab_to_active_group();
         cx.notify();
+    }
+
+    pub(crate) fn activate_workspace(
+        &mut self,
+        workspace_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self
+            .workspace_tabs
+            .iter()
+            .find(|workspace| workspace.id() == workspace_id)
+            .cloned()
+        else {
+            return;
+        };
+        self.active_workspace_tab = Some(workspace_id);
+        match workspace {
+            crate::document::WorkspaceTab::Session { group_id, .. } => {
+                self.activate_group(group_id, window, cx);
+            }
+            crate::document::WorkspaceTab::RemoteDocument { document_id, .. } => {
+                self.focus_document_workspace(&document_id, window, cx);
+            }
+        }
     }
 
     pub(crate) fn sync_pane_root_to_group(&mut self) {

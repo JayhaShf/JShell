@@ -29,6 +29,19 @@ use crate::{
     terminal::{self, TabKind},
 };
 
+#[derive(Clone)]
+enum WorkspaceCloseTarget {
+    Session(String),
+    Document(String),
+}
+
+struct WorkspaceTabRenderData {
+    workspace_id: String,
+    label: String,
+    accent: Hsla,
+    close_target: WorkspaceCloseTarget,
+}
+
 impl Ashell {
     fn render_home_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
@@ -615,12 +628,20 @@ impl Ashell {
                                                     MouseButton::Left,
                                                     window.listener_for(&view, {
                                                         let entry = entry.clone();
-                                                        move |this, _, _, cx| {
+                                                        move |this, event: &MouseDownEvent, window, cx| {
                                                             this.dismiss_sftp_context_menu(cx);
-                                                            this.select_sftp_entry(
-                                                                entry.clone(),
-                                                                cx,
-                                                            );
+                                                            if !entry.is_dir && event.click_count == 2 {
+                                                                this.open_remote_document(
+                                                                    entry.full_path.clone(),
+                                                                    window,
+                                                                    cx,
+                                                                );
+                                                            } else {
+                                                                this.select_sftp_entry(
+                                                                    entry.clone(),
+                                                                    cx,
+                                                                );
+                                                            }
                                                         }
                                                     }),
                                                 )
@@ -2029,8 +2050,7 @@ impl Ashell {
                             this.window_control_area(gpui::WindowControlArea::Close)
                         })
                         .on_click(cx.listener(|this, _, window, cx| {
-                            this.save_layout_state(window, cx);
-                            window.remove_window();
+                            this.request_application_close(window, cx);
                         }))
                         .hover(|s| s.bg(hsla(3.0 / 360.0, 1.0, 0.55, 1.0)))
                         .active(|s| s.bg(hsla(3.0 / 360.0, 1.0, 0.45, 1.0)))
@@ -2133,28 +2153,91 @@ impl Ashell {
     }
 
     fn render_tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let active_tab_index = self
-            .active_tab
-            .as_ref()
-            .and_then(|active_id| self.tabs.iter().position(|tab| &tab.id == active_id));
-        let active_group_index = self
-            .active_group
-            .as_ref()
-            .and_then(|gid| self.tab_groups.iter().position(|g| g.id == *gid));
-        let selected = active_group_index.unwrap_or(active_tab_index.unwrap_or(0));
-        let groups_data: Vec<(String, String, Vec<String>)> = self
-            .tab_groups
+        let tabs_data: Vec<WorkspaceTabRenderData> = self
+            .workspace_tabs
             .iter()
-            .map(|g| {
-                let pane_ids: Vec<String> = g
-                    .pane_root
-                    .tab_ids()
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect();
-                (g.id.clone(), g.title.clone(), pane_ids)
+            .filter_map(|workspace| match workspace {
+                crate::document::WorkspaceTab::Session {
+                    id: workspace_id,
+                    group_id,
+                } => {
+                    let group = self.tab_groups.iter().find(|group| &group.id == group_id)?;
+                    let pane_ids: Vec<String> = group
+                        .pane_root
+                        .tab_ids()
+                        .iter()
+                        .map(|id| id.to_string())
+                        .collect();
+                    let label = if pane_ids.len() > 1 {
+                        format!("{} ({})", group.title, pane_ids.len())
+                    } else {
+                        group.title.clone()
+                    };
+                    let close_id = if self.active_group.as_ref() == Some(group_id) {
+                        self.active_tab
+                            .clone()
+                            .or_else(|| pane_ids.first().cloned())
+                            .unwrap_or_default()
+                    } else {
+                        pane_ids.first().cloned().unwrap_or_default()
+                    };
+                    let accent = pane_ids
+                        .first()
+                        .and_then(|id| self.tabs.iter().find(|tab| tab.id == *id))
+                        .map(|tab| {
+                            if tab.connected {
+                                cx.theme().success
+                            } else {
+                                cx.theme().danger
+                            }
+                        })
+                        .unwrap_or(cx.theme().success);
+                    Some(WorkspaceTabRenderData {
+                        workspace_id: workspace_id.clone(),
+                        label,
+                        accent,
+                        close_target: WorkspaceCloseTarget::Session(close_id),
+                    })
+                }
+                crate::document::WorkspaceTab::RemoteDocument {
+                    id: workspace_id,
+                    document_id,
+                } => {
+                    let document = self.documents.get(document_id)?;
+                    let label = if document.revisions.is_dirty() {
+                        format!("{} •", document.title())
+                    } else {
+                        document.title().to_string()
+                    };
+                    let accent = match (&document.load_state, &document.save_state) {
+                        (crate::document::LoadState::Failed(_), _)
+                        | (_, crate::document::SaveState::Failed(_))
+                        | (_, crate::document::SaveState::Conflict) => cx.theme().danger,
+                        (crate::document::LoadState::Loading, _)
+                        | (_, crate::document::SaveState::Checking)
+                        | (_, crate::document::SaveState::Saving) => cx.theme().warning,
+                        _ if document.revisions.is_dirty() => cx.theme().warning,
+                        _ => cx.theme().primary,
+                    };
+                    Some(WorkspaceTabRenderData {
+                        workspace_id: workspace_id.clone(),
+                        label,
+                        accent,
+                        close_target: WorkspaceCloseTarget::Document(document_id.clone()),
+                    })
+                }
             })
             .collect();
+        let selected = self
+            .active_workspace_tab
+            .as_ref()
+            .and_then(|active| {
+                tabs_data
+                    .iter()
+                    .position(|workspace| &workspace.workspace_id == active)
+            })
+            .unwrap_or(0);
+        let has_active_document = self.active_document_id().is_some();
         let is_integrated =
             self.active_title_bar_style == crate::session::config::TitleBarStyle::Integrated;
 
@@ -2177,73 +2260,55 @@ impl Ashell {
                         TabBar::new("ashell-tab-bar")
                             .track_scroll(&self.tabs_scroll_handle)
                             .selected_index(selected)
-                            .children(groups_data.iter().enumerate().map(
-                                |(ix, (group_id, title, pane_ids))| {
-                                    let gid = group_id.clone();
-                                    let label = if pane_ids.len() > 1 {
-                                        format!("{} ({})", title, pane_ids.len())
-                                    } else {
-                                        title.clone()
-                                    };
-                                    let close_id = if self.active_group.as_ref() == Some(&gid) {
-                                        self.active_tab.clone().unwrap_or_else(|| {
-                                            pane_ids.first().cloned().unwrap_or_default()
-                                        })
-                                    } else {
-                                        pane_ids.first().cloned().unwrap_or_default()
-                                    };
-
-                                    let dot_color = pane_ids
-                                        .first()
-                                        .and_then(|id| self.tabs.iter().find(|t| t.id == *id))
-                                        .map(|tab| {
-                                            if tab.connected {
-                                                cx.theme().success
-                                            } else {
-                                                cx.theme().danger
-                                            }
-                                        })
-                                        .unwrap_or(cx.theme().success);
-                                    Tab::new()
-                                        .min_w(px(80.))
-                                        .prefix(div().w(px(5.)).h(px(32.)).bg(dot_color))
-                                        .child(
-                                            div()
-                                                .when(ix == selected, |this| {
-                                                    this.font_weight(FontWeight::BOLD)
-                                                        .text_color(cx.theme().primary)
-                                                        .text_base()
-                                                })
-                                                .child(label),
-                                        )
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.activate_group(gid.clone(), window, cx)
-                                        }))
-                                        .suffix(
-                                            Button::new(("tab-close", ix))
-                                                .ghost()
-                                                .xsmall()
-                                                .icon(IconName::Close)
-                                                .mr(px(5.))
-                                                .on_mouse_down(
-                                                    MouseButton::Left,
-                                                    |_, window, cx| {
-                                                        window.prevent_default();
-                                                        cx.stop_propagation();
-                                                    },
-                                                )
-                                                .on_click(cx.listener(
-                                                    move |this, _, window, cx| {
-                                                        window.prevent_default();
-                                                        cx.stop_propagation();
-                                                        if !close_id.is_empty() {
-                                                            this.close_tab(close_id.clone(), cx)
-                                                        }
-                                                    },
-                                                )),
-                                        )
-                                },
-                            ))
+                            .children(tabs_data.iter().enumerate().map(|(ix, tab_data)| {
+                                let workspace_id = tab_data.workspace_id.clone();
+                                let close_target = tab_data.close_target.clone();
+                                Tab::new()
+                                    .min_w(px(80.))
+                                    .prefix(div().w(px(5.)).h(px(32.)).bg(tab_data.accent))
+                                    .child(
+                                        div()
+                                            .when(ix == selected, |this| {
+                                                this.font_weight(FontWeight::BOLD)
+                                                    .text_color(cx.theme().primary)
+                                                    .text_base()
+                                            })
+                                            .child(tab_data.label.clone()),
+                                    )
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.activate_workspace(workspace_id.clone(), window, cx)
+                                    }))
+                                    .suffix(
+                                        Button::new(("tab-close", ix))
+                                            .ghost()
+                                            .xsmall()
+                                            .icon(IconName::Close)
+                                            .mr(px(5.))
+                                            .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                                                window.prevent_default();
+                                                cx.stop_propagation();
+                                            })
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                window.prevent_default();
+                                                cx.stop_propagation();
+                                                match &close_target {
+                                                    WorkspaceCloseTarget::Session(close_id)
+                                                        if !close_id.is_empty() =>
+                                                    {
+                                                        this.close_tab(close_id.clone(), cx)
+                                                    }
+                                                    WorkspaceCloseTarget::Document(document_id) => {
+                                                        this.request_close_document(
+                                                            document_id.clone(),
+                                                            window,
+                                                            cx,
+                                                        )
+                                                    }
+                                                    _ => {}
+                                                }
+                                            })),
+                                    )
+                            }))
                             .last_empty_space(div().w_3())
                             .w_full()
                             .h_full()
@@ -2266,33 +2331,35 @@ impl Ashell {
                                 this.show_selector_dialog(window, cx)
                             })),
                     )
-                    .child(
-                        Button::new("split-horizontal")
-                            .secondary()
-                            .small()
-                            .rounded(px(999.))
-                            .icon(IconName::PanelBottom)
-                            .tooltip(t!("settings_split_pane_down").to_string())
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                window.prevent_default();
-                                cx.stop_propagation();
-                                this.split_current_pane("down", cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("split-vertical")
-                            .secondary()
-                            .small()
-                            .rounded(px(999.))
-                            .icon(IconName::PanelRight)
-                            .tooltip(t!("settings_split_pane_right").to_string())
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                window.prevent_default();
-                                cx.stop_propagation();
-                                this.split_current_pane("right", cx);
-                            })),
-                    )
-                    .child(self.render_search_button(cx)),
+                    .when(!has_active_document, |this| {
+                        this.child(
+                            Button::new("split-horizontal")
+                                .secondary()
+                                .small()
+                                .rounded(px(999.))
+                                .icon(IconName::PanelBottom)
+                                .tooltip(t!("settings_split_pane_down").to_string())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    window.prevent_default();
+                                    cx.stop_propagation();
+                                    this.split_current_pane("down", cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("split-vertical")
+                                .secondary()
+                                .small()
+                                .rounded(px(999.))
+                                .icon(IconName::PanelRight)
+                                .tooltip(t!("settings_split_pane_right").to_string())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    window.prevent_default();
+                                    cx.stop_propagation();
+                                    this.split_current_pane("right", cx);
+                                })),
+                        )
+                        .child(self.render_search_button(cx))
+                    }),
             )
     }
 
@@ -2625,47 +2692,12 @@ impl Ashell {
                 .into_any_element(),
         }
     }
-}
 
-impl Render for Ashell {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self
-            .active_tab
-            .as_ref()
-            .is_some_and(|active_id| !self.tabs.iter().any(|tab| &tab.id == active_id))
-        {
-            self.active_tab = self.tabs.first().map(|tab| tab.id.clone());
-        }
-        self.sync_sftp_path_input(window, cx);
-
-        if self.show_transfers_dialog {
-            self.show_transfers_dialog = false;
-            self.show_transfers_dialog(window, cx);
-        }
-        if let Some(active_id) = self.active_tab.clone() {
-            if let Some(scrollbar) = self.terminal_scrollbars.get(&active_id) {
-                if let Some(new_display_offset) = scrollbar.future_display_offset.take() {
-                    if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == active_id) {
-                        let current = tab.render_snapshot(false).display_offset;
-                        match new_display_offset.cmp(&current) {
-                            std::cmp::Ordering::Greater => {
-                                tab.scroll_up_by(new_display_offset - current)
-                            }
-                            std::cmp::Ordering::Less => {
-                                tab.scroll_down_by(current - new_display_offset)
-                            }
-                            std::cmp::Ordering::Equal => {}
-                        }
-                    }
-                }
-            }
-            if let Some(snapshot) = self.active_snapshot().as_ref() {
-                if let Some(scrollbar) = self.terminal_scrollbars.get(&active_id) {
-                    scrollbar.update(snapshot, px(self.terminal_line_height()));
-                }
-            }
-        }
-
+    fn render_terminal_workspace(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let monitoring_contents = v_flex()
             .size_full()
             .when(self.config.monitoring_position() == "Bottom", |this| {
@@ -2677,17 +2709,15 @@ impl Render for Ashell {
         let minimized_height = if is_monitor_bottom { 104. } else { 24. };
         let min_panel_height = if is_monitor_bottom { 260. } else { 180. };
         let default_panel_height = if is_monitor_bottom { 328. } else { 248. };
-
         let sftp_size = if self.sftp_panel_minimized {
             px(minimized_height)
         } else {
             px(self
                 .config
                 .body_panels()
-                .and_then(|s| s.get(1).copied())
+                .and_then(|sizes| sizes.get(1).copied())
                 .unwrap_or(default_panel_height))
         };
-
         let body_panel = v_resizable("ashell-body")
             .lock(self.config.lock_layout())
             .with_state(&self.body_panels)
@@ -2704,7 +2734,7 @@ impl Render for Ashell {
             )
             .into_any_element();
 
-        let workspace = if self.sidebar_collapsed {
+        if self.sidebar_collapsed {
             h_flex()
                 .size_full()
                 .child(
@@ -2745,12 +2775,11 @@ impl Render for Ashell {
                 .size(px(self
                     .config
                     .workspace_panels()
-                    .and_then(|s| s.first().copied())
+                    .and_then(|sizes| sizes.first().copied())
                     .unwrap_or(SIDEBAR_WIDTH)))
                 .size_range(px(240.)..px(520.))
                 .flex_none()
                 .child(self.sidebar(cx));
-
             let main_area = resizable_panel().child(
                 v_flex()
                     .size_full()
@@ -2774,13 +2803,94 @@ impl Render for Ashell {
                     )
                     .child(body_panel),
             );
-
             h_resizable("ashell-workspace")
                 .lock(self.config.lock_layout())
                 .with_state(&self.workspace_panels)
                 .child(sidebar_area)
                 .child(main_area)
                 .into_any_element()
+        }
+    }
+}
+
+impl Render for Ashell {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let active_document_id = self.active_document_id();
+        if self
+            .active_tab
+            .as_ref()
+            .is_some_and(|active_id| !self.tabs.iter().any(|tab| &tab.id == active_id))
+        {
+            self.active_tab = self.tabs.first().map(|tab| tab.id.clone());
+        }
+        if active_document_id.is_none() {
+            self.sync_sftp_path_input(window, cx);
+        }
+
+        if self.show_transfers_dialog {
+            self.show_transfers_dialog = false;
+            self.show_transfers_dialog(window, cx);
+        }
+        if active_document_id.is_none()
+            && let Some(active_id) = self.active_tab.clone()
+        {
+            if let Some(scrollbar) = self.terminal_scrollbars.get(&active_id) {
+                if let Some(new_display_offset) = scrollbar.future_display_offset.take() {
+                    if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == active_id) {
+                        let current = tab.render_snapshot(false).display_offset;
+                        match new_display_offset.cmp(&current) {
+                            std::cmp::Ordering::Greater => {
+                                tab.scroll_up_by(new_display_offset - current)
+                            }
+                            std::cmp::Ordering::Less => {
+                                tab.scroll_down_by(current - new_display_offset)
+                            }
+                            std::cmp::Ordering::Equal => {}
+                        }
+                    }
+                }
+            }
+            if let Some(snapshot) = self.active_snapshot().as_ref() {
+                if let Some(scrollbar) = self.terminal_scrollbars.get(&active_id) {
+                    scrollbar.update(snapshot, px(self.terminal_line_height()));
+                }
+            }
+        }
+
+        let workspace = if let Some(document_id) = active_document_id {
+            v_flex()
+                .size_full()
+                .relative()
+                .overflow_hidden()
+                .when(
+                    self.active_title_bar_style == crate::session::config::TitleBarStyle::Native,
+                    |this| {
+                        this.child(
+                            div()
+                                .flex_none()
+                                .h(px(32.))
+                                .w_full()
+                                .bg(cx.theme().tab_bar)
+                                .border_b_1()
+                                .border_color(cx.theme().border)
+                                .child(self.render_tab_bar(cx)),
+                        )
+                    },
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .child(crate::document::ui::render_document(
+                            self,
+                            &document_id,
+                            window,
+                            cx,
+                        )),
+                )
+                .into_any_element()
+        } else {
+            self.render_terminal_workspace(window, cx)
         };
 
         v_flex()
@@ -2955,6 +3065,22 @@ impl Render for Ashell {
                                                     this.trigger_sftp_context_download(window, cx);
                                                 })),
                                         )
+                                        .when(!menu.is_dir, |this| {
+                                            this.child(
+                                                Button::new("sftp-context-open-document")
+                                                    .ghost()
+                                                    .w_full()
+                                                    .justify_start()
+                                                    .label(t!("open_in_ashell"))
+                                                    .on_click(cx.listener(
+                                                        |this, _, window, cx| {
+                                                            this.trigger_sftp_context_open_document(
+                                                                window, cx,
+                                                            );
+                                                        },
+                                                    )),
+                                            )
+                                        })
                                         .when(
                                             !menu.is_dir
                                                 && is_editable_text_file(&menu.remote_path),
