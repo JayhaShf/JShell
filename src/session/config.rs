@@ -304,6 +304,17 @@ fn default_terminal_font_family() -> String {
     "Noto Sans CJK SC".to_string()
 }
 
+fn migrate_legacy_font_families(config: &mut ConfigFile) -> bool {
+    let mut migrated = false;
+    for font_family in [&mut config.ui_font_family, &mut config.terminal_font_family] {
+        if font_family == "Maple Mono NF CN" {
+            *font_family = "Noto Sans CJK SC".to_string();
+            migrated = true;
+        }
+    }
+    migrated
+}
+
 impl Default for ConfigFile {
     fn default() -> Self {
         Self {
@@ -415,7 +426,12 @@ impl ConfigStore {
         if cache.sync_device_id.is_empty() {
             cache.sync_device_id = Uuid::new_v4().to_string();
         }
-        Ok(Self { path, cache })
+        let migrated_fonts = migrate_legacy_font_families(&mut cache);
+        let store = Self { path, cache };
+        if migrated_fonts && let Err(err) = store.save() {
+            tracing::warn!("failed to persist migrated font preferences: {err:#}");
+        }
+        Ok(store)
     }
 
     pub fn in_memory() -> Self {
@@ -1206,6 +1222,19 @@ mod tests {
     #[test]
     fn default_fonts_use_noto_sans_cjk_sc() {
         let config = ConfigFile::default();
+        assert_eq!(config.ui_font_family, "Noto Sans CJK SC");
+        assert_eq!(config.terminal_font_family, "Noto Sans CJK SC");
+    }
+
+    #[test]
+    fn legacy_maple_font_preferences_migrate_to_noto_sans_cjk_sc() {
+        let mut config = ConfigFile {
+            ui_font_family: "Maple Mono NF CN".to_string(),
+            terminal_font_family: "Maple Mono NF CN".to_string(),
+            ..ConfigFile::default()
+        };
+
+        assert!(migrate_legacy_font_families(&mut config));
         assert_eq!(config.ui_font_family, "Noto Sans CJK SC");
         assert_eq!(config.terminal_font_family, "Noto Sans CJK SC");
     }
