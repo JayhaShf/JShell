@@ -191,16 +191,16 @@ impl Ashell {
 
         let header = h_flex()
             .flex_none()
-            .h(px(34.))
+            .h(px(30.))
             .px_2()
             .items_center()
-            .gap_2()
+            .gap_1()
             .border_b_1()
             .border_color(cx.theme().border)
             .bg(cx.theme().tab_bar)
             .child(
                 div()
-                    .text_size(rems(1.0))
+                    .text_size(rems(0.833))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(cx.theme().primary)
                     .child(t!("remote_files")),
@@ -211,9 +211,8 @@ impl Ashell {
                 this.child(
                     Button::new("sftp-sync-cwd")
                         .ghost()
-                        .small()
+                        .xsmall()
                         .icon(IconName::SquareTerminal)
-                        .label(t!("sync_cwd").to_string())
                         .tooltip(t!("sync_cwd_tooltip").to_string())
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.sync_cwd_from_terminal(window, cx);
@@ -222,17 +221,17 @@ impl Ashell {
                 .child(
                     Button::new("sftp-refresh")
                         .ghost()
-                        .small()
+                        .xsmall()
                         .icon(IconName::ArrowRight)
-                        .label(t!("refresh").to_string())
+                        .tooltip(t!("refresh").to_string())
                         .on_click(cx.listener(|this, _, _, cx| this.refresh_sftp(cx))),
                 )
                 .child(
                     Button::new("sftp-new-folder")
                         .ghost()
-                        .small()
+                        .xsmall()
                         .icon(IconName::Folder)
-                        .label(t!("new_folder").to_string())
+                        .tooltip(t!("new_folder").to_string())
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.sftp_creating_folder = true;
                             this.sftp_new_folder_input.update(cx, |input, cx| {
@@ -245,17 +244,9 @@ impl Ashell {
                 .child(
                     Button::new("sftp-delete-selected")
                         .ghost()
-                        .small()
+                        .xsmall()
                         .icon(IconName::Close)
-                        .label(if selected_entries.is_empty() {
-                            t!("delete_selected").to_string()
-                        } else {
-                            format!(
-                                "{} ({})",
-                                t!("delete_selected").to_string(),
-                                selected_entries.len()
-                            )
-                        })
+                        .tooltip(t!("delete_selected").to_string())
                         .disabled(selected_entries.is_empty())
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.show_delete_confirm_dialog(window, cx);
@@ -264,9 +255,9 @@ impl Ashell {
                 .child(
                     Button::new("sftp-upload-file")
                         .ghost()
-                        .small()
+                        .xsmall()
                         .icon(IconName::Plus)
-                        .label(t!("upload_file").to_string())
+                        .tooltip(t!("upload_file").to_string())
                         .on_click(
                             cx.listener(|this, _, window, cx| this.upload_sftp_files(window, cx)),
                         ),
@@ -274,9 +265,9 @@ impl Ashell {
                 .child(
                     Button::new("sftp-upload-folder")
                         .ghost()
-                        .small()
+                        .xsmall()
                         .icon(IconName::Folder)
-                        .label(t!("upload_folder").to_string())
+                        .tooltip(t!("upload_folder").to_string())
                         .on_click(
                             cx.listener(|this, _, window, cx| this.upload_sftp_folder(window, cx)),
                         ),
@@ -284,13 +275,9 @@ impl Ashell {
                 .child(
                     Button::new("sftp-download-selected")
                         .ghost()
-                        .small()
+                        .xsmall()
                         .icon(IconName::ArrowDown)
-                        .label(if selected_entries.is_empty() {
-                            t!("download").to_string()
-                        } else {
-                            t!("download_count", count = selected_entries.len()).to_string()
-                        })
+                        .tooltip(t!("download").to_string())
                         .disabled(selected_entries.is_empty())
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.download_selected_sftp_entries(window, cx);
@@ -1343,7 +1330,7 @@ impl Ashell {
         let muted_fg = cx.theme().muted_foreground;
 
         v_flex()
-            .gap_4()
+            .gap_2()
             .w_full()
             .p_2()
             .child(
@@ -1584,7 +1571,7 @@ impl Ashell {
             .w_full()
             .h_full()
             .min_w(px(0.))
-            .p_4()
+            .p_2()
             .border_r_1()
             .border_color(cx.theme().sidebar_border)
             .bg(cx.theme().sidebar)
@@ -1596,11 +1583,11 @@ impl Ashell {
                     .child(
                         h_flex()
                             .items_center()
-                            .gap_2()
+                            .gap_1()
                             .child(
                                 div()
                                     .font_weight(FontWeight::BOLD)
-                                    .text_size(rems(1.667))
+                                    .text_size(rems(1.167))
                                     .text_color(cx.theme().primary)
                                     .child("Ashell"),
                             )
@@ -1662,6 +1649,7 @@ impl Ashell {
             .child(
                 Button::new("open-ssh-panel")
                     .primary()
+                    .small()
                     .label(t!("add_ssh").to_string())
                     .on_click(
                         cx.listener(|this, _, window, cx| this.open_new_ssh_dialog(window, cx)),
@@ -1673,11 +1661,26 @@ impl Ashell {
                     .min_h(px(0.))
                     .gap_2()
                     .child(
-                        div()
-                            .text_size(rems(1.0))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(cx.theme().primary)
-                            .child(t!("saved")),
+                        h_flex()
+                            .items_center()
+                            .child(
+                                div()
+                                    .text_size(rems(0.917))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(cx.theme().primary)
+                                    .child(t!("saved")),
+                            )
+                            .child(div().flex_1())
+                            .child(
+                                Button::new("connect-all-saved-sessions")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(IconName::Play)
+                                    .tooltip("Open all saved sessions")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.connect_all_saved_sessions(cx);
+                                    })),
+                            ),
                     )
                     .child(
                         div()
@@ -1691,7 +1694,7 @@ impl Ashell {
                                     .id("saved-sessions-scroll")
                                     .track_scroll(&self.saved_scroll_handle)
                                     .overflow_y_scroll()
-                                    .gap_2()
+                                    .gap_1()
                                     .children(sessions.into_iter().enumerate().map(
                                         |(ix, session)| {
                                             let connect_id = session.id.clone();
@@ -1704,8 +1707,9 @@ impl Ashell {
                                             div()
                                                 .id(("saved-connect", ix))
                                                 .w_full()
-                                                .p_2()
-                                                .rounded_md()
+                                                .px_2()
+                                                .py_1()
+                                                .rounded_sm()
                                                 .border_1()
                                                 .border_color(if is_active {
                                                     cx.theme().primary
@@ -1786,13 +1790,13 @@ impl Ashell {
                                                         .gap_1()
                                                         .child(
                                                             div()
-                                                                .text_size(rems(1.0))
+                                                                .text_size(rems(0.875))
                                                                 .font_weight(FontWeight::SEMIBOLD)
                                                                 .child(name),
                                                         )
                                                         .child(
                                                             div()
-                                                                .text_size(rems(0.917))
+                                                                .text_size(rems(0.75))
                                                                 .text_color(
                                                                     cx.theme().muted_foreground,
                                                                 )

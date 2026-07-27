@@ -8,6 +8,7 @@ use gpui::{
 };
 use gpui_component::{Theme, WindowExt as _, input::InputState};
 use rust_i18n::t;
+use std::collections::HashSet;
 use uuid::Uuid;
 
 use self::config::{AuthMethod, Session};
@@ -28,6 +29,23 @@ fn connected_session_tab_id<'a>(
             *connected && session.is_some_and(|session| session.id == session_id)
         })
         .map(|(tab_id, _, _)| tab_id.to_string())
+}
+
+fn saved_session_ids_without_connected_tabs<'a>(
+    session_ids: impl IntoIterator<Item = &'a str>,
+    tabs: impl IntoIterator<Item = (bool, Option<&'a Session>)>,
+) -> Vec<String> {
+    let connected_session_ids: HashSet<&str> = tabs
+        .into_iter()
+        .filter_map(|(connected, session)| connected.then_some(session).flatten())
+        .map(|session| session.id.as_str())
+        .collect();
+
+    session_ids
+        .into_iter()
+        .filter(|session_id| !connected_session_ids.contains(*session_id))
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 impl Ashell {
@@ -551,6 +569,37 @@ impl Ashell {
         } else {
             self.open_ssh_session(session, cx);
         }
+    }
+
+    pub(crate) fn connect_all_saved_sessions(&mut self, cx: &mut Context<Self>) {
+        let sessions = self.config.sessions().to_vec();
+        let pending_session_ids: HashSet<String> = saved_session_ids_without_connected_tabs(
+            sessions.iter().map(|session| session.id.as_str()),
+            self.tabs
+                .iter()
+                .map(|tab| (tab.connected, tab.session.as_ref())),
+        )
+        .into_iter()
+        .collect();
+
+        let pending_sessions: Vec<Session> = sessions
+            .into_iter()
+            .filter(|session| pending_session_ids.contains(&session.id))
+            .collect();
+        let count = pending_sessions.len();
+        for session in pending_sessions {
+            if session.protocol == "serial" {
+                self.open_serial_session(session, cx);
+            } else {
+                self.open_ssh_session(session, cx);
+            }
+        }
+        self.status = if count == 0 {
+            "all saved sessions are already connected".into()
+        } else {
+            format!("opening {count} saved sessions").into()
+        };
+        cx.notify();
     }
 
     pub(crate) fn selector_entries(&self) -> Vec<SelectorEntry> {
@@ -1737,6 +1786,19 @@ mod tests {
         assert_eq!(
             connected_session_tab_id(vec![("old", false, Some(&session))], "prod"),
             None
+        );
+    }
+
+    #[test]
+    fn batch_connect_skips_sessions_with_connected_tabs() {
+        let production = test_session("production");
+        let staging = test_session("staging");
+        let session_ids = [production.id.as_str(), staging.id.as_str()];
+        let tabs = vec![(true, Some(&production)), (false, Some(&staging))];
+
+        assert_eq!(
+            saved_session_ids_without_connected_tabs(session_ids, tabs),
+            vec!["staging".to_string()]
         );
     }
 }
