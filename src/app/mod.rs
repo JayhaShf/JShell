@@ -23,7 +23,7 @@ use gpui::{
     UniformListScrollHandle, Window, point, px, size,
 };
 use gpui_component::{
-    Theme, ThemeMode, ThemeRegistry,
+    Theme, ThemeMode,
     input::{InputEvent, InputState},
     scroll::ScrollbarHandle,
 };
@@ -297,7 +297,6 @@ pub(crate) struct Ashell {
     pub(crate) prev_monitoring_size: Option<Pixels>,
     pub(crate) status: SharedString,
     pub(crate) config: ConfigStore,
-    pub(crate) active_title_bar_style: crate::session::config::TitleBarStyle,
     pub(crate) cursor_style: crate::session::config::CursorStyle,
     pub(crate) system_sampler: SystemSampler,
     pub(crate) recording_action: Option<String>,
@@ -330,7 +329,6 @@ pub(crate) struct Ashell {
     pub(crate) events_tx: mpsc::Sender<BackendEvent>,
     pub(crate) last_window_size: Option<gpui::Size<Pixels>>,
     pub(crate) last_sidebar_width: Option<Pixels>,
-    pub(crate) should_move_window: bool,
     pub(crate) hovered_url: Option<HoveredUrl>,
     pub(crate) cmd_ctrl_pressed: bool,
     pub(crate) _subscriptions: Vec<gpui::Subscription>,
@@ -552,8 +550,6 @@ impl Ashell {
         let body_panels = cx.new(|_| ResizableState::default());
         let mut system_sampler = SystemSampler::new();
         let system = system_sampler.sample();
-        let default_light_theme_name = ThemeRegistry::global(cx).default_light_theme().name.clone();
-        let default_dark_theme_name = ThemeRegistry::global(cx).default_dark_theme().name.clone();
         let follow_system_theme = config.follow_system_theme();
 
         let theme_mode = match config.theme_mode() {
@@ -561,16 +557,10 @@ impl Ashell {
             "dark" => ThemeMode::Dark,
             _ => ThemeMode::Light,
         };
-        let light_theme_name = if config.light_theme_name().is_empty() {
-            default_light_theme_name
-        } else {
-            config.light_theme_name().into()
-        };
-        let dark_theme_name = if config.dark_theme_name().is_empty() {
-            default_dark_theme_name
-        } else {
-            config.dark_theme_name().into()
-        };
+        let light_theme_name =
+            crate::app::theme::validated_theme_name(config.light_theme_name(), false).into();
+        let dark_theme_name =
+            crate::app::theme::validated_theme_name(config.dark_theme_name(), true).into();
 
         let configured_locale = config.locale();
         let mut active_locale = configured_locale.to_string();
@@ -699,7 +689,6 @@ impl Ashell {
             collapsed_saved_scroll_handle: gpui::ScrollHandle::new(),
             prev_monitoring_size: None,
             status: "ready".into(),
-            active_title_bar_style: config.title_bar_style(),
             config,
             system_sampler,
             recording_action: None,
@@ -730,7 +719,6 @@ impl Ashell {
             events_tx,
             last_window_size: None,
             last_sidebar_width,
-            should_move_window: false,
             hovered_url: None,
             cmd_ctrl_pressed: false,
             _subscriptions,
@@ -765,8 +753,6 @@ impl Ashell {
         self.show_hidden_files = self.config.show_hidden_files();
         self.sftp_panel_minimized = self.config.sftp_panel_minimized();
         self.sidebar_collapsed = self.config.sidebar_collapsed();
-        self.active_title_bar_style = self.config.title_bar_style();
-
         // Apply theme preferences
         self.apply_theme_preferences(window, cx);
 

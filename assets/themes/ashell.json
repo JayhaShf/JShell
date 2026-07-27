@@ -1,0 +1,32 @@
+{
+  "name": "Ashell",
+  "$schema": "https://github.com/longbridge/gpui-component/raw/refs/heads/main/.theme-schema.json",
+  "themes": [
+    {
+      "name": "Ashell Light",
+      "mode": "light",
+      "colors": {
+        "background": "#ffffff", "foreground": "#111111", "border": "#d8d8d8", "window_border": "#c8c8c8",
+        "title_bar.background": "#f6f6f6", "title_bar.border": "#d8d8d8", "panel.background": "#f0f0f0",
+        "popover.background": "#ffffff", "popover.foreground": "#111111", "muted.background": "#eeeeee", "muted.foreground": "#606060",
+        "primary.background": "#111111", "primary.foreground": "#ffffff", "secondary.background": "#eeeeee", "secondary.foreground": "#111111",
+        "secondary.hover.background": "#e0e0e0", "secondary.active.background": "#d8d8d8", "accent.background": "#e8e8e8", "accent.foreground": "#111111",
+        "ring": "#111111", "scrollbar.thumb.background": "#a0a0a0", "base.red": "#b4232a", "base.green": "#16794f",
+        "base.yellow": "#8a6400", "base.blue": "#202020", "base.magenta": "#4a4a4a", "base.cyan": "#363636"
+      }
+    },
+    {
+      "name": "Ashell Dark",
+      "mode": "dark",
+      "colors": {
+        "background": "#0b0b0b", "foreground": "#f5f5f5", "border": "#303030", "window_border": "#3a3a3a",
+        "title_bar.background": "#111111", "title_bar.border": "#303030", "panel.background": "#191919",
+        "popover.background": "#141414", "popover.foreground": "#f5f5f5", "muted.background": "#202020", "muted.foreground": "#a0a0a0",
+        "primary.background": "#f5f5f5", "primary.foreground": "#0b0b0b", "secondary.background": "#202020", "secondary.foreground": "#f5f5f5",
+        "secondary.hover.background": "#2a2a2a", "secondary.active.background": "#303030", "accent.background": "#252525", "accent.foreground": "#f5f5f5",
+        "ring": "#f5f5f5", "scrollbar.thumb.background": "#606060", "base.red": "#ef6b73", "base.green": "#d8d8d8",
+        "base.yellow": "#c8c8c8", "base.blue": "#f5f5f5", "base.magenta": "#b8b8b8", "base.cyan": "#e0e0e0"
+      }
+    }
+  ]
+}

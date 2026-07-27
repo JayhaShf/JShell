@@ -1,0 +1,19 @@
+{
+  "name": "VS Code",
+  "$schema": "https://github.com/longbridge/gpui-component/raw/refs/heads/main/.theme-schema.json",
+  "themes": [
+    {
+      "name": "VS Code Dark",
+      "mode": "dark",
+      "colors": {
+        "background": "#1e1e1e", "foreground": "#ffffff", "border": "#3e3e42", "window_border": "#3e3e42",
+        "title_bar.background": "#252526", "title_bar.border": "#3e3e42", "panel.background": "#252526",
+        "popover.background": "#252526", "popover.foreground": "#cccccc", "muted.background": "#2d2d30", "muted.foreground": "#9d9d9d",
+        "primary.background": "#007acc", "primary.foreground": "#ffffff", "secondary.background": "#2d2d30", "secondary.foreground": "#cccccc",
+        "secondary.hover.background": "#37373d", "secondary.active.background": "#094771", "accent.background": "#094771", "accent.foreground": "#ffffff",
+        "ring": "#007acc", "scrollbar.thumb.background": "#79797966", "base.red": "#f14c4c", "base.green": "#89d185",
+        "base.yellow": "#dcdcaa", "base.blue": "#569cd6", "base.magenta": "#c586c0", "base.cyan": "#4ec9b0"
+      }
+    }
+  ]
+}

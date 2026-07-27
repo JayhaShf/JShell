@@ -949,6 +949,7 @@ impl Ashell {
                                                                 this.active_dialog = None;
                                                                 this.connect_saved_session(
                                                                     connect_id.clone(),
+                                                                    window,
                                                                     cx,
                                                                 );
                                                                 window.close_dialog(cx);
@@ -1839,7 +1840,10 @@ impl Ashell {
                                                                         move |mut menu, window, cx| {
                                                                             let current_theme = view.read(cx).light_theme_name.to_string();
                                                                             let themes = gpui_component::ThemeRegistry::global(cx).sorted_themes();
-                                                                            let light_themes: Vec<_> = themes.into_iter().filter(|t| !t.mode.is_dark()).map(|t| t.name.clone()).collect();
+                                                                            let light_themes: Vec<_> = themes.into_iter().filter(|t| {
+                                                                                !t.mode.is_dark()
+                                                                                    && crate::app::theme::allowed_theme_names().contains(&t.name.as_ref())
+                                                                            }).map(|t| t.name.clone()).collect();
                                                                             menu = menu.min_w(160.).max_h(px(320.)).scrollable(true);
                                                                             for theme_name in light_themes {
                                                                                 let checked = theme_name == current_theme;
@@ -1875,7 +1879,10 @@ impl Ashell {
                                                                         move |mut menu, window, cx| {
                                                                             let current_theme = view.read(cx).dark_theme_name.to_string();
                                                                             let themes = gpui_component::ThemeRegistry::global(cx).sorted_themes();
-                                                                            let dark_themes: Vec<_> = themes.into_iter().filter(|t| t.mode.is_dark()).map(|t| t.name.clone()).collect();
+                                                                            let dark_themes: Vec<_> = themes.into_iter().filter(|t| {
+                                                                                t.mode.is_dark()
+                                                                                    && crate::app::theme::allowed_theme_names().contains(&t.name.as_ref())
+                                                                            }).map(|t| t.name.clone()).collect();
                                                                             menu = menu.min_w(160.).max_h(px(320.)).scrollable(true);
                                                                             for theme_name in dark_themes {
                                                                                 let checked = theme_name == current_theme;
@@ -1887,50 +1894,6 @@ impl Ashell {
                                                                                         }))
                                                                                 );
                                                                             }
-                                                                            menu
-                                                                        }
-                                                                    })
-                                                                    .into_any_element()
-                                                            }
-                                                        })
-                                                    )
-                                                )
-                                                .item(
-                                                    SettingItem::new(
-                                                        format!("{}{}", t!("title_bar_style"), t!("restart_hint")),
-                                                        SettingField::render({
-                                                            let view = view_clone_for_general.clone();
-                                                            move |_, _window, cx| {
-                                                                let current_style = view.read(cx).config.title_bar_style();
-                                                                Button::new("title-bar-style-dropdown")
-                                                                    .small()
-                                                                    .label(match current_style {
-                                                                        crate::session::config::TitleBarStyle::Native => t!("title_bar_native").to_string(),
-                                                                        crate::session::config::TitleBarStyle::Integrated => t!("title_bar_integrated").to_string(),
-                                                                    })
-                                                                    .dropdown_menu_with_anchor(Anchor::BottomRight, {
-                                                                        let view = view.clone();
-                                                                        move |mut menu, window, cx| {
-                                                                            let current_style = view.read(cx).config.title_bar_style();
-                                                                            menu = menu.min_w(160.)
-                                                                                .item(
-                                                                                    PopupMenuItem::new(t!("title_bar_native").to_string())
-                                                                                        .checked(current_style == crate::session::config::TitleBarStyle::Native)
-                                                                                        .on_click(window.listener_for(&view, |this, _, _, cx| {
-                                                                                            this.config.set_title_bar_style(crate::session::config::TitleBarStyle::Native);
-                                                                                            this.save_preferences_background();
-                                                                                            cx.notify();
-                                                                                        }))
-                                                                                )
-                                                                                .item(
-                                                                                    PopupMenuItem::new(t!("title_bar_integrated").to_string())
-                                                                                        .checked(current_style == crate::session::config::TitleBarStyle::Integrated)
-                                                                                        .on_click(window.listener_for(&view, |this, _, _, cx| {
-                                                                                            this.config.set_title_bar_style(crate::session::config::TitleBarStyle::Integrated);
-                                                                                            this.save_preferences_background();
-                                                                                            cx.notify();
-                                                                                        }))
-                                                                                );
                                                                             menu
                                                                         }
                                                                     })
@@ -1988,12 +1951,8 @@ impl Ashell {
                                                                     .icon(IconName::ChevronsUpDown)
                                                                     .label({
                                                                         let current = view.read(cx).ui_font_family.to_string();
-                                                                        let names = cx.text_system().all_font_names();
-                                                                        let using_system_maple = crate::app::theme::USING_SYSTEM_MAPLE.load(std::sync::atomic::Ordering::Relaxed);
-                                                                        if current == *".SystemUIFont" || current.is_empty() || !names.contains(&current) {
+                                                                        if current == *".SystemUIFont" || current.is_empty() {
                                                                             t!("system_default").to_string()
-                                                                        } else if !using_system_maple && current == "Maple Mono NF CN" {
-                                                                            format!("Maple Mono NF CN ({})", t!("software_builtin"))
                                                                         } else {
                                                                             current
                                                                         }
@@ -2002,7 +1961,7 @@ impl Ashell {
                                                                         let view = view.clone();
                                                                         move |mut menu, window, cx| {
                                                                             let current = view.read(cx).ui_font_family.to_string();
-                                                                            let mut names = cx.text_system().all_font_names();
+                                                                            let names = cx.text_system().all_font_names();
                                                                             menu = menu.min_w(200.).max_h(px(320.)).scrollable(true);
                                                                             menu = menu.item(
                                                                                 PopupMenuItem::new(t!("system_default").to_string())
@@ -2011,18 +1970,6 @@ impl Ashell {
                                                                                         this.change_ui_font_family(".SystemUIFont", window, cx);
                                                                                     }))
                                                                             );
-                                                                            let maple_font = "Maple Mono NF CN".to_string();
-                                                                            let using_system_maple = crate::app::theme::USING_SYSTEM_MAPLE.load(std::sync::atomic::Ordering::Relaxed);
-                                                                            if !using_system_maple && names.contains(&maple_font) {
-                                                                                names.retain(|n| n != &maple_font);
-                                                                                menu = menu.item(
-                                                                                    PopupMenuItem::new(format!("{} ({})", maple_font, t!("software_builtin")))
-                                                                                        .checked(current == maple_font)
-                                                                                        .on_click(window.listener_for(&view, move |this, _, window, cx| {
-                                                                                            this.change_ui_font_family("Maple Mono NF CN", window, cx);
-                                                                                        }))
-                                                                                ).separator();
-                                                                            }
                                                                             for name in names {
                                                                                 let checked = name == current;
                                                                                 menu = menu.item(
@@ -2052,31 +1999,14 @@ impl Ashell {
                                                                     .icon(IconName::ChevronsUpDown)
                                                                     .label({
                                                                         let current = view.read(cx).terminal_font_family.to_string();
-                                                                        let using_system_maple = crate::app::theme::USING_SYSTEM_MAPLE.load(std::sync::atomic::Ordering::Relaxed);
-                                                                        if !using_system_maple && current == "Maple Mono NF CN" {
-                                                                            format!("Maple Mono NF CN ({})", t!("software_builtin"))
-                                                                        } else {
-                                                                            current
-                                                                        }
+                                                                        current
                                                                     })
                                                                     .dropdown_menu_with_anchor(Anchor::BottomRight, {
                                                                         let view = view.clone();
                                                                         move |mut menu, window, cx| {
                                                                             let current = view.read(cx).terminal_font_family.to_string();
-                                                                            let mut names = cx.text_system().all_font_names();
+                                                                            let names = cx.text_system().all_font_names();
                                                                             menu = menu.min_w(200.).max_h(px(320.)).scrollable(true);
-                                                                            let maple_font = "Maple Mono NF CN".to_string();
-                                                                            let using_system_maple = crate::app::theme::USING_SYSTEM_MAPLE.load(std::sync::atomic::Ordering::Relaxed);
-                                                                            if !using_system_maple && names.contains(&maple_font) {
-                                                                                names.retain(|n| n != &maple_font);
-                                                                                menu = menu.item(
-                                                                                    PopupMenuItem::new(format!("{} ({})", maple_font, t!("software_builtin")))
-                                                                                        .checked(current == maple_font)
-                                                                                        .on_click(window.listener_for(&view, move |this, _, _window, cx| {
-                                                                                            this.change_terminal_font_family("Maple Mono NF CN", cx);
-                                                                                        }))
-                                                                                ).separator();
-                                                                            }
                                                                             for name in names {
                                                                                 let checked = name == current;
                                                                                 menu = menu.item(

@@ -57,12 +57,13 @@ The current version provides a fully-featured GPUI-native workspace:
 
 - **Local & Remote Sessions:** Open local terminal tabs or connect to remote servers via SSH.
 - **Advanced SSH Authentication:** Supports both password-based and key-based (file path or inline) SSH connections.
-- **Session Management:** Easily save, reopen, edit, and remove your SSH sessions.
+- **Session Management:** Save, reopen, edit, and remove SSH sessions; reopening an already connected session activates its existing tab instead of creating a duplicate connection.
 - **SFTP Integration:** Built-in SFTP file manager to browse, upload, download, and manage remote files.
 - **Robust Terminal Emulator:** Parses terminal output with `alacritty_terminal`, supporting rich ANSI color spans, fast rendering, and complete keyboard input forwarding.
 - **System Telemetry:** Real-time visualization of CPU, memory, swap, network, and disk metrics in the left cockpit sidebar.
-- **Theming System:** Switch between multiple GPUI Component themes directly from the top toolbar.
-- **Embedded Fonts:** Uses embedded Maple Mono NF CN fonts out-of-the-box for excellent CJK character and Nerd Font icon support.
+- **Theming System:** Choose Ashell Light, Ashell Dark, or VS Code Dark. The Ashell light and dark themes use monochrome palettes, while VS Code Dark uses blue active accents.
+- **Default Fonts:** UI and terminal text default to the system-installed Noto Sans CJK SC font.
+- **Windows Title Bar:** A compact custom Windows-style title bar follows the active theme and places minimize, maximize, and close controls on the right.
 - **v0.3 Core Enhancements:** Global font and font-size controls, concurrent SFTP transfers, persistent layout state, disconnect awareness, hot-swappable i18n, and smart terminal right-click copy/paste.
 
 ## Run

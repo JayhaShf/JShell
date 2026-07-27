@@ -19,6 +19,17 @@ use crate::{
     terminal::{BackendCommand, RenderSnapshot, TabKind, TerminalTab},
 };
 
+fn connected_session_tab_id<'a>(
+    tabs: impl IntoIterator<Item = (&'a str, bool, Option<&'a Session>)>,
+    session_id: &str,
+) -> Option<String> {
+    tabs.into_iter()
+        .find(|(_, connected, session)| {
+            *connected && session.is_some_and(|session| session.id == session_id)
+        })
+        .map(|(tab_id, _, _)| tab_id.to_string())
+}
+
 impl Ashell {
     fn register_session_workspace(&mut self, group_id: String) {
         if !self.workspace_tabs.iter().any(|workspace| {
@@ -511,7 +522,12 @@ impl Ashell {
         cx.notify();
     }
 
-    pub(crate) fn connect_saved_session(&mut self, session_id: String, cx: &mut Context<Self>) {
+    pub(crate) fn connect_saved_session(
+        &mut self,
+        session_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         tracing::info!(
             "[ui] user clicked to connect saved session '{}'",
             session_id
@@ -521,6 +537,15 @@ impl Ashell {
             cx.notify();
             return;
         };
+        if let Some(tab_id) = connected_session_tab_id(
+            self.tabs
+                .iter()
+                .map(|tab| (tab.id.as_str(), tab.connected, tab.session.as_ref())),
+            &session_id,
+        ) {
+            self.activate_tab(tab_id, window, cx);
+            return;
+        }
         if session.protocol == "serial" {
             self.open_serial_session(session, cx);
         } else {
@@ -584,7 +609,7 @@ impl Ashell {
                 self.open_new_ssh_dialog(window, cx);
             }
             SelectorEntry::Saved(session_id) => {
-                self.connect_saved_session(session_id, cx);
+                self.connect_saved_session(session_id, window, cx);
                 window.close_dialog(cx);
             }
         }
@@ -1673,5 +1698,45 @@ impl Ashell {
                 self.search_target_tab = None;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_session(id: &str) -> Session {
+        let mut session = Session::password(
+            "example.com".to_string(),
+            22,
+            "root".to_string(),
+            "password".to_string(),
+        );
+        session.id = id.to_string();
+        session
+    }
+
+    #[test]
+    fn connected_saved_session_returns_existing_tab_id() {
+        let session = test_session("prod");
+        let tabs = vec![
+            ("disconnected", false, Some(&session)),
+            ("connected", true, Some(&session)),
+        ];
+
+        assert_eq!(
+            connected_session_tab_id(tabs, "prod"),
+            Some("connected".to_string())
+        );
+    }
+
+    #[test]
+    fn disconnected_saved_session_does_not_block_a_new_connection() {
+        let session = test_session("prod");
+
+        assert_eq!(
+            connected_session_tab_id(vec![("old", false, Some(&session))], "prod"),
+            None
+        );
     }
 }

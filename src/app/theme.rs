@@ -1,40 +1,33 @@
-use anyhow::{Context as _, Result};
 use gpui::{App, Context, SharedString, Window, px};
 use gpui_component::{ActiveTheme as _, Theme, ThemeMode, ThemeRegistry};
 
 use crate::Ashell;
 
+pub(crate) const ASHELL_LIGHT_THEME: &str = "Ashell Light";
+pub(crate) const ASHELL_DARK_THEME: &str = "Ashell Dark";
+pub(crate) const VSCODE_DARK_THEME: &str = "VS Code Dark";
+
 pub(crate) const EMBEDDED_THEME_JSONS: &[&str] = &[
-    include_str!("../../assets/themes/matrix.json"),
-    include_str!("../../assets/themes/tokyonight.json"),
-    include_str!("../../assets/themes/gruvbox.json"),
-    include_str!("../../assets/themes/solarized.json"),
-    include_str!("../../assets/themes/phygerr.json"),
+    include_str!("../../assets/themes/ashell.json"),
+    include_str!("../../assets/themes/vscode.json"),
 ];
 
-use std::sync::atomic::{AtomicBool, Ordering};
+pub(crate) fn allowed_theme_names() -> [&'static str; 3] {
+    [ASHELL_LIGHT_THEME, ASHELL_DARK_THEME, VSCODE_DARK_THEME]
+}
 
-pub(crate) static USING_SYSTEM_MAPLE: AtomicBool = AtomicBool::new(false);
-
-pub(crate) fn load_fonts(cx: &mut App) -> Result<()> {
-    let has_system_maple = cx
-        .text_system()
-        .all_font_names()
-        .contains(&"Maple Mono NF CN".to_string());
-    if has_system_maple {
-        USING_SYSTEM_MAPLE.store(true, Ordering::Relaxed);
-    } else {
-        let regular = std::borrow::Cow::Borrowed(
-            include_bytes!("../../assets/fonts/MapleMono-NF-CN-Regular.ttf").as_slice(),
-        );
-        let bold = std::borrow::Cow::Borrowed(
-            include_bytes!("../../assets/fonts/MapleMono-NF-CN-Bold.ttf").as_slice(),
-        );
-        cx.text_system()
-            .add_fonts(vec![regular, bold])
-            .context("load Maple Mono NF CN fonts")?;
+pub(crate) fn validated_theme_name(name: &str, is_dark: bool) -> &'static str {
+    match name {
+        ASHELL_LIGHT_THEME => ASHELL_LIGHT_THEME,
+        ASHELL_DARK_THEME => ASHELL_DARK_THEME,
+        VSCODE_DARK_THEME => VSCODE_DARK_THEME,
+        _ if is_dark => ASHELL_DARK_THEME,
+        _ => ASHELL_LIGHT_THEME,
     }
-    set_theme_font_names(cx.global_mut::<Theme>(), ".SystemUIFont");
+}
+
+pub(crate) fn load_fonts(cx: &mut App) -> anyhow::Result<()> {
+    set_theme_font_names(cx.global_mut::<Theme>(), "Noto Sans CJK SC");
     Ok(())
 }
 
@@ -73,6 +66,13 @@ impl Ashell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let is_allowed = allowed_theme_names().iter().any(|allowed| name == *allowed);
+        if !is_allowed {
+            self.status = format!("theme not allowed: {name}").into();
+            cx.notify();
+            return;
+        }
+
         let Some(theme_config) = ThemeRegistry::global(cx).themes().get(&name).cloned() else {
             self.status = format!("theme not found: {name}").into();
             cx.notify();
@@ -132,16 +132,18 @@ impl Ashell {
     }
 
     pub(crate) fn apply_theme_preferences(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.light_theme_name = validated_theme_name(&self.light_theme_name, false).into();
+        self.dark_theme_name = validated_theme_name(&self.dark_theme_name, true).into();
         let light_theme = ThemeRegistry::global(cx)
             .themes()
             .get(&self.light_theme_name)
             .cloned()
-            .unwrap_or_else(|| ThemeRegistry::global(cx).default_light_theme().clone());
+            .expect("Ashell Light theme must be registered");
         let dark_theme = ThemeRegistry::global(cx)
             .themes()
             .get(&self.dark_theme_name)
             .cloned()
-            .unwrap_or_else(|| ThemeRegistry::global(cx).default_dark_theme().clone());
+            .expect("Ashell Dark theme must be registered");
         let theme = Theme::global_mut(cx);
         theme.light_theme = light_theme;
         theme.dark_theme = dark_theme;
@@ -167,5 +169,24 @@ impl Ashell {
             self.dark_theme_name.to_string(),
         );
         self.save_preferences_background();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allowed_theme_names_are_the_only_selectable_themes() {
+        assert_eq!(
+            allowed_theme_names(),
+            ["Ashell Light", "Ashell Dark", "VS Code Dark"]
+        );
+    }
+
+    #[test]
+    fn removed_theme_name_falls_back_to_the_matching_ashell_default() {
+        assert_eq!(validated_theme_name("Tokyo Night", true), "Ashell Dark");
+        assert_eq!(validated_theme_name("Solarized", false), "Ashell Light");
     }
 }

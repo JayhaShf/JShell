@@ -2,12 +2,11 @@ use crate::app::resizable::{h_resizable, resizable_panel, v_resizable};
 use gpui::{
     Context, ElementId, Focusable as _, FontWeight, Hsla, InteractiveElement as _, IntoElement,
     MouseButton, MouseDownEvent, ParentElement as _, PathBuilder, Pixels, Render,
-    StatefulInteractiveElement as _, Styled as _, Window, canvas, div, hsla, point,
-    prelude::FluentBuilder as _, px, relative, rems, uniform_list,
+    StatefulInteractiveElement as _, Styled as _, Window, canvas, div, point,
+    prelude::FluentBuilder as _, px, rems, uniform_list,
 };
 use gpui_component::{
-    ActiveTheme, Disableable as _, ElementExt, Icon, IconName, InteractiveElementExt as _, Root,
-    Sizable as _, Size,
+    ActiveTheme, Disableable as _, ElementExt, Icon, IconName, Root, Sizable as _, Size,
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,
     h_flex,
@@ -1722,9 +1721,10 @@ impl Ashell {
                                                 .hover(|this| this.bg(cx.theme().secondary))
                                                 .on_mouse_down(
                                                     MouseButton::Left,
-                                                    cx.listener(move |this, _, _, cx| {
+                                                    cx.listener(move |this, _, window, cx| {
                                                         this.connect_saved_session(
                                                             connect_id.clone(),
+                                                            window,
                                                             cx,
                                                         )
                                                     }),
@@ -1925,8 +1925,12 @@ impl Ashell {
                                     .hover(|this| this.bg(cx.theme().secondary))
                                     .on_mouse_down(
                                         MouseButton::Left,
-                                        cx.listener(move |this, _, _, cx| {
-                                            this.connect_saved_session(connect_id.clone(), cx)
+                                        cx.listener(move |this, _, window, cx| {
+                                            this.connect_saved_session(
+                                                connect_id.clone(),
+                                                window,
+                                                cx,
+                                            )
                                         }),
                                     )
                                     .tooltip({
@@ -2016,6 +2020,7 @@ impl Ashell {
             )
     }
 
+    #[cfg(any())]
     fn render_window_controls(
         &self,
         window: &mut Window,
@@ -2238,9 +2243,6 @@ impl Ashell {
             })
             .unwrap_or(0);
         let has_active_document = self.active_document_id().is_some();
-        let is_integrated =
-            self.active_title_bar_style == crate::session::config::TitleBarStyle::Integrated;
-
         h_flex()
             .flex_1()
             .min_w(px(0.))
@@ -2252,9 +2254,7 @@ impl Ashell {
                     .flex_1()
                     .min_w(px(0.))
                     .h_full()
-                    .when(is_integrated, |this| {
-                        this.window_control_area(gpui::WindowControlArea::Drag)
-                    })
+                    .window_control_area(gpui::WindowControlArea::Drag)
                     .overflow_x_hidden()
                     .child({
                         TabBar::new("ashell-tab-bar")
@@ -2361,6 +2361,127 @@ impl Ashell {
                         .child(self.render_search_button(cx))
                     }),
             )
+    }
+
+    fn render_windows_window_controls(
+        &self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        h_flex()
+            .id("windows-window-controls")
+            .flex_none()
+            .h_full()
+            .gap_0()
+            .child(
+                div()
+                    .id("windows-window-minimize")
+                    .w(px(44.))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_color(cx.theme().foreground)
+                    .window_control_area(gpui::WindowControlArea::Min)
+                    .on_click(|_, window, _| window.minimize_window())
+                    .hover(|this| this.bg(cx.theme().accent))
+                    .child(Icon::new(IconName::WindowMinimize).size(px(14.))),
+            )
+            .child(
+                div()
+                    .id("windows-window-maximize")
+                    .w(px(44.))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_color(cx.theme().foreground)
+                    .window_control_area(gpui::WindowControlArea::Max)
+                    .on_click(|_, window, _| window.zoom_window())
+                    .hover(|this| this.bg(cx.theme().accent))
+                    .child(Icon::new(IconName::WindowMaximize).size(px(14.))),
+            )
+            .child(
+                div()
+                    .id("windows-window-close")
+                    .w(px(48.))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_color(cx.theme().primary_foreground)
+                    .bg(cx.theme().danger.opacity(0.8))
+                    .window_control_area(gpui::WindowControlArea::Close)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.request_application_close(window, cx);
+                    }))
+                    .hover(|this| this.bg(cx.theme().danger))
+                    .child(Icon::new(IconName::WindowClose).size(px(14.))),
+            )
+    }
+
+    fn render_windows_title_bar(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        h_flex()
+            .id("windows-title-bar")
+            .flex_none()
+            .items_center()
+            .h(px(44.))
+            .w_full()
+            .bg(cx.theme().tab_bar)
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .child(
+                h_flex()
+                    .w(px(136.))
+                    .h_full()
+                    .px_3()
+                    .gap_2()
+                    .items_center()
+                    .text_color(cx.theme().foreground)
+                    .child(Icon::new(IconName::SquareTerminal).size(px(16.)))
+                    .child(div().font_weight(FontWeight::MEDIUM).child("ashell")),
+            )
+            .child(
+                div()
+                    .id("windows-title-bar-drag")
+                    .flex_1()
+                    .min_w(px(0.))
+                    .h_full()
+                    .window_control_area(gpui::WindowControlArea::Drag)
+                    .overflow_x_hidden()
+                    .child(self.render_tab_bar(cx)),
+            )
+            .child(
+                h_flex()
+                    .flex_none()
+                    .h_full()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .child(
+                        Button::new("windows-title-search")
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::Search)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.show_selector_dialog(window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("windows-title-settings")
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::Settings)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.show_settings_dialog(window, cx);
+                            })),
+                    ),
+            )
+            .child(self.render_windows_window_controls(window, cx))
     }
 
     fn render_terminal_panel(
@@ -2750,22 +2871,6 @@ impl Ashell {
                             .size_full()
                             .relative()
                             .overflow_hidden()
-                            .when(
-                                self.active_title_bar_style
-                                    == crate::session::config::TitleBarStyle::Native,
-                                |this| {
-                                    this.child(
-                                        div()
-                                            .flex_none()
-                                            .h(px(32.))
-                                            .w_full()
-                                            .bg(cx.theme().tab_bar)
-                                            .border_b_1()
-                                            .border_color(cx.theme().border)
-                                            .child(self.render_tab_bar(cx)),
-                                    )
-                                },
-                            )
                             .child(body_panel),
                     ),
                 )
@@ -2785,22 +2890,6 @@ impl Ashell {
                     .size_full()
                     .relative()
                     .overflow_hidden()
-                    .when(
-                        self.active_title_bar_style
-                            == crate::session::config::TitleBarStyle::Native,
-                        |this| {
-                            this.child(
-                                div()
-                                    .flex_none()
-                                    .h(px(32.))
-                                    .w_full()
-                                    .bg(cx.theme().tab_bar)
-                                    .border_b_1()
-                                    .border_color(cx.theme().border)
-                                    .child(self.render_tab_bar(cx)),
-                            )
-                        },
-                    )
                     .child(body_panel),
             );
             h_resizable("ashell-workspace")
@@ -2862,21 +2951,6 @@ impl Render for Ashell {
                 .size_full()
                 .relative()
                 .overflow_hidden()
-                .when(
-                    self.active_title_bar_style == crate::session::config::TitleBarStyle::Native,
-                    |this| {
-                        this.child(
-                            div()
-                                .flex_none()
-                                .h(px(32.))
-                                .w_full()
-                                .bg(cx.theme().tab_bar)
-                                .border_b_1()
-                                .border_color(cx.theme().border)
-                                .child(self.render_tab_bar(cx)),
-                        )
-                    },
-                )
                 .child(
                     div()
                         .flex_1()
@@ -2953,55 +3027,7 @@ impl Render for Ashell {
                     cx.propagate();
                 }
             }))
-            .when(self.active_title_bar_style == crate::session::config::TitleBarStyle::Integrated, |this| {
-                this.child(
-                    div()
-                        .id("title-bar")
-                        .flex()
-                        .items_center()
-                        .h(px(34.))
-                        .w_full()
-                        .bg(cx.theme().tab_bar)
-                        .child(self.render_window_controls(window, cx))
-                        .child(
-                            div()
-                                .id("tab-bar-drag")
-                                .flex_1()
-                                .min_w(px(0.))
-                                .h_full()
-                                .on_double_click(|_, window, _| {
-                                    #[cfg(target_os = "macos")]
-                                    window.titlebar_double_click();
-                                    #[cfg(not(target_os = "macos"))]
-                                    window.zoom_window();
-                                })
-                                .when(cfg!(target_os = "linux"), |this| {
-                                    this.on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, _| {
-                                            this.should_move_window = true;
-                                        }),
-                                    )
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, _| {
-                                            this.should_move_window = false;
-                                        }),
-                                    )
-                                    .on_mouse_down_out(cx.listener(|this, _, _, _| {
-                                        this.should_move_window = false;
-                                    }))
-                                    .on_mouse_move(cx.listener(|this, _, window, _| {
-                                        if this.should_move_window {
-                                            this.should_move_window = false;
-                                            window.start_window_move();
-                                        }
-                                    }))
-                                })
-                                .child(self.render_tab_bar(cx)),
-                        ),
-                )
-            })
+            .child(self.render_windows_title_bar(window, cx))
             .child(
                 div().flex_1().min_h_0().child(workspace),
             )

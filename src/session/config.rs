@@ -167,14 +167,6 @@ pub enum SavedWindowBounds {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum TitleBarStyle {
-    Native,
-    #[default]
-    Integrated,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum CursorStyle {
     #[default]
@@ -208,8 +200,6 @@ pub struct ConfigFile {
     pub ui_font_family: String,
     #[serde(default = "default_terminal_font_family")]
     pub terminal_font_family: String,
-    #[serde(default)]
-    pub title_bar_style: TitleBarStyle,
     #[serde(default)]
     pub cursor_style: CursorStyle,
     #[serde(default)]
@@ -307,13 +297,11 @@ fn default_ui_font_size() -> f32 {
 }
 
 pub fn default_ui_font_family() -> String {
-    // ".SystemUIFont" is a GPUI sentinel that resolves to the platform system UI font.
-    // This matches gpui-component's own Theme default.
-    ".SystemUIFont".to_string()
+    "Noto Sans CJK SC".to_string()
 }
 
 fn default_terminal_font_family() -> String {
-    "Maple Mono NF CN".to_string()
+    "Noto Sans CJK SC".to_string()
 }
 
 impl Default for ConfigFile {
@@ -330,7 +318,6 @@ impl Default for ConfigFile {
             keyword_highlight: false,
             ui_font_family: default_ui_font_family(),
             terminal_font_family: default_terminal_font_family(),
-            title_bar_style: TitleBarStyle::default(),
             cursor_style: CursorStyle::default(),
             sessions: Vec::new(),
             window_bounds: None,
@@ -664,7 +651,7 @@ impl ConfigStore {
 
     pub fn ui_font_family(&self) -> &str {
         if self.cache.ui_font_family.is_empty() {
-            ".SystemUIFont"
+            "Noto Sans CJK SC"
         } else {
             &self.cache.ui_font_family
         }
@@ -692,7 +679,7 @@ impl ConfigStore {
 
     pub fn terminal_font_family(&self) -> &str {
         if self.cache.terminal_font_family.is_empty() {
-            "Maple Mono NF CN"
+            "Noto Sans CJK SC"
         } else {
             &self.cache.terminal_font_family
         }
@@ -700,14 +687,6 @@ impl ConfigStore {
 
     pub fn set_terminal_font_family(&mut self, family: &str) {
         self.cache.terminal_font_family = family.to_string();
-    }
-
-    pub fn title_bar_style(&self) -> TitleBarStyle {
-        self.cache.title_bar_style
-    }
-
-    pub fn set_title_bar_style(&mut self, style: TitleBarStyle) {
-        self.cache.title_bar_style = style;
     }
 
     pub fn cursor_style(&self) -> CursorStyle {
@@ -862,7 +841,6 @@ impl ConfigStore {
         disk_config.keyword_highlight = local_config.keyword_highlight;
         disk_config.ui_font_family = local_config.ui_font_family;
         disk_config.terminal_font_family = local_config.terminal_font_family;
-        disk_config.title_bar_style = local_config.title_bar_style;
         disk_config.cursor_style = local_config.cursor_style;
         disk_config.window_bounds = local_config.window_bounds;
         disk_config.workspace_panels = local_config.workspace_panels;
@@ -1226,6 +1204,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn default_fonts_use_noto_sans_cjk_sc() {
+        let config = ConfigFile::default();
+        assert_eq!(config.ui_font_family, "Noto Sans CJK SC");
+        assert_eq!(config.terminal_font_family, "Noto Sans CJK SC");
+    }
+
+    #[test]
+    fn configuration_does_not_persist_a_title_bar_style() {
+        let config = ConfigFile::default();
+        assert!(
+            !serde_json::to_string(&config)
+                .unwrap()
+                .contains("title_bar_style")
+        );
+    }
+
+    #[test]
     fn test_get_hardware_uuid() {
         let uuid = get_hardware_uuid();
         assert!(!uuid.is_empty());
@@ -1239,7 +1234,7 @@ mod tests {
 
         // Ensure it doesn't contain plain text fields of default config
         let encrypted_str = String::from_utf8_lossy(&encrypted);
-        assert!(!encrypted_str.contains("Maple Mono NF CN"));
+        assert!(!encrypted_str.contains("Noto Sans CJK SC"));
         assert!(encrypted_str.contains("argon2id"));
 
         let decrypted = decrypt_config(&encrypted, password).unwrap();

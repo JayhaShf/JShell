@@ -237,13 +237,11 @@ pub(crate) fn open_main_window(cx: &mut App) {
 
     let mut window_options = WindowOptions::default();
 
-    if config.title_bar_style() == crate::session::config::TitleBarStyle::Integrated {
-        window_options.titlebar = Some(gpui::TitlebarOptions {
-            title: None,
-            appears_transparent: true,
-            traffic_light_position: Some(gpui::point(px(9.0), px(9.0))),
-        });
-    }
+    window_options.titlebar = Some(gpui::TitlebarOptions {
+        title: None,
+        appears_transparent: true,
+        traffic_light_position: Some(gpui::point(px(9.0), px(9.0))),
+    });
 
     #[cfg(not(target_os = "macos"))]
     if let Ok(img) = image::load_from_memory(include_bytes!("../../assets/icons/ashell.png")) {
