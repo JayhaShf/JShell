@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ashell - UI proportion preview</title>
+  <style>
+    :root {
+      --bg: #0b0b0b; --panel: #171717; --panel-2: #202020; --line: #303030;
+      --text: #f5f5f5; --muted: #969696; --hover: #292929; --active: #f5f5f5;
+      --active-text: #0b0b0b; --accent: #f5f5f5; --terminal: #0b0b0b;
+      --green: #a7d797; --yellow: #d8ca77; --danger: #d75050;
+    }
+    [data-theme="light"] {
+      --bg: #fff; --panel: #f5f5f5; --panel-2: #ededed; --line: #d7d7d7;
+      --text: #151515; --muted: #6b6b6b; --hover: #e6e6e6; --active: #151515;
+      --active-text: #fff; --accent: #151515; --terminal: #fff;
+      --green: #267a43; --yellow: #816200; --danger: #b4232a;
+    }
+    [data-theme="vscode"] {
+      --bg: #1e1e1e; --panel: #252526; --panel-2: #2d2d30; --line: #3e3e42;
+      --text: #fff; --muted: #a5a5a5; --hover: #37373d; --active: #094771;
+      --active-text: #fff; --accent: #007acc; --terminal: #1e1e1e;
+      --green: #89d185; --yellow: #dcdcaa; --danger: #f14c4c;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-width: 320px; height: 100vh; overflow: hidden; background: #101010; color: var(--text); font-family: "Noto Sans CJK SC", "Segoe UI", sans-serif; letter-spacing: 0; }
+    button { font: inherit; color: inherit; border: 0; cursor: pointer; }
+    .app { width: min(1440px, calc(100vw - 32px)); height: min(880px, calc(100vh - 32px)); margin: 16px auto; display: grid; grid-template-rows: 40px minmax(0, 1fr) 26px; overflow: hidden; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); box-shadow: 0 18px 48px #00000045; }
+    .titlebar { display: grid; grid-template-columns: 180px minmax(200px, 1fr) 146px 136px; align-items: stretch; border-bottom: 1px solid var(--line); background: var(--panel); }
+    .brand, .actions, .controls, .tabs { display: flex; align-items: center; }
+    .brand { gap: 9px; padding: 0 14px; font-size: 13px; font-weight: 600; }
+    .brand i { color: var(--accent); width: 17px; }
+    .tabs { min-width: 0; gap: 2px; overflow: hidden; }
+    .tab { height: 32px; min-width: 155px; max-width: 220px; padding: 0 9px 0 10px; display: flex; align-items: center; gap: 8px; background: transparent; color: var(--muted); border-radius: 5px 5px 0 0; font-size: 12px; }
+    .tab.active { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-bottom-color: var(--bg); margin-bottom: -1px; }
+    .tab .status { width: 7px; height: 7px; border-radius: 50%; background: var(--green); flex: none; }
+    .tab span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; text-align: left; }
+    .icon-button { width: 32px; height: 32px; display: inline-grid; place-items: center; background: transparent; color: var(--muted); border-radius: 5px; }
+    .icon-button:hover { background: var(--hover); color: var(--text); }
+    .icon-button i { width: 16px; height: 16px; }
+    .actions { gap: 2px; justify-content: center; padding: 0 6px; }
+    .controls { justify-content: flex-end; }
+    .window-control { width: 45px; height: 39px; display: grid; place-items: center; background: transparent; color: var(--text); }
+    .window-control:hover { background: var(--hover); }
+    .window-control.close:hover { background: var(--danger); color: #fff; }
+    .window-control i { width: 15px; height: 15px; }
+    .content { min-height: 0; display: grid; grid-template-columns: 60px minmax(210px, 260px) minmax(0, 1fr); }
+    .rail { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 10px 0; background: var(--panel); border-right: 1px solid var(--line); }
+    .rail .spacer { flex: 1; }
+    .rail .icon-button { width: 40px; height: 38px; border-radius: 5px; position: relative; }
+    .rail .icon-button.active { color: var(--text); background: var(--hover); }
+    .rail .icon-button.active::before { content: ""; position: absolute; left: 0; height: 22px; width: 3px; background: var(--accent); border-radius: 0 2px 2px 0; }
+    .sessions { min-width: 0; min-height: 0; display: flex; flex-direction: column; border-right: 1px solid var(--line); background: var(--panel); }
+    .section-head { display: flex; align-items: center; justify-content: space-between; padding: 0 12px; border-bottom: 1px solid var(--line); }
+    .section-head h2 { margin: 0; font-size: 12px; font-weight: 600; }
+    .section-head .head-actions { display: flex; gap: 2px; }
+    .side-monitor { flex: none; height: 154px; display: grid; grid-template-rows: repeat(4, 1fr); border-bottom: 1px solid var(--line); background: var(--panel); }
+    .side-metric { min-width: 0; padding: 7px 12px; border-bottom: 1px solid var(--line); }.side-metric:last-child { border-bottom: 0; }
+    .side-metric-title { display: flex; align-items: center; justify-content: space-between; color: var(--muted); font-size: 10px; }.side-metric-title strong { color: var(--text); font-size: 10px; font-weight: 600; }
+    .side-meter { height: 4px; margin-top: 7px; overflow: hidden; background: var(--panel-2); border-radius: 3px; }.side-meter b { display: block; height: 100%; background: var(--accent); }
+    .saved-list { min-height: 0; flex: 1; overflow: auto; padding: 8px; }
+    .folder-row { min-height: 30px; display: flex; align-items: center; gap: 6px; padding: 5px 4px 3px 6px; color: var(--muted); font-size: 11px; font-weight: 600; }.folder-row > i { width: 13px; height: 13px; }.folder-row .folder-count { margin-left: auto; font-size: 10px; color: var(--muted); font-weight: 400; }.folder-open-all { width: 22px; height: 22px; display: inline-grid; place-items: center; flex: none; border-radius: 4px; color: var(--muted); background: transparent; }.folder-open-all:hover { color: var(--text); background: var(--hover); }.folder-open-all i { width: 13px; height: 13px; }
+    .session { width: 100%; min-height: 46px; padding: 5px 7px 5px 14px; display: grid; grid-template-columns: 24px minmax(0, 1fr) 16px; align-items: center; gap: 7px; text-align: left; border-radius: 5px; background: transparent; }
+    .session:hover { background: var(--hover); }
+    .session.selected { background: var(--active); color: var(--active-text); }
+    .session-icon { width: 23px; height: 23px; display: grid; place-items: center; background: var(--panel-2); border: 1px solid var(--line); border-radius: 5px; }
+    .selected .session-icon { background: var(--active-text); color: var(--active); border-color: transparent; }
+    .session-icon i { width: 14px; height: 14px; }
+    .session-name { display: block; min-width: 0; font-size: 11px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .session-host { display: block; margin-top: 2px; color: var(--muted); font-family: "Cascadia Mono", "Noto Sans CJK SC", monospace; font-size: 9px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .selected .session-host { color: color-mix(in srgb, var(--active-text), transparent 35%); }
+    .online { width: 7px; height: 7px; border-radius: 50%; background: var(--green); }
+    .config-entry { margin: 8px; padding: 9px 8px; display: flex; align-items: center; gap: 8px; border-top: 1px solid var(--line); color: var(--muted); font-size: 11px; }
+    .config-entry i { width: 14px; }
+    .workspace { min-width: 0; min-height: 0; display: grid; grid-template-rows: minmax(0, 1fr) 154px; background: var(--terminal); }.show-hidden .workspace { grid-template-rows: minmax(0, 1fr) 224px; }
+    .terminal-wrap { min-height: 0; padding: 18px 22px; overflow: hidden; }
+    .terminal { height: 100%; padding: 4px 0; font-family: "Noto Sans CJK SC", "Cascadia Mono", monospace; font-size: 14px; line-height: 1.8; color: var(--text); white-space: pre-wrap; }
+    .prompt { color: var(--text); font-weight: 600; }.host { color: var(--green); }.path { color: var(--yellow); }.cmd { color: var(--text); }.dim { color: var(--muted); }.cursor { display: inline-block; width: 8px; height: 17px; transform: translateY(3px); background: var(--accent); animation: blink 1s steps(2) infinite; }
+    @keyframes blink { 50% { opacity: 0; } }
+    .sftp-dock { min-height: 0; display: grid; grid-template-rows: 30px minmax(0, 1fr); border-top: 1px solid var(--line); background: var(--panel); }
+    .sftp-head { display: flex; align-items: center; gap: 7px; padding: 0 10px; border-bottom: 1px solid var(--line); }.sftp-head > i { width: 14px; color: var(--accent); }.sftp-head strong { font-size: 10px; }.sftp-path { min-width: 0; margin-left: 7px; color: var(--muted); font: 9px "Cascadia Mono", monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }.sftp-actions { margin-left: auto; display: flex; gap: 1px; }.sftp-head .icon-button { width: 24px; height: 24px; }.sftp-head .icon-button i { width: 14px; height: 14px; }.sftp-files { min-height: 0; display: grid; grid-template-rows: 22px repeat(4, minmax(24px, 1fr)); padding: 4px 14px 6px; overflow: hidden; }.sftp-file { min-width: 0; padding: 3px 8px; display: grid; grid-template-columns: minmax(180px, 1.8fr) 1fr 70px 25px; align-items: center; gap: 10px; border-bottom: 1px solid var(--line); background: transparent; }.sftp-file:hover { background: var(--hover); }.sftp-file i { width: 14px; color: var(--muted); flex: none; }.sftp-file .file-name { min-width: 0; display: flex; align-items: center; gap: 7px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; }.sftp-file .file-meta { min-width: 0; color: var(--muted); font: 9px "Cascadia Mono", monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }.sftp-file small { color: var(--muted); font-size: 9px; text-align: right; }.sftp-file.is-directory { padding-left: 5px; border-left: 3px solid var(--accent); background: var(--panel-2); }.sftp-file.is-directory .file-name { font-weight: 600; }.sftp-file.is-directory .file-name i { color: var(--accent); }.sftp-file.is-file .file-name i { color: var(--muted); }.sftp-column { display: grid; grid-template-columns: minmax(180px, 1.8fr) 1fr 70px 25px; gap: 10px; align-items: center; padding: 0 8px; color: var(--muted); font-size: 9px; }.sftp-column span:last-child { text-align: right; }.hidden-file { display: none; }.show-hidden .hidden-file { display: grid; }.show-hidden #hidden-toggle { color: var(--accent); background: var(--hover); }
+    .monitor { min-height: 0; border-top: 1px solid var(--line); background: var(--panel); display: grid; grid-template-columns: 1.1fr 1fr 1fr 1fr; }
+    .statusbar { display: flex; align-items: center; justify-content: space-between; padding: 0 12px; border-top: 1px solid var(--line); background: var(--panel); color: var(--muted); font-size: 10px; }.status-left, .status-right { display: flex; gap: 14px; align-items: center; }.status-item { display: flex; gap: 5px; align-items: center; }.status-item i { width: 12px; height: 12px; }
+    .theme-popover { position: fixed; right: max(28px, calc((100vw - min(1440px, calc(100vw - 32px))) / 2 + 168px)); top: 62px; display: none; width: 142px; padding: 5px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); box-shadow: 0 12px 32px #00000030; z-index: 3; }.theme-popover.open { display: grid; gap: 2px; }.theme-choice { height: 30px; padding: 0 8px; display: flex; align-items: center; gap: 8px; background: transparent; border-radius: 4px; color: var(--text); font-size: 11px; text-align: left; }.theme-choice:hover { background: var(--hover); }.swatch { width: 12px; height: 12px; border: 1px solid var(--line); border-radius: 3px; }.swatch.dark { background: #0b0b0b; }.swatch.light { background: #fff; }.swatch.vscode { background: #007acc; }.toast { position: fixed; left: 50%; bottom: 42px; z-index: 5; max-width: calc(100vw - 32px); padding: 8px 12px; border: 1px solid var(--line); border-radius: 5px; background: var(--panel-2); color: var(--text); box-shadow: 0 8px 24px #00000035; font-size: 11px; opacity: 0; pointer-events: none; transform: translate(-50%, 8px); transition: opacity .16s ease, transform .16s ease; }.toast.visible { opacity: 1; transform: translate(-50%, 0); }
+    @media (max-width: 850px) { .app { width: 100vw; height: 100vh; margin: 0; border-radius: 0; border: 0; }.titlebar { grid-template-columns: 116px minmax(0, 1fr) 70px 92px; }.brand { padding: 0 10px; }.brand span { display: none; }.tab { min-width: 115px; }.content { grid-template-columns: 56px minmax(190px, 240px) minmax(0, 1fr); }.rail .icon-button { width: 40px; }.terminal-wrap { padding: 14px; }.terminal { font-size: 12px; }.workspace { grid-template-rows: minmax(0, 1fr) 132px; }.sftp-files { grid-template-columns: repeat(2, minmax(100px, 1fr)); } }
+    @media (max-width: 620px) { .titlebar { grid-template-columns: 54px 1fr 46px 92px; }.tabs .tab:not(.active), .actions .icon-button:not(#theme-toggle), .sessions { display: none; }.content { grid-template-columns: 56px minmax(0, 1fr); }.workspace { grid-column: 2; }.monitor { display: none; }.workspace { grid-template-rows: 1fr; }.sftp-dock { display: none; }.terminal-wrap { padding: 12px; }.brand { justify-content: center; }.controls { margin-left: -1px; } }
+  </style>
+</head>
+<body data-theme="dark">
+  <main class="app" aria-label="ashell workspace preview">
+    <header class="titlebar">
+      <div class="brand"><i data-lucide="square-terminal"></i><span>ashell</span></div>
+      <div class="tabs">
+        <button class="tab active"><span class="status"></span><span>prod@shanghai:~$</span><i data-lucide="x" style="width:13px"></i></button>
+        <button class="tab"><span class="status"></span><span>staging@hangzhou</span><i data-lucide="x" style="width:13px"></i></button>
+      </div>
+      <div class="actions"><button class="icon-button" title="搜索"><i data-lucide="search"></i></button><button class="icon-button" id="theme-toggle" title="主题"><i data-lucide="palette"></i></button><button class="icon-button" title="设置"><i data-lucide="settings-2"></i></button></div>
+      <div class="controls"><button class="window-control" title="最小化"><i data-lucide="minus"></i></button><button class="window-control" title="最大化"><i data-lucide="square"></i></button><button class="window-control close" title="关闭"><i data-lucide="x"></i></button></div>
+    </header>
+    <section class="content">
+      <nav class="rail" aria-label="主导航"><button class="icon-button active" title="会话"><i data-lucide="terminal-square"></i></button><button class="icon-button" title="文件"><i data-lucide="folder-tree"></i></button><button class="icon-button" title="传输"><i data-lucide="arrow-left-right"></i></button><button class="icon-button" title="监控"><i data-lucide="activity"></i></button><span class="spacer"></span><button class="icon-button" title="添加会话"><i data-lucide="plus"></i></button><button class="icon-button" title="设置"><i data-lucide="settings-2"></i></button></nav>
+      <aside class="sessions">
+        <div class="section-head"><h2>性能监控</h2><div class="head-actions"><button class="icon-button" title="刷新"><i data-lucide="refresh-cw"></i></button></div></div>
+        <section class="side-monitor" aria-label="服务器监控">
+          <div class="side-metric"><div class="side-metric-title"><span>CPU</span><strong>34%</strong></div><div class="side-meter"><b style="width:34%"></b></div></div>
+          <div class="side-metric"><div class="side-metric-title"><span>内存</span><strong>6.4 / 16G</strong></div><div class="side-meter"><b style="width:40%"></b></div></div>
+          <div class="side-metric"><div class="side-metric-title"><span>网络</span><strong>12.8 MB/s</strong></div><div class="side-meter"><b style="width:56%"></b></div></div>
+          <div class="side-metric"><div class="side-metric-title"><span>磁盘</span><strong>39%</strong></div><div class="side-meter"><b style="width:39%"></b></div></div>
+        </section>
+        <div class="section-head"><h2>SSH 会话</h2><div class="head-actions"><button class="icon-button" title="筛选"><i data-lucide="filter"></i></button><button class="icon-button" title="新建会话"><i data-lucide="plus"></i></button></div></div>
+        <div class="saved-list">
+          <div class="folder-row" data-folder="production"><i data-lucide="folder-open"></i><span>生产环境</span><span class="folder-count">2 个客户端</span><button class="folder-open-all" title="批量打开生产环境"><i data-lucide="play"></i></button><i data-lucide="chevron-down"></i></div>
+          <button class="session selected" data-folder-session="production" data-tab-label="prod@shanghai:~$"><span class="session-icon"><i data-lucide="server"></i></span><span><span class="session-name">Shanghai Production</span><span class="session-host">prod@shanghai:22</span></span><span class="online"></span></button>
+          <button class="session" data-folder-session="production" data-tab-label="ops@beijing:~$"><span class="session-icon"><i data-lucide="server"></i></span><span><span class="session-name">Beijing Analytics</span><span class="session-host">ops@beijing:22</span></span><span class="online"></span></button>
+          <div class="folder-row" data-folder="development"><i data-lucide="folder-open"></i><span>开发环境</span><span class="folder-count">2 个客户端</span><button class="folder-open-all" title="批量打开开发环境"><i data-lucide="play"></i></button><i data-lucide="chevron-down"></i></div>
+          <button class="session" data-folder-session="development" data-tab-label="dev@hangzhou:~$"><span class="session-icon"><i data-lucide="server"></i></span><span><span class="session-name">Hangzhou Staging</span><span class="session-host">dev@hangzhou:2202</span></span><span class="online"></span></button>
+          <button class="session" data-folder-session="development" data-tab-label="local:~$"><span class="session-icon"><i data-lucide="laptop"></i></span><span><span class="session-name">Local Shell</span><span class="session-host">PowerShell 7</span></span><span class="online" style="visibility:hidden"></span></button>
+        </div>
+        <div class="config-entry"><i data-lucide="folder-cog"></i><span>配置目录</span><button class="icon-button" style="margin-left:auto;width:25px;height:25px" title="选择位置"><i data-lucide="ellipsis"></i></button></div>
+      </aside>
+      <section class="workspace">
+        <div class="terminal-wrap"><div class="terminal"><span class="prompt">[</span><span class="host">prod@shanghai</span><span class="prompt">:</span><span class="path">~</span><span class="prompt">]$ </span><span class="cmd">uptime</span>
+<span class="dim"> 10:42:18 up 17 days,  6:31,  2 users,  load average: 0.34, 0.28, 0.22</span>
+<span class="prompt">[</span><span class="host">prod@shanghai</span><span class="prompt">:</span><span class="path">~</span><span class="prompt">]$ </span><span class="cmd">systemctl status ashell-worker</span>
+<span class="green">●</span> ashell-worker.service - ashell worker
+   <span class="dim">Active: active (running) since Mon 2026-07-13 08:21:56 CST</span>
+<span class="prompt">[</span><span class="host">prod@shanghai</span><span class="prompt">:</span><span class="path">~</span><span class="prompt">]$ </span><span class="cursor"></span></div></div>
+        <section class="sftp-dock" aria-label="SFTP 文件管理">
+          <div class="sftp-head"><i data-lucide="folder-tree"></i><strong>SFTP</strong><span class="sftp-path">prod@shanghai:/var/www/ashell</span><div class="sftp-actions"><button class="icon-button" title="显示隐藏文件" id="hidden-toggle"><i data-lucide="eye"></i></button><button class="icon-button" title="上传"><i data-lucide="upload"></i></button><button class="icon-button" title="下载"><i data-lucide="download"></i></button><button class="icon-button" title="刷新"><i data-lucide="refresh-cw"></i></button><button class="icon-button" title="收起"><i data-lucide="chevron-down"></i></button></div></div>
+          <div class="sftp-files"><div class="sftp-column"><span>名称</span><span>修改时间</span><span>大小</span><span></span></div><div class="sftp-file is-directory"><span class="file-name"><i data-lucide="folder"></i>releases</span><span class="file-meta">今天 09:18</span><small>目录</small><span></span></div><div class="sftp-file is-directory"><span class="file-name"><i data-lucide="folder"></i>shared</span><span class="file-meta">昨天 18:42</span><small>目录</small><span></span></div><div class="sftp-file is-file"><span class="file-name"><i data-lucide="file-code-2"></i>docker-compose.yml</span><span class="file-meta">今天 08:36</span><small>4 KB</small><span></span></div><div class="sftp-file is-file"><span class="file-name"><i data-lucide="file-text"></i>deploy.log</span><span class="file-meta">今天 10:40</span><small>28 KB</small><span></span></div><div class="sftp-file is-directory hidden-file"><span class="file-name"><i data-lucide="folder-dot"></i>.config</span><span class="file-meta">7 月 26 日</span><small>目录</small><span></span></div><div class="sftp-file is-file hidden-file"><span class="file-name"><i data-lucide="file-key-2"></i>.env.production</span><span class="file-meta">7 月 26 日</span><small>2 KB</small><span></span></div></div>
+        </section>
+      </section>
+    </section>
+    <footer class="statusbar"><div class="status-left"><span class="status-item"><i data-lucide="wifi"></i>已连接</span><span class="status-item">UTF-8</span></div><div class="status-right"><span>Linux x86_64</span><span>延迟 18 ms</span></div></footer>
+  </main>
+  <div class="theme-popover" id="theme-popover"><button class="theme-choice" data-choice="light"><span class="swatch light"></span>Ashell Light</button><button class="theme-choice" data-choice="dark"><span class="swatch dark"></span>Ashell Dark</button><button class="theme-choice" data-choice="vscode"><span class="swatch vscode"></span>VS Code Dark</button></div>
+  <div class="toast" id="toast" role="status"></div>
+  <script src="https://unpkg.com/lucide@latest"></script>
+  <script>
+    lucide.createIcons();
+    const popover = document.getElementById('theme-popover');
+    document.getElementById('theme-toggle').addEventListener('click', () => popover.classList.toggle('open'));
+    document.querySelectorAll('[data-choice]').forEach((button) => button.addEventListener('click', () => { document.body.dataset.theme = button.dataset.choice; popover.classList.remove('open'); }));
+    const toast = document.getElementById('toast');
+    let toastTimer;
+    const showToast = (message) => { toast.textContent = message; toast.classList.add('visible'); clearTimeout(toastTimer); toastTimer = setTimeout(() => toast.classList.remove('visible'), 2200); };
+    document.getElementById('hidden-toggle').addEventListener('click', () => {
+      const visible = document.body.classList.toggle('show-hidden');
+      showToast(visible ? '已显示隐藏文件和文件夹' : '已隐藏隐藏文件和文件夹');
+    });
+    document.querySelectorAll('.folder-open-all').forEach((button) => button.addEventListener('click', (event) => {
+      event.stopPropagation();
+      const folder = button.closest('[data-folder]').dataset.folder;
+      const sessions = [...document.querySelectorAll(`[data-folder-session="${folder}"]`)];
+      const tabBar = document.querySelector('.tabs');
+      sessions.forEach((session) => {
+        const label = session.dataset.tabLabel;
+        if (![...tabBar.querySelectorAll('.tab span:nth-child(2)')].some((tab) => tab.textContent === label)) {
+          const tab = document.createElement('button');
+          tab.className = 'tab';
+          tab.innerHTML = `<span class="status"></span><span>${label}</span><i data-lucide="x" style="width:13px"></i>`;
+          tabBar.append(tab);
+        }
+        const status = session.querySelector('.online');
+        status.style.visibility = 'visible';
+      });
+      lucide.createIcons();
+      showToast(`已打开 ${sessions.length} 个 SSH 客户端`);
+    }));
+  </script>
+</body>
+</html>

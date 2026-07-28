@@ -1,0 +1,1069 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ashell 终端字体校准</title>
+  <style>
+    @font-face {
+      font-family: "Ashell Noto Sans CJK";
+      src: url("../assets/fonts/NotoSansCJKsc-Regular.otf") format("opentype");
+      font-style: normal;
+      font-weight: 400;
+      font-display: swap;
+    }
+
+    @font-face {
+      font-family: "Ashell Noto Mono CJK";
+      src: url("../assets/fonts/NotoSansMonoCJKsc-Regular.otf") format("opentype");
+      font-style: normal;
+      font-weight: 400;
+      font-display: swap;
+    }
+
+    :root {
+      color-scheme: dark;
+      --page: #101010;
+      --shell: #151515;
+      --titlebar: #1b1b1b;
+      --panel: #202020;
+      --panel-2: #252525;
+      --terminal: #0b0b0b;
+      --terminal-2: #0e0e0e;
+      --line: #333333;
+      --line-strong: #484848;
+      --text: #f5f5f5;
+      --muted: #a5a5a5;
+      --quiet: #727272;
+      --green: #a7d797;
+      --yellow: #d8ca77;
+      --red: #d75050;
+      --blue: #75b7e8;
+      --cyan: #7ccbc4;
+      --focus: #d8ca77;
+      --radius: 6px;
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body { min-height: 100%; }
+
+    html { overflow-x: hidden; }
+
+    body {
+      margin: 0;
+      max-width: 100vw;
+      overflow-x: hidden;
+      background: var(--page);
+      color: var(--text);
+      font-family: "Ashell Noto Sans CJK", "Noto Sans CJK SC", sans-serif;
+      font-size: 13px;
+    }
+
+    button, input { font: inherit; }
+
+    button {
+      border: 0;
+      color: inherit;
+      cursor: pointer;
+    }
+
+    button:focus-visible,
+    input:focus-visible {
+      outline: 2px solid var(--focus);
+      outline-offset: 2px;
+    }
+
+    .app-shell {
+      width: min(1500px, calc(100vw - 24px));
+      min-height: calc(100vh - 24px);
+      margin: 12px auto;
+      overflow: hidden;
+      border: 1px solid var(--line-strong);
+      border-radius: var(--radius);
+      background: var(--shell);
+      box-shadow: 0 18px 55px rgba(0, 0, 0, 0.32);
+    }
+
+    .titlebar {
+      height: 46px;
+      display: grid;
+      grid-template-columns: 210px minmax(0, 1fr) auto;
+      align-items: center;
+      border-bottom: 1px solid var(--line);
+      background: var(--titlebar);
+      user-select: none;
+    }
+
+    .brand {
+      min-width: 0;
+      height: 100%;
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      padding: 0 14px;
+      font-weight: 600;
+    }
+
+    .brand-mark {
+      width: 20px;
+      height: 16px;
+      display: grid;
+      place-items: center;
+      border: 1px solid #606060;
+      border-radius: 3px;
+      background: #111111;
+      color: var(--green);
+      font: 10px/1 "Ashell Noto Mono CJK", monospace;
+    }
+
+    .active-tab-wrap {
+      min-width: 0;
+      height: 100%;
+      display: flex;
+      align-items: end;
+      padding-top: 6px;
+    }
+
+    .active-tab {
+      width: min(390px, 100%);
+      height: 34px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 0 12px;
+      overflow: hidden;
+      border: 1px solid #292929;
+      border-bottom: 0;
+      border-radius: 6px 6px 0 0;
+      background: #000000;
+      font: 12px/1 "Ashell Noto Mono CJK", monospace;
+    }
+
+    .active-tab .status-dot {
+      width: 7px;
+      height: 7px;
+      flex: none;
+      border-radius: 50%;
+      background: var(--green);
+    }
+
+    .active-tab .label {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .window-controls {
+      height: 100%;
+      display: flex;
+    }
+
+    .window-control {
+      width: 46px;
+      height: 100%;
+      display: grid;
+      place-items: center;
+      background: transparent;
+      color: #cccccc;
+      font-size: 15px;
+    }
+
+    .window-control:hover { background: #303030; }
+    .window-control.close:hover { background: #c42b1c; color: #ffffff; }
+
+    .workspace-head {
+      min-height: 76px;
+      display: grid;
+      grid-template-columns: minmax(270px, 1fr) auto;
+      align-items: center;
+      gap: 20px;
+      padding: 14px 18px;
+      border-bottom: 1px solid var(--line);
+      background: var(--panel);
+    }
+
+    .heading-copy { min-width: 0; }
+
+    .heading-copy h1 {
+      margin: 0;
+      font-size: 17px;
+      line-height: 1.25;
+      font-weight: 650;
+    }
+
+    .heading-copy p {
+      margin: 6px 0 0;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+
+    .font-status {
+      min-width: 214px;
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      padding: 8px 10px;
+      border-left: 2px solid var(--yellow);
+      background: #191919;
+    }
+
+    .font-status.loaded { border-left-color: var(--green); }
+    .font-status.failed { border-left-color: var(--red); }
+
+    .font-status-dot {
+      width: 8px;
+      height: 8px;
+      flex: none;
+      border-radius: 50%;
+      background: var(--yellow);
+    }
+
+    .font-status.loaded .font-status-dot { background: var(--green); }
+    .font-status.failed .font-status-dot { background: var(--red); }
+
+    .font-status strong {
+      display: block;
+      font-size: 11px;
+      font-weight: 600;
+    }
+
+    .font-status small {
+      display: block;
+      margin-top: 2px;
+      color: var(--muted);
+      font: 10px/1.35 "Ashell Noto Sans CJK", sans-serif;
+    }
+
+    .view-tabs {
+      min-height: 43px;
+      display: flex;
+      align-items: center;
+      gap: 3px;
+      padding: 6px 12px;
+      border-bottom: 1px solid var(--line);
+      background: #191919;
+    }
+
+    .view-tab {
+      min-height: 30px;
+      padding: 0 12px;
+      border-radius: 4px;
+      background: transparent;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .view-tab:hover { background: #282828; color: var(--text); }
+
+    .view-tab[aria-pressed="true"] {
+      background: #343434;
+      color: var(--text);
+      box-shadow: inset 0 -2px 0 var(--green);
+    }
+
+    .view-panel { padding: 16px; }
+    .view-panel[hidden] { display: none; }
+
+    .section-bar {
+      min-height: 34px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 10px;
+    }
+
+    .section-bar h2 {
+      margin: 0;
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    .section-bar .hint {
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .comparison-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .preset-panel {
+      min-width: 0;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 5px;
+      background: var(--panel-2);
+    }
+
+    .preset-panel.active { border-color: #737373; }
+
+    .preset-head {
+      min-height: 52px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--line);
+      background: #242424;
+    }
+
+    .preset-copy { min-width: 0; }
+
+    .preset-copy strong {
+      display: block;
+      font-size: 12px;
+      font-weight: 650;
+    }
+
+    .preset-copy span {
+      display: block;
+      margin-top: 3px;
+      color: var(--muted);
+      font: 10px/1.2 "Ashell Noto Mono CJK", monospace;
+      white-space: nowrap;
+    }
+
+    .preset-action {
+      margin-left: auto;
+      min-width: 58px;
+      height: 27px;
+      padding: 0 8px;
+      border: 1px solid #444444;
+      border-radius: 4px;
+      background: #1a1a1a;
+      color: #d5d5d5;
+      font-size: 10px;
+    }
+
+    .preset-action:hover { border-color: #777777; background: #303030; }
+
+    .preset-panel.active .preset-action {
+      border-color: var(--green);
+      color: var(--green);
+    }
+
+    .terminal-frame {
+      min-width: 0;
+      overflow: hidden;
+      background: var(--terminal);
+    }
+
+    .terminal-toolbar {
+      height: 32px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 0 10px;
+      border-bottom: 1px solid #242424;
+      background: var(--terminal-2);
+      color: var(--quiet);
+      font: 10px/1 "Ashell Noto Mono CJK", monospace;
+    }
+
+    .terminal-toolbar .led {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--green);
+    }
+
+    .terminal-toolbar .path {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .terminal-toolbar .dimensions { margin-left: auto; white-space: nowrap; }
+
+    .terminal-scroll {
+      min-width: 0;
+      height: 390px;
+      overflow: auto;
+      padding: 14px 14px 18px;
+      scrollbar-color: #424242 #111111;
+      scrollbar-width: thin;
+    }
+
+    .comparison-grid .terminal-scroll { height: 360px; }
+
+    .terminal-canvas {
+      width: max-content;
+      color: var(--text);
+      font-family: "Ashell Noto Mono CJK", monospace;
+      font-weight: 400;
+      font-style: normal;
+      font-variant-ligatures: none;
+      font-synthesis: none;
+      text-rendering: geometricPrecision;
+    }
+
+    .terminal-line {
+      height: var(--line-height);
+      min-width: max-content;
+      white-space: nowrap;
+    }
+
+    .terminal-cell {
+      position: relative;
+      width: calc(var(--cell-width) * var(--columns));
+      height: var(--line-height);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      overflow: visible;
+      vertical-align: top;
+      font-size: var(--font-size);
+      line-height: var(--line-height);
+    }
+
+    .terminal-cell.custom-circle::before {
+      content: "";
+      width: min(calc(var(--cell-width) * 0.72), calc(var(--line-height) * 0.38));
+      aspect-ratio: 1;
+      border-radius: 50%;
+      background: currentColor;
+    }
+
+    .terminal-canvas.show-grid .terminal-cell::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      border-right: 1px solid rgba(117, 183, 232, 0.15);
+      border-bottom: 1px solid rgba(117, 183, 232, 0.10);
+    }
+
+    .fg-green { color: var(--green); }
+    .fg-yellow { color: var(--yellow); }
+    .fg-red { color: var(--red); }
+    .fg-blue { color: var(--blue); }
+    .fg-cyan { color: var(--cyan); }
+    .fg-muted { color: var(--muted); }
+    .fg-quiet { color: var(--quiet); }
+
+    .terminal-cell.cursor-cell::before {
+      content: "";
+      width: calc(var(--cell-width) - 1px);
+      height: calc(var(--font-size) + 1px);
+      display: block;
+      background: #f5f5f5;
+      animation: cursor-blink 1s steps(2, end) infinite;
+    }
+
+    @keyframes cursor-blink { 50% { opacity: 0; } }
+
+    .single-layout {
+      display: grid;
+      grid-template-columns: 190px minmax(0, 1fr);
+      min-height: 520px;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 5px;
+      background: var(--terminal);
+    }
+
+    .preset-switcher {
+      padding: 12px;
+      border-right: 1px solid var(--line);
+      background: var(--panel);
+    }
+
+    .preset-switcher h3,
+    .calibration-controls h3 {
+      margin: 0 0 10px;
+      color: var(--muted);
+      font-size: 10px;
+      font-weight: 600;
+      text-transform: uppercase;
+    }
+
+    .preset-button {
+      width: 100%;
+      min-height: 48px;
+      display: grid;
+      gap: 4px;
+      margin-bottom: 5px;
+      padding: 8px 9px;
+      border: 1px solid transparent;
+      border-radius: 4px;
+      background: transparent;
+      color: var(--muted);
+      text-align: left;
+    }
+
+    .preset-button:hover { background: #292929; color: var(--text); }
+
+    .preset-button[aria-pressed="true"] {
+      border-color: #4b4b4b;
+      background: #303030;
+      color: var(--text);
+      box-shadow: inset 2px 0 0 var(--green);
+    }
+
+    .preset-button strong { font-size: 12px; }
+    .preset-button small { color: var(--muted); font: 9px/1.2 "Ashell Noto Mono CJK", monospace; }
+
+    .single-terminal-wrap { min-width: 0; }
+    .single-terminal-wrap .terminal-scroll { height: 486px; }
+
+    .calibration-layout {
+      display: grid;
+      grid-template-columns: 250px minmax(0, 1fr);
+      min-height: 560px;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 5px;
+      background: var(--terminal);
+    }
+
+    .calibration-controls {
+      padding: 13px;
+      border-right: 1px solid var(--line);
+      background: var(--panel);
+    }
+
+    .control-group {
+      padding: 11px 0;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .control-label {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 9px;
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .control-value {
+      min-width: 54px;
+      padding: 3px 5px;
+      border: 1px solid #3f3f3f;
+      border-radius: 3px;
+      background: #171717;
+      color: var(--text);
+      font: 10px/1.2 "Ashell Noto Mono CJK", monospace;
+      text-align: center;
+    }
+
+    input[type="range"] {
+      width: 100%;
+      height: 18px;
+      margin: 0;
+      accent-color: var(--green);
+    }
+
+    .checkbox-row {
+      min-height: 34px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .checkbox-row input { accent-color: var(--green); }
+
+    .control-actions {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px;
+      margin-top: 12px;
+    }
+
+    .command-button {
+      min-height: 31px;
+      padding: 0 8px;
+      border: 1px solid #454545;
+      border-radius: 4px;
+      background: #292929;
+      color: #dddddd;
+      font-size: 10px;
+    }
+
+    .command-button:hover { border-color: #6b6b6b; background: #343434; }
+    .command-button.primary { border-color: #6e8e63; color: var(--green); }
+
+    .metrics-readout {
+      margin-top: 13px;
+      padding: 9px;
+      border-left: 2px solid var(--blue);
+      background: #181818;
+      color: var(--muted);
+      font: 10px/1.6 "Ashell Noto Mono CJK", monospace;
+    }
+
+    .metrics-readout strong { color: var(--text); font-weight: 400; }
+
+    .calibration-terminal-wrap { min-width: 0; }
+    .calibration-terminal-wrap .terminal-scroll { height: 526px; }
+
+    .bottom-status {
+      min-height: 32px;
+      display: flex;
+      align-items: center;
+      gap: 18px;
+      padding: 0 12px;
+      border-top: 1px solid var(--line);
+      background: #181818;
+      color: var(--muted);
+      font-size: 10px;
+    }
+
+    .bottom-status .right { margin-left: auto; }
+
+    @media (max-width: 1080px) {
+      .comparison-grid { grid-template-columns: 1fr; }
+      .comparison-grid .terminal-scroll { height: 300px; }
+      .workspace-head { grid-template-columns: 1fr; gap: 10px; }
+      .font-status { min-width: 0; }
+    }
+
+    @media (max-width: 720px) {
+      .app-shell {
+        width: 100vw;
+        min-height: 100vh;
+        margin: 0;
+        border: 0;
+        border-radius: 0;
+      }
+
+      .titlebar { grid-template-columns: 54px minmax(0, 1fr) auto; }
+      .brand { justify-content: center; padding: 0; }
+      .brand span:last-child { display: none; }
+      .active-tab { width: 100%; }
+      .window-control { width: 38px; }
+      .view-tabs { overflow-x: auto; }
+      .view-tab { flex: 0 0 auto; }
+      .view-panel { padding: 10px; }
+      .section-bar { align-items: start; flex-direction: column; gap: 3px; }
+      .single-layout,
+      .calibration-layout { grid-template-columns: 1fr; }
+      .preset-switcher,
+      .calibration-controls { border-right: 0; border-bottom: 1px solid var(--line); }
+      .preset-switcher { display: grid; grid-template-columns: repeat(3, 1fr); gap: 5px; }
+      .preset-switcher h3 { grid-column: 1 / -1; }
+      .preset-button { min-width: 0; margin: 0; }
+      .preset-button small { white-space: normal; }
+      .control-actions { grid-template-columns: 1fr; }
+      .bottom-status { flex-wrap: wrap; padding-block: 7px; }
+      .bottom-status .right { width: 100%; margin-left: 0; }
+    }
+  </style>
+</head>
+<body>
+  <main class="app-shell">
+    <header class="titlebar">
+      <div class="brand"><span class="brand-mark">&gt;_</span><span>Ashell</span></div>
+      <div class="active-tab-wrap">
+        <div class="active-tab"><span class="status-dot"></span><span class="label">prod@shanghai:~$</span></div>
+      </div>
+      <div class="window-controls" aria-label="窗口控件">
+        <button class="window-control" type="button" title="最小化">−</button>
+        <button class="window-control" type="button" title="最大化">□</button>
+        <button class="window-control close" type="button" title="关闭">×</button>
+      </div>
+    </header>
+
+    <section class="workspace-head">
+      <div class="heading-copy">
+        <h1>终端字体校准</h1>
+        <p>界面使用 Noto Sans CJK SC，终端使用 Noto Sans Mono CJK SC，在固定网格中比较间距与宽高比例。</p>
+      </div>
+      <div class="font-status" id="font-status" role="status">
+        <span class="font-status-dot"></span>
+        <span><strong id="font-status-title">正在检测字体</strong><small>Noto Sans CJK SC + Noto Sans Mono CJK SC</small></span>
+      </div>
+    </section>
+
+    <nav class="view-tabs" aria-label="预览方式">
+      <button class="view-tab" type="button" data-view="comparison" aria-pressed="true">三栏并排</button>
+      <button class="view-tab" type="button" data-view="single" aria-pressed="false">单窗口切换</button>
+      <button class="view-tab" type="button" data-view="calibration" aria-pressed="false">完整校准</button>
+    </nav>
+
+    <section class="view-panel" id="comparison-view" data-view-panel="comparison">
+      <div class="section-bar"><h2>同屏对比</h2><span class="hint">三套预设使用完全相同的输出内容</span></div>
+      <div class="comparison-grid" id="comparison-grid"></div>
+    </section>
+
+    <section class="view-panel" id="single-view" data-view-panel="single" hidden>
+      <div class="section-bar"><h2>单窗口观察</h2><span class="hint">切换预设，完整查看长路径与中英文混排</span></div>
+      <div class="single-layout">
+        <aside class="preset-switcher" id="single-preset-switcher"><h3>排版密度</h3></aside>
+        <div class="single-terminal-wrap" id="single-terminal"></div>
+      </div>
+    </section>
+
+    <section class="view-panel" id="calibration-view" data-view-panel="calibration" hidden>
+      <div class="section-bar"><h2>完整校准</h2><span class="hint">调整参数并开启网格，观察每个字符的实际占位</span></div>
+      <div class="calibration-layout">
+        <aside class="calibration-controls">
+          <h3>终端排版参数</h3>
+          <div class="control-group">
+            <label class="control-label" for="font-size"><span>字号</span><output class="control-value" id="font-size-value">16px</output></label>
+            <input id="font-size" type="range" min="12" max="22" step="1" value="16">
+          </div>
+          <div class="control-group">
+            <label class="control-label" for="cell-width"><span>单列宽度</span><output class="control-value" id="cell-width-value">9.75px</output></label>
+            <input id="cell-width" type="range" min="7" max="13" step="0.25" value="9.75">
+          </div>
+          <div class="control-group">
+            <label class="control-label" for="line-height"><span>行高</span><output class="control-value" id="line-height-value">22px</output></label>
+            <input id="line-height" type="range" min="16" max="32" step="1" value="22">
+          </div>
+          <label class="checkbox-row"><input id="grid-toggle" type="checkbox">显示单元格网格</label>
+          <div class="control-actions">
+            <button class="command-button" id="reset" type="button">恢复预设</button>
+            <button class="command-button primary" id="next-preset" type="button">下一个预设</button>
+          </div>
+          <div class="metrics-readout" id="metrics-readout"></div>
+        </aside>
+        <div class="calibration-terminal-wrap" id="calibration-terminal"></div>
+      </div>
+    </section>
+
+    <footer class="bottom-status">
+      <span>界面：Noto Sans CJK SC Regular</span>
+      <span>终端：Noto Sans Mono CJK SC Regular</span>
+      <span>连字：关闭</span>
+      <span>斜体合成：关闭</span>
+      <span class="right" id="active-preset-status">当前预设：均衡</span>
+    </footer>
+  </main>
+
+  <script>
+    const PRESETS = {
+      compact: { label: "紧凑", description: "信息密度优先", fontSize: 15, cellWidth: 9, lineHeight: 20 },
+      balanced: { label: "均衡", description: "略放大且保持比例", fontSize: 16, cellWidth: 9.75, lineHeight: 22 },
+      relaxed: { label: "宽松", description: "长时间阅读优先", fontSize: 17, cellWidth: 10.25, lineHeight: 25 },
+    };
+
+    const SAMPLE_LINES = [
+      [
+        { text: "prod@shanghai", tone: "green" },
+        { text: ":", tone: "muted" },
+        { text: "~", tone: "yellow" },
+        { text: "$ ", tone: "muted" },
+        { text: "printf \"ABC abc 0123456789 !@#$%^&*()\"" },
+      ],
+      [{ text: "ABC abc 0123456789 !@#$%^&*()", tone: "blue" }],
+      [{ text: "" }],
+      [
+        { text: "prod@shanghai", tone: "green" },
+        { text: ":", tone: "muted" },
+        { text: "~", tone: "yellow" },
+        { text: "$ ", tone: "muted" },
+        { text: "printf \"英文宽度 / 中文网格 / symbols\"" },
+      ],
+      [
+        { text: "英文宽度 ABCDEFG / 数字 012345 / 中文网格 ", tone: "cyan" },
+        { text: "服务器状态正常", tone: "green" },
+      ],
+      [{ text: "" }],
+      [
+        { text: "权限       所有者  大小  修改时间          名称", tone: "muted" },
+      ],
+      [
+        { text: "drwxr-xr-x ", tone: "blue" },
+        { text: "deploy  4096  Jul 27 18:42  ", tone: "muted" },
+        { text: "releases/", tone: "yellow" },
+      ],
+      [
+        { text: "-rwxr-xr-x ", tone: "blue" },
+        { text: "deploy  8.7M  Jul 27 18:40  ", tone: "muted" },
+        { text: "ashell-worker", tone: "green" },
+      ],
+      [
+        { text: "-rw------- ", tone: "blue" },
+        { text: "root     312  Jul 27 17:03  ", tone: "muted" },
+        { text: ".env.production", tone: "red" },
+      ],
+      [{ text: "" }],
+      [
+        { text: "prod@shanghai", tone: "green" },
+        { text: ":", tone: "muted" },
+        { text: "/var/www/ashell/releases/2026-07-27/bin", tone: "yellow" },
+        { text: "$" , tone: "muted" },
+      ],
+      [
+        { text: "systemctl status ashell-worker --no-pager" },
+      ],
+      [
+        { text: "● ", tone: "green" },
+        { text: "ashell-worker.service", tone: "text" },
+        { text: " - Ashell Worker", tone: "muted" },
+      ],
+      [
+        { text: "  Active: ", tone: "muted" },
+        { text: "active (running)", tone: "green" },
+        { text: " since Mon 2026-07-27 08:21:56 CST", tone: "muted" },
+      ],
+      [
+        { text: "  Memory: ", tone: "muted" },
+        { text: "148.6M", tone: "yellow" },
+        { text: "   Tasks: 12   CPU: 3.421s", tone: "muted" },
+      ],
+      [{ text: "" }],
+      [
+        { text: "prod@shanghai", tone: "green" },
+        { text: ":", tone: "muted" },
+        { text: "~", tone: "yellow" },
+        { text: "$ ", tone: "muted" },
+        { text: "", cursor: true },
+      ],
+    ];
+
+    const TONE_CLASSES = {
+      green: "fg-green",
+      yellow: "fg-yellow",
+      red: "fg-red",
+      blue: "fg-blue",
+      cyan: "fg-cyan",
+      muted: "fg-muted",
+      quiet: "fg-quiet",
+      text: "",
+    };
+
+    const state = {
+      view: "comparison",
+      preset: "balanced",
+      showGrid: false,
+    };
+
+    const comparisonGrid = document.getElementById("comparison-grid");
+    const singlePresetSwitcher = document.getElementById("single-preset-switcher");
+    const singleTerminal = document.getElementById("single-terminal");
+    const calibrationTerminal = document.getElementById("calibration-terminal");
+    const fontSizeInput = document.getElementById("font-size");
+    const cellWidthInput = document.getElementById("cell-width");
+    const lineHeightInput = document.getElementById("line-height");
+    const gridToggle = document.getElementById("grid-toggle");
+    const metricsReadout = document.getElementById("metrics-readout");
+
+    function isWideCharacter(character) {
+      const code = character.codePointAt(0);
+      return (
+        (code >= 0x1100 && code <= 0x115f) ||
+        (code >= 0x2e80 && code <= 0xa4cf) ||
+        (code >= 0xac00 && code <= 0xd7a3) ||
+        (code >= 0xf900 && code <= 0xfaff) ||
+        (code >= 0xfe10 && code <= 0xfe6f) ||
+        (code >= 0xff01 && code <= 0xff60) ||
+        (code >= 0xffe0 && code <= 0xffe6) ||
+        (code >= 0x1f300 && code <= 0x1faff) ||
+        (code >= 0x20000 && code <= 0x3fffd)
+      );
+    }
+
+    function isCustomRenderedCharacter(character) {
+      return character === "●";
+    }
+
+    function formatMetric(value) {
+      return Number.isInteger(value) ? String(value) : value.toFixed(2).replace(/0+$/, "").replace(/\.$/, "");
+    }
+
+    function renderTerminal(host, metrics, options = {}) {
+      host.replaceChildren();
+      host.classList.add("terminal-frame");
+
+      const toolbar = document.createElement("div");
+      toolbar.className = "terminal-toolbar";
+      toolbar.innerHTML = `<span class="led"></span><span class="path">ssh://prod@shanghai/var/www/ashell</span><span class="dimensions">${formatMetric(metrics.fontSize)} / ${formatMetric(metrics.cellWidth)} / ${formatMetric(metrics.lineHeight)} px</span>`;
+
+      const scroll = document.createElement("div");
+      scroll.className = "terminal-scroll";
+      const canvas = document.createElement("div");
+      canvas.className = "terminal-canvas";
+      canvas.dataset.terminalCanvas = "true";
+      canvas.dataset.preset = options.preset || "custom";
+      canvas.style.setProperty("--font-size", `${metrics.fontSize}px`);
+      canvas.style.setProperty("--cell-width", `${metrics.cellWidth}px`);
+      canvas.style.setProperty("--line-height", `${metrics.lineHeight}px`);
+      canvas.classList.toggle("show-grid", state.showGrid);
+
+      SAMPLE_LINES.forEach((segments) => {
+        const line = document.createElement("div");
+        line.className = "terminal-line";
+        segments.forEach((segment) => {
+          if (segment.cursor) {
+            const cursor = document.createElement("span");
+            cursor.className = "terminal-cell cursor-cell";
+            cursor.style.setProperty("--columns", "1");
+            cursor.setAttribute("aria-hidden", "true");
+            line.append(cursor);
+            return;
+          }
+
+          Array.from(segment.text).forEach((character) => {
+            const cell = document.createElement("span");
+            cell.className = `terminal-cell ${TONE_CLASSES[segment.tone] || ""}`.trim();
+            cell.style.setProperty("--columns", isWideCharacter(character) ? "2" : "1");
+            if (isCustomRenderedCharacter(character)) {
+              cell.classList.add("custom-circle");
+            } else {
+              cell.textContent = character === " " ? "\u00a0" : character;
+            }
+            line.append(cell);
+          });
+        });
+        canvas.append(line);
+      });
+
+      scroll.append(canvas);
+      host.append(toolbar, scroll);
+    }
+
+    function presetMetrics(name) {
+      const preset = PRESETS[name];
+      return { fontSize: preset.fontSize, cellWidth: preset.cellWidth, lineHeight: preset.lineHeight };
+    }
+
+    function buildComparison() {
+      comparisonGrid.replaceChildren();
+      Object.entries(PRESETS).forEach(([name, preset]) => {
+        const panel = document.createElement("article");
+        panel.className = "preset-panel";
+        panel.dataset.comparisonPreset = name;
+
+        const head = document.createElement("header");
+        head.className = "preset-head";
+        head.innerHTML = `<div class="preset-copy"><strong>${preset.label}</strong><span>${preset.fontSize}px · ${preset.cellWidth}px cell · ${preset.lineHeight}px line</span></div>`;
+
+        const action = document.createElement("button");
+        action.className = "preset-action";
+        action.type = "button";
+        action.textContent = "选用";
+        action.addEventListener("click", () => {
+          applyPreset(name);
+          switchView("single");
+        });
+        head.append(action);
+
+        const terminal = document.createElement("div");
+        renderTerminal(terminal, presetMetrics(name), { preset: name });
+        panel.append(head, terminal);
+        comparisonGrid.append(panel);
+      });
+    }
+
+    function buildPresetSwitcher() {
+      singlePresetSwitcher.querySelectorAll(".preset-button").forEach((button) => button.remove());
+      Object.entries(PRESETS).forEach(([name, preset]) => {
+        const button = document.createElement("button");
+        button.className = "preset-button";
+        button.type = "button";
+        button.dataset.preset = name;
+        button.innerHTML = `<strong>${preset.label}</strong><small>${preset.fontSize} / ${preset.cellWidth} / ${preset.lineHeight}px</small>`;
+        button.addEventListener("click", () => applyPreset(name));
+        singlePresetSwitcher.append(button);
+      });
+    }
+
+    function syncPresetState() {
+      document.querySelectorAll("[data-preset]").forEach((button) => {
+        if (button.classList.contains("preset-button")) {
+          button.setAttribute("aria-pressed", String(button.dataset.preset === state.preset));
+        }
+      });
+      document.querySelectorAll("[data-comparison-preset]").forEach((panel) => {
+        panel.classList.toggle("active", panel.dataset.comparisonPreset === state.preset);
+      });
+      document.getElementById("active-preset-status").textContent = `当前预设：${PRESETS[state.preset].label}`;
+    }
+
+    function setCalibrationInputs(metrics) {
+      fontSizeInput.value = metrics.fontSize;
+      cellWidthInput.value = metrics.cellWidth;
+      lineHeightInput.value = metrics.lineHeight;
+      updateCalibration();
+    }
+
+    function applyPreset(name) {
+      state.preset = name;
+      const metrics = presetMetrics(name);
+      renderTerminal(singleTerminal, metrics, { preset: name });
+      setCalibrationInputs(metrics);
+      syncPresetState();
+    }
+
+    function updateCalibration() {
+      const metrics = {
+        fontSize: Number(fontSizeInput.value),
+        cellWidth: Number(cellWidthInput.value),
+        lineHeight: Number(lineHeightInput.value),
+      };
+      document.getElementById("font-size-value").textContent = `${formatMetric(metrics.fontSize)}px`;
+      document.getElementById("cell-width-value").textContent = `${formatMetric(metrics.cellWidth)}px`;
+      document.getElementById("line-height-value").textContent = `${formatMetric(metrics.lineHeight)}px`;
+      metricsReadout.innerHTML = `ASCII 单元格 <strong>${formatMetric(metrics.cellWidth)}px</strong><br>中文单元格 <strong>${formatMetric(metrics.cellWidth * 2)}px</strong><br>行高 / 字号 <strong>${(metrics.lineHeight / metrics.fontSize).toFixed(3)}</strong>`;
+      renderTerminal(calibrationTerminal, metrics, { preset: "custom" });
+    }
+
+    function switchView(name) {
+      state.view = name;
+      document.querySelectorAll("[data-view]").forEach((button) => {
+        button.setAttribute("aria-pressed", String(button.dataset.view === name));
+      });
+      document.querySelectorAll("[data-view-panel]").forEach((panel) => {
+        panel.hidden = panel.dataset.viewPanel !== name;
+      });
+    }
+
+    document.querySelectorAll("[data-view]").forEach((button) => {
+      button.addEventListener("click", () => switchView(button.dataset.view));
+    });
+
+    [fontSizeInput, cellWidthInput, lineHeightInput].forEach((input) => {
+      input.addEventListener("input", updateCalibration);
+    });
+
+    gridToggle.addEventListener("change", () => {
+      state.showGrid = gridToggle.checked;
+      document.querySelectorAll("[data-terminal-canvas]").forEach((canvas) => {
+        canvas.classList.toggle("show-grid", state.showGrid);
+      });
+    });
+
+    document.getElementById("reset").addEventListener("click", () => {
+      setCalibrationInputs(presetMetrics(state.preset));
+    });
+
+    document.getElementById("next-preset").addEventListener("click", () => {
+      const names = Object.keys(PRESETS);
+      const index = names.indexOf(state.preset);
+      applyPreset(names[(index + 1) % names.length]);
+    });
+
+    buildComparison();
+    buildPresetSwitcher();
+    applyPreset("balanced");
+    switchView("comparison");
+
+    const fontStatus = document.getElementById("font-status");
+    const fontStatusTitle = document.getElementById("font-status-title");
+    Promise.all([
+      document.fonts.load('16px "Ashell Noto Sans CJK"'),
+      document.fonts.load('16px "Ashell Noto Mono CJK"'),
+    ]).then((fontSets) => {
+      const loaded = fontSets.every((fonts) => fonts.length > 0)
+        && document.fonts.check('16px "Ashell Noto Sans CJK"')
+        && document.fonts.check('16px "Ashell Noto Mono CJK"');
+      fontStatus.classList.add(loaded ? "loaded" : "failed");
+      fontStatusTitle.textContent = loaded ? "UI 与终端字体已加载" : "字体加载失败";
+    }).catch(() => {
+      fontStatus.classList.add("failed");
+      fontStatusTitle.textContent = "字体加载失败";
+    });
+  </script>
+</body>
+</html>
