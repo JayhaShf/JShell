@@ -62,6 +62,24 @@ pub struct Session {
     pub baud_rate: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionFolder {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub session_ids: Vec<String>,
+}
+
+impl SessionFolder {
+    pub fn new(name: String, session_ids: Vec<String>) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            name,
+            session_ids,
+        }
+    }
+}
+
 impl Session {
     pub fn password(host: String, port: u16, user: String, password: String) -> Self {
         let name = format!("{user}@{host}");
@@ -178,6 +196,8 @@ pub enum CursorStyle {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigFile {
+    #[serde(default)]
+    pub font_defaults_version: u8,
     #[serde(default = "default_follow_system_theme")]
     pub follow_system_theme: bool,
     #[serde(default)]
@@ -196,6 +216,8 @@ pub struct ConfigFile {
     pub right_click_copy_paste: bool,
     #[serde(default)]
     pub keyword_highlight: bool,
+    #[serde(default = "default_history_completion_plugin_enabled")]
+    pub history_completion_plugin_enabled: bool,
     #[serde(default = "default_ui_font_family")]
     pub ui_font_family: String,
     #[serde(default = "default_terminal_font_family")]
@@ -204,6 +226,8 @@ pub struct ConfigFile {
     pub cursor_style: CursorStyle,
     #[serde(default)]
     pub sessions: Vec<Session>,
+    #[serde(default)]
+    pub session_folders: Vec<SessionFolder>,
     #[serde(default)]
     pub window_bounds: Option<SavedWindowBounds>,
     #[serde(default)]
@@ -264,6 +288,10 @@ fn default_read_env_proxy() -> bool {
     true
 }
 
+fn default_history_completion_plugin_enabled() -> bool {
+    true
+}
+
 fn default_global_proxy_type() -> String {
     "socks5".to_string()
 }
@@ -289,35 +317,77 @@ fn default_locale() -> String {
 }
 
 fn default_terminal_font_size() -> f32 {
-    18.0
+    16.0
 }
 
 fn default_ui_font_size() -> f32 {
     14.0
 }
 
+pub(crate) const MIN_UI_FONT_SIZE: f32 = 10.0;
+pub(crate) const MAX_UI_FONT_SIZE: f32 = 18.0;
+
+pub(crate) fn clamp_ui_font_size(ui_font_size: f32) -> f32 {
+    if ui_font_size <= 0.0 {
+        default_ui_font_size()
+    } else {
+        ui_font_size.clamp(MIN_UI_FONT_SIZE, MAX_UI_FONT_SIZE)
+    }
+}
+
+const CURRENT_FONT_DEFAULTS_VERSION: u8 = 4;
+pub(crate) const SYSTEM_MONOSPACE_FONT: &str = ".SystemMonospace";
+
 pub fn default_ui_font_family() -> String {
     "Noto Sans CJK SC".to_string()
 }
 
 fn default_terminal_font_family() -> String {
-    "Noto Sans CJK SC".to_string()
+    SYSTEM_MONOSPACE_FONT.to_string()
 }
 
-fn migrate_legacy_font_families(config: &mut ConfigFile) -> bool {
-    let mut migrated = false;
-    for font_family in [&mut config.ui_font_family, &mut config.terminal_font_family] {
-        if font_family == "Maple Mono NF CN" {
-            *font_family = "Noto Sans CJK SC".to_string();
-            migrated = true;
+fn migrate_legacy_font_preferences(config: &mut ConfigFile) -> bool {
+    if config.font_defaults_version >= CURRENT_FONT_DEFAULTS_VERSION {
+        return false;
+    }
+
+    if config.font_defaults_version < 1 {
+        if matches!(
+            config.ui_font_family.as_str(),
+            "Maple Mono NF CN"
+                | "Noto Sans SC"
+                | "Noto Sans CJK SC"
+                | "Noto Sans CJK SC Black"
+                | "Noto Sans Mono CJK SC"
+        ) {
+            config.ui_font_family = "Noto Sans CJK SC".to_string();
+        }
+        if matches!(
+            config.terminal_font_family.as_str(),
+            "Maple Mono NF CN" | "Noto Sans SC" | "Noto Sans CJK SC"
+        ) {
+            config.terminal_font_family = "Noto Sans Mono CJK SC".to_string();
         }
     }
-    migrated
+
+    if config.font_defaults_version < 2 && (config.terminal_font_size - 18.0).abs() < f32::EPSILON {
+        config.terminal_font_size = default_terminal_font_size();
+    }
+    if config.font_defaults_version < 3 && (config.terminal_font_size - 15.0).abs() < f32::EPSILON {
+        config.terminal_font_size = default_terminal_font_size();
+    }
+    if config.font_defaults_version < 4 && config.terminal_font_family == "Noto Sans Mono CJK SC" {
+        config.terminal_font_family = default_terminal_font_family();
+    }
+
+    config.font_defaults_version = CURRENT_FONT_DEFAULTS_VERSION;
+    true
 }
 
 impl Default for ConfigFile {
     fn default() -> Self {
         Self {
+            font_defaults_version: CURRENT_FONT_DEFAULTS_VERSION,
             follow_system_theme: default_follow_system_theme(),
             theme_mode: String::new(),
             light_theme_name: String::new(),
@@ -327,10 +397,12 @@ impl Default for ConfigFile {
             ui_font_size: default_ui_font_size(),
             right_click_copy_paste: false,
             keyword_highlight: false,
+            history_completion_plugin_enabled: default_history_completion_plugin_enabled(),
             ui_font_family: default_ui_font_family(),
             terminal_font_family: default_terminal_font_family(),
             cursor_style: CursorStyle::default(),
             sessions: Vec::new(),
+            session_folders: Vec::new(),
             window_bounds: None,
             workspace_panels: None,
             body_panels: None,
@@ -426,9 +498,9 @@ impl ConfigStore {
         if cache.sync_device_id.is_empty() {
             cache.sync_device_id = Uuid::new_v4().to_string();
         }
-        let migrated_fonts = migrate_legacy_font_families(&mut cache);
+        let migrated_font_preferences = migrate_legacy_font_preferences(&mut cache);
         let store = Self { path, cache };
-        if migrated_fonts && let Err(err) = store.save() {
+        if migrated_font_preferences && let Err(err) = store.save() {
             tracing::warn!("failed to persist migrated font preferences: {err:#}");
         }
         Ok(store)
@@ -456,6 +528,33 @@ impl ConfigStore {
 
     pub fn sessions(&self) -> &[Session] {
         &self.cache.sessions
+    }
+
+    pub fn session_folders(&self) -> &[SessionFolder] {
+        &self.cache.session_folders
+    }
+
+    pub fn session_folder_sessions(&self, folder_id: &str) -> Vec<Session> {
+        let Some(folder) = self
+            .cache
+            .session_folders
+            .iter()
+            .find(|folder| folder.id == folder_id)
+        else {
+            return Vec::new();
+        };
+        let sessions_by_id: std::collections::HashMap<_, _> = self
+            .cache
+            .sessions
+            .iter()
+            .map(|session| (session.id.as_str(), session))
+            .collect();
+        folder
+            .session_ids
+            .iter()
+            .filter_map(|session_id| sessions_by_id.get(session_id.as_str()))
+            .map(|session| (*session).clone())
+            .collect()
     }
 
     pub fn replace_sessions(&mut self, sessions: Vec<Session>) {
@@ -654,15 +753,11 @@ impl ConfigStore {
     }
 
     pub fn ui_font_size(&self) -> f32 {
-        if self.cache.ui_font_size <= 0.0 {
-            default_ui_font_size()
-        } else {
-            self.cache.ui_font_size
-        }
+        clamp_ui_font_size(self.cache.ui_font_size)
     }
 
     pub fn set_ui_font_size(&mut self, ui_font_size: f32) {
-        self.cache.ui_font_size = ui_font_size.max(8.0);
+        self.cache.ui_font_size = clamp_ui_font_size(ui_font_size);
     }
 
     pub fn ui_font_family(&self) -> &str {
@@ -693,9 +788,17 @@ impl ConfigStore {
         self.cache.keyword_highlight = val;
     }
 
+    pub fn history_completion_plugin_enabled(&self) -> bool {
+        self.cache.history_completion_plugin_enabled
+    }
+
+    pub fn set_history_completion_plugin_enabled(&mut self, val: bool) {
+        self.cache.history_completion_plugin_enabled = val;
+    }
+
     pub fn terminal_font_family(&self) -> &str {
         if self.cache.terminal_font_family.is_empty() {
-            "Noto Sans CJK SC"
+            SYSTEM_MONOSPACE_FONT
         } else {
             &self.cache.terminal_font_family
         }
@@ -802,6 +905,81 @@ impl ConfigStore {
 
     pub fn remove(&mut self, id: &str) {
         self.cache.sessions.retain(|s| s.id != id);
+        for folder in &mut self.cache.session_folders {
+            folder.session_ids.retain(|session_id| session_id != id);
+        }
+    }
+
+    pub fn upsert_session_folder(&mut self, mut folder: SessionFolder) {
+        folder.session_ids = self.normalize_folder_session_ids(folder.session_ids);
+        if let Some(existing) = self
+            .cache
+            .session_folders
+            .iter_mut()
+            .find(|existing| existing.id == folder.id)
+        {
+            *existing = folder;
+        } else {
+            self.cache.session_folders.push(folder);
+        }
+    }
+
+    pub fn remove_session_folder(&mut self, id: &str) {
+        self.cache.session_folders.retain(|folder| folder.id != id);
+    }
+
+    pub fn add_session_to_folder(
+        &mut self,
+        session_id: &str,
+        folder_id: &str,
+        move_from_other_folders: bool,
+    ) -> bool {
+        if !self
+            .cache
+            .sessions
+            .iter()
+            .any(|session| session.id == session_id)
+        {
+            return false;
+        }
+        let Some(destination_index) = self
+            .cache
+            .session_folders
+            .iter()
+            .position(|folder| folder.id == folder_id)
+        else {
+            return false;
+        };
+
+        if move_from_other_folders {
+            for folder in &mut self.cache.session_folders {
+                folder.session_ids.retain(|member| member != session_id);
+            }
+        }
+        let destination = &mut self.cache.session_folders[destination_index];
+        if !destination
+            .session_ids
+            .iter()
+            .any(|member| member == session_id)
+        {
+            destination.session_ids.push(session_id.to_string());
+        }
+        true
+    }
+
+    fn normalize_folder_session_ids(&self, session_ids: Vec<String>) -> Vec<String> {
+        let known_ids: std::collections::HashSet<&str> = self
+            .cache
+            .sessions
+            .iter()
+            .map(|session| session.id.as_str())
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        session_ids
+            .into_iter()
+            .filter(|session_id| known_ids.contains(session_id.as_str()))
+            .filter(|session_id| seen.insert(session_id.clone()))
+            .collect()
     }
 
     pub fn save(&self) -> Result<()> {
@@ -846,6 +1024,7 @@ impl ConfigStore {
         };
 
         // Merge UI preference fields
+        disk_config.font_defaults_version = local_config.font_defaults_version;
         disk_config.follow_system_theme = local_config.follow_system_theme;
         disk_config.theme_mode = local_config.theme_mode;
         disk_config.light_theme_name = local_config.light_theme_name;
@@ -855,6 +1034,8 @@ impl ConfigStore {
         disk_config.ui_font_size = local_config.ui_font_size;
         disk_config.right_click_copy_paste = local_config.right_click_copy_paste;
         disk_config.keyword_highlight = local_config.keyword_highlight;
+        disk_config.history_completion_plugin_enabled =
+            local_config.history_completion_plugin_enabled;
         disk_config.ui_font_family = local_config.ui_font_family;
         disk_config.terminal_font_family = local_config.terminal_font_family;
         disk_config.cursor_style = local_config.cursor_style;
@@ -1220,23 +1401,83 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_fonts_use_noto_sans_cjk_sc() {
+    fn default_terminal_font_follows_the_system_monospace_font() {
         let config = ConfigFile::default();
         assert_eq!(config.ui_font_family, "Noto Sans CJK SC");
-        assert_eq!(config.terminal_font_family, "Noto Sans CJK SC");
+        assert_eq!(config.terminal_font_family, ".SystemMonospace");
+        assert_eq!(config.terminal_font_size, 16.0);
+        assert_eq!(config.font_defaults_version, 4);
     }
 
     #[test]
-    fn legacy_maple_font_preferences_migrate_to_noto_sans_cjk_sc() {
+    fn history_completion_plugin_is_enabled_by_default_and_can_be_disabled() {
+        let mut store = ConfigStore::in_memory();
+        assert!(store.history_completion_plugin_enabled());
+
+        store.set_history_completion_plugin_enabled(false);
+        assert!(!store.history_completion_plugin_enabled());
+
+        let legacy_config: ConfigFile = serde_json::from_str("{}").unwrap();
+        assert!(legacy_config.history_completion_plugin_enabled);
+    }
+
+    #[test]
+    fn legacy_font_preferences_migrate_to_system_monospace() {
         let mut config = ConfigFile {
-            ui_font_family: "Maple Mono NF CN".to_string(),
-            terminal_font_family: "Maple Mono NF CN".to_string(),
+            ui_font_family: "Noto Sans Mono CJK SC".to_string(),
+            terminal_font_family: "Noto Sans CJK SC".to_string(),
+            font_defaults_version: 0,
             ..ConfigFile::default()
         };
 
-        assert!(migrate_legacy_font_families(&mut config));
+        assert!(migrate_legacy_font_preferences(&mut config));
         assert_eq!(config.ui_font_family, "Noto Sans CJK SC");
-        assert_eq!(config.terminal_font_family, "Noto Sans CJK SC");
+        assert_eq!(config.terminal_font_family, ".SystemMonospace");
+        assert_eq!(config.terminal_font_size, 16.0);
+        assert_eq!(config.font_defaults_version, 4);
+
+        config.ui_font_family = "Noto Sans Mono CJK SC".to_string();
+        assert!(!migrate_legacy_font_preferences(&mut config));
+        assert_eq!(config.ui_font_family, "Noto Sans Mono CJK SC");
+    }
+
+    #[test]
+    fn system_font_migration_preserves_an_explicit_custom_terminal_font() {
+        let mut config = ConfigFile {
+            terminal_font_family: "JetBrains Mono".to_string(),
+            font_defaults_version: 3,
+            ..ConfigFile::default()
+        };
+
+        assert!(migrate_legacy_font_preferences(&mut config));
+        assert_eq!(config.terminal_font_family, "JetBrains Mono");
+        assert_eq!(config.font_defaults_version, 4);
+    }
+
+    #[test]
+    fn balanced_font_migration_preserves_a_custom_terminal_size() {
+        let mut config = ConfigFile {
+            terminal_font_size: 16.0,
+            font_defaults_version: 1,
+            ..ConfigFile::default()
+        };
+
+        assert!(migrate_legacy_font_preferences(&mut config));
+        assert_eq!(config.terminal_font_size, 16.0);
+        assert_eq!(config.font_defaults_version, 4);
+    }
+
+    #[test]
+    fn balanced_font_migration_upgrades_the_compact_default() {
+        let mut config = ConfigFile {
+            terminal_font_size: 15.0,
+            font_defaults_version: 2,
+            ..ConfigFile::default()
+        };
+
+        assert!(migrate_legacy_font_preferences(&mut config));
+        assert_eq!(config.terminal_font_size, 16.0);
+        assert_eq!(config.font_defaults_version, 4);
     }
 
     #[test]
@@ -1331,5 +1572,138 @@ mod tests {
         let mut store = ConfigStore::in_memory();
         store.set_key_binding("OpenSettings", "none");
         assert_eq!(store.key_bindings().get("OpenSettings").unwrap(), "none");
+    }
+
+    #[test]
+    fn ui_font_size_is_clamped_when_saved() {
+        let mut store = ConfigStore::in_memory();
+
+        store.set_ui_font_size(99.0);
+        assert_eq!(store.ui_font_size(), 18.0);
+
+        store.set_ui_font_size(1.0);
+        assert_eq!(store.ui_font_size(), 10.0);
+    }
+
+    #[test]
+    fn ui_font_size_is_clamped_when_loaded_from_legacy_config() {
+        let mut store = ConfigStore::in_memory();
+        store.cache.ui_font_size = 99.0;
+        assert_eq!(store.ui_font_size(), 18.0);
+
+        store.cache.ui_font_size = 1.0;
+        assert_eq!(store.ui_font_size(), 10.0);
+    }
+
+    #[test]
+    fn removing_a_session_prunes_it_from_session_folders() {
+        let mut store = ConfigStore::in_memory();
+        let session = Session::password(
+            "example.com".to_string(),
+            22,
+            "root".to_string(),
+            "password".to_string(),
+        );
+        let session_id = session.id.clone();
+        store.upsert(session);
+        store.upsert_session_folder(SessionFolder::new(
+            "Production".to_string(),
+            vec![
+                session_id.clone(),
+                session_id.clone(),
+                "missing".to_string(),
+            ],
+        ));
+
+        store.remove(&session_id);
+
+        assert!(store.sessions().is_empty());
+        assert_eq!(store.session_folders().len(), 1);
+        assert!(store.session_folders()[0].session_ids.is_empty());
+    }
+
+    #[test]
+    fn updating_a_folder_keeps_only_existing_unique_session_members() {
+        let mut store = ConfigStore::in_memory();
+        let session = Session::password(
+            "example.com".to_string(),
+            22,
+            "root".to_string(),
+            "password".to_string(),
+        );
+        let session_id = session.id.clone();
+        store.upsert(session);
+        let mut folder = SessionFolder::new("Production".to_string(), Vec::new());
+        let folder_id = folder.id.clone();
+        folder.session_ids = vec![
+            session_id.clone(),
+            session_id.clone(),
+            "missing".to_string(),
+        ];
+
+        store.upsert_session_folder(folder);
+
+        assert_eq!(store.session_folders()[0].id, folder_id);
+        assert_eq!(store.session_folders()[0].session_ids, vec![session_id]);
+    }
+
+    #[test]
+    fn folder_sessions_follow_the_folder_member_order() {
+        let mut store = ConfigStore::in_memory();
+        let first = Session::password(
+            "one.example.com".to_string(),
+            22,
+            "root".to_string(),
+            "password".to_string(),
+        );
+        let second = Session::password(
+            "two.example.com".to_string(),
+            22,
+            "root".to_string(),
+            "password".to_string(),
+        );
+        let first_id = first.id.clone();
+        let second_id = second.id.clone();
+        store.upsert(first);
+        store.upsert(second);
+        let folder = SessionFolder::new("Production".to_string(), vec![second_id, first_id]);
+        let folder_id = folder.id.clone();
+        store.upsert_session_folder(folder);
+
+        let names: Vec<_> = store
+            .session_folder_sessions(&folder_id)
+            .into_iter()
+            .map(|session| session.host)
+            .collect();
+
+        assert_eq!(names, vec!["two.example.com", "one.example.com"]);
+    }
+
+    #[test]
+    fn copying_and_moving_a_session_between_folders_preserves_the_expected_membership() {
+        let mut store = ConfigStore::in_memory();
+        let session = Session::password(
+            "example.com".to_string(),
+            22,
+            "root".to_string(),
+            "password".to_string(),
+        );
+        let session_id = session.id.clone();
+        store.upsert(session);
+
+        let source = SessionFolder::new("Source".to_string(), vec![session_id.clone()]);
+        let source_id = source.id.clone();
+        let destination = SessionFolder::new("Destination".to_string(), Vec::new());
+        let destination_id = destination.id.clone();
+        store.upsert_session_folder(source);
+        store.upsert_session_folder(destination);
+
+        assert!(store.add_session_to_folder(&session_id, &destination_id, false));
+        assert_eq!(store.session_folder_sessions(&source_id).len(), 1);
+        assert_eq!(store.session_folder_sessions(&destination_id).len(), 1);
+
+        assert!(store.add_session_to_folder(&session_id, &destination_id, true));
+        assert!(store.session_folder_sessions(&source_id).is_empty());
+        assert_eq!(store.session_folder_sessions(&destination_id).len(), 1);
     }
 }

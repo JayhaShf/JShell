@@ -3,10 +3,9 @@ use alacritty_terminal::{
     vte::ansi::{Color as AnsiColor, CursorShape, NamedColor},
 };
 use gpui::{
-    App, Bounds, Element, ElementId, Entity, FocusHandle, Font, FontStyle, FontWeight,
-    GlobalElementId, Hsla, InputHandler, IntoElement, LayoutId, Pixels, Point, Rgba, SharedString,
-    StrikethroughStyle, TextRun, TextStyle, UTF16Selection, UnderlineStyle, Window, fill, point,
-    px, relative, rgb,
+    App, Bounds, Element, ElementId, Entity, FocusHandle, Font, GlobalElementId, Hsla,
+    InputHandler, IntoElement, LayoutId, Pixels, Point, Rgba, SharedString, StrikethroughStyle,
+    TextRun, TextStyle, UTF16Selection, UnderlineStyle, Window, fill, point, px, relative, rgb,
 };
 use gpui_component::ActiveTheme as _;
 
@@ -18,6 +17,14 @@ use crate::terminal::{RenderSnapshot, ViewportSelection};
 struct TerminalMetrics {
     cell_width: Pixels,
     line_height: Pixels,
+}
+
+fn terminal_cell_span(flags: Flags) -> usize {
+    if flags.contains(Flags::WIDE_CHAR) {
+        2
+    } else {
+        1
+    }
 }
 
 #[derive(Clone)]
@@ -121,6 +128,8 @@ impl BatchedTextRun {
                 self.text.clone().into(),
                 self.font_size,
                 std::slice::from_ref(&self.style),
+                // GPUI interprets this as one glyph's fixed advance, not the
+                // aggregate width of the text run.
                 Some(metrics.cell_width),
             )
             .paint(
@@ -346,25 +355,12 @@ impl TerminalElement {
                 thickness: px(1.0),
             });
 
-        let weight = if cell.flags.intersects(Flags::BOLD | Flags::DIM_BOLD) {
-            FontWeight::BOLD
-        } else {
-            FontWeight::NORMAL
-        };
-        let style = if cell.flags.intersects(Flags::ITALIC | Flags::BOLD_ITALIC) {
-            FontStyle::Italic
-        } else {
-            FontStyle::Normal
-        };
-
         TextRun {
             len: cell.c.len_utf8(),
             color: fg,
             background_color: None,
             font: Font {
                 family: self.font_family.clone(),
-                weight,
-                style,
                 ..Font::default()
             },
             underline,
@@ -383,6 +379,7 @@ impl TerminalElement {
     ) {
         let view_read = self.view.read(cx);
         let hovered_url = view_read.hovered_url.clone();
+        let link_modifier_pressed = view_read.terminal_link_ctrl_pressed;
 
         let mut rects = Vec::new();
         let mut runs = Vec::new();
@@ -412,11 +409,7 @@ impl TerminalElement {
                 rects.push(LayoutRect {
                     row: render_cell.row,
                     col: render_cell.col,
-                    cells: if cell.flags.contains(Flags::WIDE_CHAR) {
-                        2
-                    } else {
-                        1
-                    },
+                    cells: terminal_cell_span(cell.flags),
                     color: if selected {
                         cx.theme().selection
                     } else if cell.flags.contains(Flags::INVERSE) {
@@ -442,7 +435,7 @@ impl TerminalElement {
             }
 
             // Apply hover underline if mouse is hovering over this URL
-            if let Some(hu) = &hovered_url {
+            if link_modifier_pressed && let Some(hu) = &hovered_url {
                 if hu.tab_id == self.tab_id
                     && hu
                         .cells
@@ -451,11 +444,7 @@ impl TerminalElement {
                     underlines.push(LayoutUnderline {
                         row: render_cell.row,
                         col: render_cell.col,
-                        cells: if cell.flags.contains(Flags::WIDE_CHAR) {
-                            2
-                        } else {
-                            1
-                        },
+                        cells: terminal_cell_span(cell.flags),
                         color: style.color,
                     });
                 }
@@ -472,11 +461,7 @@ impl TerminalElement {
                     c: cell.c,
                     row: render_cell.row,
                     col: render_cell.col,
-                    cells: if cell.flags.contains(Flags::WIDE_CHAR) {
-                        2
-                    } else {
-                        1
-                    },
+                    cells: terminal_cell_span(cell.flags),
                     color: style.color,
                 });
                 continue;
@@ -872,24 +857,13 @@ fn color_to_hsla(color: AnsiColor, foreground: bool, cx: &App) -> Hsla {
     }
 }
 
-fn ansi_index_color(index: u8, _cx: &App) -> Hsla {
-    const ANSI_16: [u32; 16] = [
-        0x1f2430, 0xff5c57, 0x5af78e, 0xf3f99d, 0x57c7ff, 0xff6ac1, 0x9aedfe, 0xf1f1f0, 0x686868,
-        0xff5c57, 0x5af78e, 0xf3f99d, 0x57c7ff, 0xff6ac1, 0x9aedfe, 0xffffff,
-    ];
-
-    if (index as usize) < ANSI_16.len() {
-        return Hsla::from(rgb(ANSI_16[index as usize]));
+fn ansi_index_color(index: u8, cx: &App) -> Hsla {
+    if (index as usize) < TERMINAL_DARK_ANSI_16.len() {
+        return Hsla::from(rgb(terminal_ansi_16(index, cx.theme().is_dark())));
     }
 
     if index >= 232 {
-        let gray = 8 + (index - 232) * 10;
-        return Hsla::from(Rgba {
-            r: gray as f32 / 255.0,
-            g: gray as f32 / 255.0,
-            b: gray as f32 / 255.0,
-            a: 1.0,
-        });
+        return Hsla::from(rgb(soften_xterm_gray(index, cx.theme().is_dark())));
     }
 
     let i = index - 16;
@@ -897,44 +871,123 @@ fn ansi_index_color(index: u8, _cx: &App) -> Hsla {
     let g = (i % 36) / 6;
     let b = i % 6;
     let conv = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
-    Hsla::from(Rgba {
-        r: conv(r) as f32 / 255.0,
-        g: conv(g) as f32 / 255.0,
-        b: conv(b) as f32 / 255.0,
-        a: 1.0,
-    })
+    Hsla::from(rgb(soften_xterm_rgb(
+        pack_rgb(conv(r), conv(g), conv(b)),
+        cx.theme().is_dark(),
+    )))
 }
 
 fn named_color(named: NamedColor, _foreground: bool, cx: &App) -> Hsla {
     match named {
         NamedColor::Foreground => cx.theme().foreground,
         NamedColor::Background => cx.theme().background,
-        NamedColor::Black => Hsla::from(rgb(0x1f2430)),
-        NamedColor::Red => Hsla::from(rgb(0xff5c57)),
-        NamedColor::Green => Hsla::from(rgb(0x5af78e)),
-        NamedColor::Yellow => Hsla::from(rgb(0xf3f99d)),
-        NamedColor::Blue => Hsla::from(rgb(0x57c7ff)),
-        NamedColor::Magenta => Hsla::from(rgb(0xff6ac1)),
-        NamedColor::Cyan => Hsla::from(rgb(0x9aedfe)),
-        NamedColor::White => Hsla::from(rgb(0xf1f1f0)),
-        NamedColor::BrightBlack => Hsla::from(rgb(0x686868)),
-        NamedColor::BrightRed => Hsla::from(rgb(0xff5c57)),
-        NamedColor::BrightGreen => Hsla::from(rgb(0x5af78e)),
-        NamedColor::BrightYellow => Hsla::from(rgb(0xf3f99d)),
-        NamedColor::BrightBlue => Hsla::from(rgb(0x57c7ff)),
-        NamedColor::BrightMagenta => Hsla::from(rgb(0xff6ac1)),
-        NamedColor::BrightCyan => Hsla::from(rgb(0x9aedfe)),
-        NamedColor::BrightWhite => Hsla::from(rgb(0xffffff)),
+        NamedColor::Black => Hsla::from(rgb(terminal_ansi_16(0, cx.theme().is_dark()))),
+        NamedColor::Red => Hsla::from(rgb(terminal_ansi_16(1, cx.theme().is_dark()))),
+        NamedColor::Green => Hsla::from(rgb(terminal_ansi_16(2, cx.theme().is_dark()))),
+        NamedColor::Yellow => Hsla::from(rgb(terminal_ansi_16(3, cx.theme().is_dark()))),
+        NamedColor::Blue => Hsla::from(rgb(terminal_ansi_16(4, cx.theme().is_dark()))),
+        NamedColor::Magenta => Hsla::from(rgb(terminal_ansi_16(5, cx.theme().is_dark()))),
+        NamedColor::Cyan => Hsla::from(rgb(terminal_ansi_16(6, cx.theme().is_dark()))),
+        NamedColor::White => Hsla::from(rgb(terminal_ansi_16(7, cx.theme().is_dark()))),
+        NamedColor::BrightBlack => Hsla::from(rgb(terminal_ansi_16(8, cx.theme().is_dark()))),
+        NamedColor::BrightRed => Hsla::from(rgb(terminal_ansi_16(9, cx.theme().is_dark()))),
+        NamedColor::BrightGreen => Hsla::from(rgb(terminal_ansi_16(10, cx.theme().is_dark()))),
+        NamedColor::BrightYellow => Hsla::from(rgb(terminal_ansi_16(11, cx.theme().is_dark()))),
+        NamedColor::BrightBlue => Hsla::from(rgb(terminal_ansi_16(12, cx.theme().is_dark()))),
+        NamedColor::BrightMagenta => Hsla::from(rgb(terminal_ansi_16(13, cx.theme().is_dark()))),
+        NamedColor::BrightCyan => Hsla::from(rgb(terminal_ansi_16(14, cx.theme().is_dark()))),
+        NamedColor::BrightWhite => Hsla::from(rgb(terminal_ansi_16(15, cx.theme().is_dark()))),
         NamedColor::Cursor => cx.theme().primary,
         NamedColor::DimForeground => cx.theme().muted_foreground,
         NamedColor::BrightForeground => cx.theme().foreground,
-        NamedColor::DimBlack => Hsla::from(rgb(0x3b4252)),
-        NamedColor::DimRed => Hsla::from(rgb(0xbf616a)),
-        NamedColor::DimGreen => Hsla::from(rgb(0xa3be8c)),
-        NamedColor::DimYellow => Hsla::from(rgb(0xebcb8b)),
-        NamedColor::DimBlue => Hsla::from(rgb(0x81a1c1)),
-        NamedColor::DimMagenta => Hsla::from(rgb(0xb48ead)),
-        NamedColor::DimCyan => Hsla::from(rgb(0x88c0d0)),
-        NamedColor::DimWhite => Hsla::from(rgb(0xe5e9f0)),
+        NamedColor::DimBlack => Hsla::from(rgb(dim_terminal_ansi_16(0, cx.theme().is_dark()))),
+        NamedColor::DimRed => Hsla::from(rgb(dim_terminal_ansi_16(1, cx.theme().is_dark()))),
+        NamedColor::DimGreen => Hsla::from(rgb(dim_terminal_ansi_16(2, cx.theme().is_dark()))),
+        NamedColor::DimYellow => Hsla::from(rgb(dim_terminal_ansi_16(3, cx.theme().is_dark()))),
+        NamedColor::DimBlue => Hsla::from(rgb(dim_terminal_ansi_16(4, cx.theme().is_dark()))),
+        NamedColor::DimMagenta => Hsla::from(rgb(dim_terminal_ansi_16(5, cx.theme().is_dark()))),
+        NamedColor::DimCyan => Hsla::from(rgb(dim_terminal_ansi_16(6, cx.theme().is_dark()))),
+        NamedColor::DimWhite => Hsla::from(rgb(dim_terminal_ansi_16(7, cx.theme().is_dark()))),
+    }
+}
+
+const TERMINAL_DARK_ANSI_16: [u32; 16] = [
+    0x191919, 0xd76e6e, 0x8fbd8b, 0xd2b86e, 0x8eace2, 0xbf8fcb, 0x82c8c0, 0xd8d8d8, 0x777777,
+    0xe48989, 0xa4d19f, 0xdfc885, 0xa4bff0, 0xd1a4dc, 0x99d8d1, 0xf3f3f3,
+];
+
+const TERMINAL_LIGHT_ANSI_16: [u32; 16] = [
+    0x242424, 0xa84444, 0x3d7a4b, 0x80651d, 0x315f99, 0x754b82, 0x2f7770, 0xeeeeee, 0x767676,
+    0xbf5b5b, 0x4f8d5c, 0x96762a, 0x4773ad, 0x8a5d98, 0x428b83, 0xffffff,
+];
+
+fn terminal_ansi_16(index: u8, is_dark: bool) -> u32 {
+    let palette = if is_dark {
+        TERMINAL_DARK_ANSI_16
+    } else {
+        TERMINAL_LIGHT_ANSI_16
+    };
+    palette[index as usize]
+}
+
+fn dim_terminal_ansi_16(index: u8, is_dark: bool) -> u32 {
+    let color = terminal_ansi_16(index, is_dark);
+    let anchor = if is_dark { 0x8a8a8a } else { 0x5f5f5f };
+    mix_rgb(color, anchor, 0.42)
+}
+
+fn soften_xterm_gray(index: u8, is_dark: bool) -> u32 {
+    let gray = 8 + (index - 232) * 10;
+    let adjusted = if is_dark {
+        gray.clamp(72, 218)
+    } else {
+        gray.clamp(42, 178)
+    };
+    pack_rgb(adjusted, adjusted, adjusted)
+}
+
+fn soften_xterm_rgb(color: u32, is_dark: bool) -> u32 {
+    let (r, g, b) = unpack_rgb(color);
+    let gray = (0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32).round() as u8;
+    let neutral = pack_rgb(gray, gray, gray);
+    let softened = mix_rgb(color, neutral, 0.38);
+    if is_dark {
+        mix_rgb(softened, 0xd0d0d0, 0.10)
+    } else {
+        mix_rgb(softened, 0x222222, 0.18)
+    }
+}
+
+fn pack_rgb(r: u8, g: u8, b: u8) -> u32 {
+    ((r as u32) << 16) | ((g as u32) << 8) | b as u32
+}
+
+fn unpack_rgb(color: u32) -> (u8, u8, u8) {
+    (
+        ((color >> 16) & 0xff) as u8,
+        ((color >> 8) & 0xff) as u8,
+        (color & 0xff) as u8,
+    )
+}
+
+fn mix_rgb(color: u32, target: u32, amount: f32) -> u32 {
+    let (r, g, b) = unpack_rgb(color);
+    let (tr, tg, tb) = unpack_rgb(target);
+    let mix = |from: u8, to: u8| {
+        (from as f32 + (to as f32 - from as f32) * amount)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    pack_rgb(mix(r, tr), mix(g, tg), mix(b, tb))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_cell_span_matches_terminal_column_width() {
+        assert_eq!(terminal_cell_span(Flags::empty()), 1);
+        assert_eq!(terminal_cell_span(Flags::WIDE_CHAR), 2);
     }
 }

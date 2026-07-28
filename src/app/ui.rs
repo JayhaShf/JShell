@@ -3,10 +3,11 @@ use gpui::{
     Context, ElementId, Focusable as _, FontWeight, Hsla, InteractiveElement as _, IntoElement,
     MouseButton, MouseDownEvent, ParentElement as _, PathBuilder, Pixels, Render,
     StatefulInteractiveElement as _, Styled as _, Window, canvas, div, point,
-    prelude::FluentBuilder as _, px, rems, uniform_list,
+    prelude::FluentBuilder as _, px, relative, rems, uniform_list,
 };
 use gpui_component::{
     ActiveTheme, Disableable as _, ElementExt, Icon, IconName, Root, Sizable as _, Size,
+    animation::Transition,
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,
     h_flex,
@@ -14,18 +15,21 @@ use gpui_component::{
     menu::{ContextMenuExt as _, PopupMenuItem},
     progress::Progress,
     scroll::{ScrollableElement as _, Scrollbar, ScrollbarShow},
-    tab::{Tab, TabBar},
     v_flex,
 };
 use rust_i18n::t;
 
 use crate::{
     Ashell, PaneLayout,
-    app::constants::{COLLAPSED_SIDEBAR_WIDTH, SIDEBAR_WIDTH, TERMINAL_KEY_CONTEXT},
+    app::constants::{
+        COLLAPSED_SIDEBAR_WIDTH, COMPACT_ICON_SIZE, SFTP_STATUS_HEIGHT, SFTP_TOOLBAR_HEIGHT,
+        SIDEBAR_PRIMARY_ACTION_HEIGHT, SIDEBAR_SECTION_HEIGHT, SIDEBAR_WIDTH, TAB_BAR_HEIGHT,
+        TERMINAL_KEY_CONTEXT, TERMINAL_PADDING_X, TERMINAL_PADDING_Y, TERMINAL_SCROLLBAR_GUTTER,
+    },
     sftp::format_mtime,
     sftp::ops::is_editable_text_file,
     system::format_bytes,
-    terminal::{self, TabKind},
+    terminal,
 };
 
 #[derive(Clone)]
@@ -38,6 +42,7 @@ struct WorkspaceTabRenderData {
     workspace_id: String,
     label: String,
     accent: Hsla,
+    connected_ssh: bool,
     close_target: WorkspaceCloseTarget,
 }
 
@@ -191,8 +196,8 @@ impl Ashell {
 
         let header = h_flex()
             .flex_none()
-            .h(px(30.))
-            .px_2()
+            .h(px(SFTP_TOOLBAR_HEIGHT))
+            .px_3()
             .items_center()
             .gap_1()
             .border_b_1()
@@ -211,7 +216,7 @@ impl Ashell {
                 this.child(
                     Button::new("sftp-sync-cwd")
                         .ghost()
-                        .xsmall()
+                        .small()
                         .icon(IconName::SquareTerminal)
                         .tooltip(t!("sync_cwd_tooltip").to_string())
                         .on_click(cx.listener(|this, _, window, cx| {
@@ -221,15 +226,15 @@ impl Ashell {
                 .child(
                     Button::new("sftp-refresh")
                         .ghost()
-                        .xsmall()
-                        .icon(IconName::ArrowRight)
+                        .small()
+                        .icon(IconName::Redo2)
                         .tooltip(t!("refresh").to_string())
                         .on_click(cx.listener(|this, _, _, cx| this.refresh_sftp(cx))),
                 )
                 .child(
                     Button::new("sftp-new-folder")
                         .ghost()
-                        .xsmall()
+                        .small()
                         .icon(IconName::Folder)
                         .tooltip(t!("new_folder").to_string())
                         .on_click(cx.listener(|this, _, window, cx| {
@@ -244,8 +249,8 @@ impl Ashell {
                 .child(
                     Button::new("sftp-delete-selected")
                         .ghost()
-                        .xsmall()
-                        .icon(IconName::Close)
+                        .small()
+                        .icon(IconName::Delete)
                         .tooltip(t!("delete_selected").to_string())
                         .disabled(selected_entries.is_empty())
                         .on_click(cx.listener(|this, _, window, cx| {
@@ -255,7 +260,7 @@ impl Ashell {
                 .child(
                     Button::new("sftp-upload-file")
                         .ghost()
-                        .xsmall()
+                        .small()
                         .icon(IconName::Plus)
                         .tooltip(t!("upload_file").to_string())
                         .on_click(
@@ -265,7 +270,7 @@ impl Ashell {
                 .child(
                     Button::new("sftp-upload-folder")
                         .ghost()
-                        .xsmall()
+                        .small()
                         .icon(IconName::Folder)
                         .tooltip(t!("upload_folder").to_string())
                         .on_click(
@@ -275,7 +280,7 @@ impl Ashell {
                 .child(
                     Button::new("sftp-download-selected")
                         .ghost()
-                        .xsmall()
+                        .small()
                         .icon(IconName::ArrowDown)
                         .tooltip(t!("download").to_string())
                         .disabled(selected_entries.is_empty())
@@ -353,7 +358,6 @@ impl Ashell {
                                                 div()
                                                     .text_size(rems(0.833))
                                                     .text_color(cx.theme().primary)
-                                                    .italic()
                                                     .child(label.clone()),
                                             )
                                             .child(
@@ -367,7 +371,6 @@ impl Ashell {
                                                 div()
                                                     .text_size(rems(0.833))
                                                     .text_color(cx.theme().primary)
-                                                    .italic()
                                                     .child(pct_display.clone()),
                                             ),
                                     );
@@ -389,7 +392,6 @@ impl Ashell {
                                                 div()
                                                     .text_size(rems(0.833))
                                                     .text_color(cx.theme().primary)
-                                                    .italic()
                                                     .child(label.clone()),
                                             )
                                             .child(
@@ -403,7 +405,6 @@ impl Ashell {
                                                 div()
                                                     .text_size(rems(0.833))
                                                     .text_color(cx.theme().primary)
-                                                    .italic()
                                                     .child(pct_display.clone()),
                                             ),
                                     );
@@ -760,7 +761,7 @@ impl Ashell {
         outer = outer.child(
             h_flex()
                 .flex_none()
-                .h(px(24.))
+                .h(px(SFTP_STATUS_HEIGHT))
                 .px_3()
                 .items_center()
                 .border_t_1()
@@ -773,7 +774,6 @@ impl Ashell {
                         .overflow_hidden()
                         .text_size(rems(0.833))
                         .text_color(cx.theme().primary)
-                        .italic()
                         .child(status),
                 )
                 .child(
@@ -796,7 +796,6 @@ impl Ashell {
                                             div()
                                                 .text_size(rems(0.833))
                                                 .text_color(cx.theme().primary)
-                                                .italic()
                                                 .child(label.clone()),
                                         )
                                         .child(
@@ -810,7 +809,6 @@ impl Ashell {
                                             div()
                                                 .text_size(rems(0.833))
                                                 .text_color(cx.theme().primary)
-                                                .italic()
                                                 .child(pct_display.clone()),
                                         ),
                                 );
@@ -832,7 +830,6 @@ impl Ashell {
                                             div()
                                                 .text_size(rems(0.833))
                                                 .text_color(cx.theme().primary)
-                                                .italic()
                                                 .child(label.clone()),
                                         )
                                         .child(
@@ -846,7 +843,6 @@ impl Ashell {
                                             div()
                                                 .text_size(rems(0.833))
                                                 .text_color(cx.theme().primary)
-                                                .italic()
                                                 .child(pct_display.clone()),
                                         ),
                                 );
@@ -896,7 +892,6 @@ impl Ashell {
         let disk_color = cx.theme().chart_5;
         let border_color = cx.theme().border;
         let muted_fg = cx.theme().muted_foreground;
-
         let cpu_pct = self.system.cpu_percent;
         // Dynamic CPU line color: green <30%, amber 30-80%, red >80%
         // NOTE: Hsla.h is normalized 0..=1 (not degrees)
@@ -1328,273 +1323,212 @@ impl Ashell {
         let disk_color = cx.theme().chart_5;
         let net_color = cx.theme().chart_4;
         let muted_fg = cx.theme().muted_foreground;
+        let _ = (swap_pct, swap_color);
+        let disk_pct = self
+            .system
+            .disks
+            .first()
+            .map(|disk| {
+                if disk.total_bytes == 0 {
+                    0.0
+                } else {
+                    (disk.total_bytes - disk.available_bytes) as f32 / disk.total_bytes as f32
+                }
+            })
+            .unwrap_or(0.0);
 
         v_flex()
-            .gap_2()
             .w_full()
-            .p_2()
+            .h(px(154.))
+            .flex_none()
+            .bg(cx.theme().sidebar)
+            .border_b_1()
+            .border_color(cx.theme().border)
             .child(
                 v_flex()
-                    .gap_1()
+                    .flex_1()
+                    .px_3()
+                    .py(px(7.))
+                    .border_b_1()
+                    .border_color(cx.theme().border)
                     .child(
                         h_flex()
                             .justify_between()
                             .child(
                                 div()
-                                    .text_size(rems(0.85))
-                                    .text_color(cpu_color)
-                                    .child(t!("cpu").to_string()),
+                                    .text_size(rems(0.708))
+                                    .text_color(muted_fg)
+                                    .child(t!("cpu")),
                             )
                             .child(
                                 div()
-                                    .text_size(rems(0.85))
-                                    .text_color(muted_fg)
-                                    .child(format!("{:.1}%", cpu_pct * 100.0)),
+                                    .text_size(rems(0.708))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(format!("{:.0}%", cpu_pct * 100.0)),
                             ),
                     )
                     .child(
-                        Progress::new("sidebar-cpu")
-                            .value(cpu_pct * 100.0)
-                            .color(cpu_color)
-                            .with_size(px(4.))
-                            .w_full(),
+                        div()
+                            .h(px(4.))
+                            .w_full()
+                            .overflow_hidden()
+                            .rounded(px(3.))
+                            .bg(cx.theme().muted)
+                            .child(div().h_full().w(relative(cpu_pct)).bg(cpu_color)),
                     ),
             )
             .child(
                 v_flex()
-                    .gap_1()
+                    .flex_1()
+                    .px_3()
+                    .py(px(7.))
+                    .border_b_1()
+                    .border_color(cx.theme().border)
                     .child(
                         h_flex()
                             .justify_between()
                             .child(
                                 div()
-                                    .text_size(rems(0.85))
-                                    .text_color(mem_color)
-                                    .child(t!("mem").to_string()),
+                                    .text_size(rems(0.708))
+                                    .text_color(muted_fg)
+                                    .child(t!("mem")),
                             )
                             .child(
                                 div()
-                                    .text_size(rems(0.85))
-                                    .text_color(muted_fg)
+                                    .text_size(rems(0.708))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .truncate()
                                     .child(self.system.mem_detail.clone()),
                             ),
                     )
                     .child(
-                        Progress::new("sidebar-mem")
-                            .value(mem_pct * 100.0)
-                            .color(mem_color)
-                            .with_size(px(4.))
-                            .w_full(),
+                        div()
+                            .h(px(4.))
+                            .w_full()
+                            .overflow_hidden()
+                            .rounded(px(3.))
+                            .bg(cx.theme().muted)
+                            .child(div().h_full().w(relative(mem_pct)).bg(mem_color)),
                     ),
             )
             .child(
                 v_flex()
-                    .gap_1()
+                    .flex_1()
+                    .px_3()
+                    .py(px(7.))
+                    .border_b_1()
+                    .border_color(cx.theme().border)
                     .child(
                         h_flex()
                             .justify_between()
                             .child(
                                 div()
-                                    .text_size(rems(0.85))
-                                    .text_color(swap_color)
-                                    .child(t!("swap").to_string()),
-                            )
-                            .child(
-                                div()
-                                    .text_size(rems(0.85))
+                                    .text_size(rems(0.708))
                                     .text_color(muted_fg)
-                                    .child(self.system.swap_detail.clone()),
-                            ),
-                    )
-                    .child(
-                        Progress::new("sidebar-swap")
-                            .value(swap_pct * 100.0)
-                            .color(swap_color)
-                            .with_size(px(4.))
-                            .w_full(),
-                    ),
-            )
-            .child(
-                v_flex()
-                    .gap_1()
-                    .child(
-                        h_flex()
-                            .justify_between()
-                            .items_center()
+                                    .child(t!("net")),
+                            )
                             .child(
                                 div()
-                                    .text_size(rems(0.85))
-                                    .text_color(disk_color)
-                                    .child(t!("disk").to_string()),
-                            )
-                            .children(if self.system.disks.len() > 3 {
-                                Some(
-                                    div()
-                                        .text_size(rems(0.65))
-                                        .text_color(muted_fg)
-                                        .child(t!("scroll").to_string()),
-                                )
-                            } else {
-                                None
-                            }),
+                                    .text_size(rems(0.708))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .truncate()
+                                    .child(self.system.net_rx.clone()),
+                            ),
                     )
                     .child(
                         div()
-                            .relative()
+                            .h(px(4.))
                             .w_full()
-                            .child(
-                                v_flex()
-                                    .id("sidebar-disk-scroll")
-                                    .track_scroll(&self.disk_scroll_handle)
-                                    .overflow_y_scroll()
-                                    .max_h(px(90.))
-                                    .gap_2()
-                                    .children(self.system.disks.iter().map(|disk| {
-                                        let pct = if disk.total_bytes > 0 {
-                                            (disk.total_bytes - disk.available_bytes) as f64
-                                                / disk.total_bytes as f64
-                                                * 100.0
-                                        } else {
-                                            0.0
-                                        };
-                                        let mount_short = disk.mount.clone();
-                                        let mount_id = format!("sidebar-disk-{}", mount_short);
-                                        v_flex()
-                                            .gap_0p5()
-                                            .child(
-                                                h_flex()
-                                                    .justify_between()
-                                                    .child(
-                                                        div()
-                                                            .text_size(rems(0.75))
-                                                            .text_color(muted_fg)
-                                                            .child(mount_short),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .text_size(rems(0.75))
-                                                            .text_color(muted_fg)
-                                                            .child(format!("{:.1}%", pct)),
-                                                    ),
-                                            )
-                                            .child(
-                                                Progress::new(mount_id)
-                                                    .value(pct as f32)
-                                                    .color(disk_color)
-                                                    .with_size(px(4.))
-                                                    .w_full(),
-                                            )
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .absolute()
-                                    .top_0()
-                                    .right_0()
-                                    .bottom_0()
-                                    .w(px(8.))
-                                    .child(
-                                        Scrollbar::vertical(&self.disk_scroll_handle)
-                                            .scrollbar_show(ScrollbarShow::Scrolling),
-                                    ),
-                            ),
+                            .overflow_hidden()
+                            .rounded(px(3.))
+                            .bg(cx.theme().muted)
+                            .child(div().h_full().w(relative(0.56)).bg(net_color)),
                     ),
             )
             .child(
                 v_flex()
-                    .gap_1()
+                    .flex_1()
+                    .px_3()
+                    .py(px(7.))
                     .child(
                         h_flex()
                             .justify_between()
                             .child(
                                 div()
-                                    .text_size(rems(0.85))
-                                    .text_color(net_color)
-                                    .child(t!("net").to_string()),
+                                    .text_size(rems(0.708))
+                                    .text_color(muted_fg)
+                                    .child(t!("disk")),
                             )
                             .child(
                                 div()
-                                    .text_size(rems(0.85))
-                                    .text_color(muted_fg)
-                                    .child(t!("live")),
+                                    .text_size(rems(0.708))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(format!("{:.0}%", disk_pct * 100.0)),
                             ),
                     )
                     .child(
-                        h_flex()
-                            .gap_2()
-                            .child(
-                                h_flex()
-                                    .flex_1()
-                                    .min_w(px(0.))
-                                    .gap_1()
-                                    .child(
-                                        div()
-                                            .flex_none()
-                                            .text_size(rems(0.75))
-                                            .text_color(net_color)
-                                            .child("↓"),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(rems(0.75))
-                                            .child(self.system.net_rx.clone()),
-                                    ),
-                            )
-                            .child(
-                                h_flex()
-                                    .flex_1()
-                                    .min_w(px(0.))
-                                    .gap_1()
-                                    .child(
-                                        div()
-                                            .flex_none()
-                                            .text_size(rems(0.75))
-                                            .text_color(cx.theme().chart_5)
-                                            .child("↑"),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(rems(0.75))
-                                            .child(self.system.net_tx.clone()),
-                                    ),
-                            ),
+                        div()
+                            .h(px(4.))
+                            .w_full()
+                            .overflow_hidden()
+                            .rounded(px(3.))
+                            .bg(cx.theme().muted)
+                            .child(div().h_full().w(relative(disk_pct)).bg(disk_color)),
                     ),
             )
     }
 
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let sessions = self.config.sessions().to_vec();
+        let session_folders = self.config.session_folders().to_vec();
+        let session_folder_menu_entries = self.config.session_folders().to_vec();
+        let session_folder_members: std::collections::HashMap<_, _> = session_folders
+            .iter()
+            .map(|folder| {
+                (
+                    folder.id.clone(),
+                    self.config.session_folder_sessions(&folder.id),
+                )
+            })
+            .collect();
         let active_session_id = self.active_session_id().map(ToOwned::to_owned);
+        let connected_session_ids: std::collections::HashSet<_> = self
+            .tabs
+            .iter()
+            .filter(|tab| tab.kind == crate::terminal::TabKind::Ssh && tab.connected)
+            .filter_map(|tab| tab.session.as_ref().map(|session| session.id.clone()))
+            .collect();
 
         v_flex()
-            .gap_4()
+            .gap_0()
             .w_full()
             .h_full()
             .min_w(px(0.))
-            .p_2()
             .border_r_1()
             .border_color(cx.theme().sidebar_border)
             .bg(cx.theme().sidebar)
             .overflow_hidden()
             .child(
                 v_flex()
-                    .gap_1()
                     .min_w(px(0.))
                     .child(
                         h_flex()
+                            .h(px(SIDEBAR_PRIMARY_ACTION_HEIGHT))
+                            .px_3()
                             .items_center()
                             .gap_1()
                             .child(
                                 div()
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_size(rems(1.167))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_size(rems(0.833))
                                     .text_color(cx.theme().primary)
-                                    .child("Ashell"),
+                                    .child(t!("system").to_string()),
                             )
                             .child(div().flex_1())
                             .child(
                                 Button::new("sidebar-collapse-toggle")
                                     .ghost()
+                                    .small()
                                     .icon(IconName::PanelLeftClose)
                                     .tooltip(t!("settings_toggle_sidebar").to_string())
                                     .on_click(cx.listener(|this, _, _, cx| {
@@ -1603,69 +1537,342 @@ impl Ashell {
                                         this.save_preferences_background();
                                         cx.notify();
                                     })),
-                            )
-                            .child(
-                                Button::new("sidebar-settings")
-                                    .ghost()
-                                    .icon(IconName::Settings)
-                                    .tooltip(t!("settings_open_settings").to_string())
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.show_settings_dialog(window, cx)
-                                    })),
                             ),
-                    )
-                    .child(
-                        div()
-                            .text_size(rems(0.917))
-                            .text_color(cx.theme().muted_foreground)
-                            .child({
-                                if let Some(kind) = self.active_kind() {
-                                    match kind {
-                                        TabKind::Local => t!("local_terminal").to_string(),
-                                        TabKind::Ssh => {
-                                            if let Some((_, session)) = self.active_ssh_session() {
-                                                format!("ssh / {}", session.name)
-                                            } else {
-                                                "ssh".to_string()
-                                            }
-                                        }
-                                        TabKind::Serial => {
-                                            if let Some((_, session)) = self.active_ssh_session() {
-                                                format!("serial / {}", session.name)
-                                            } else {
-                                                "serial".to_string()
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    self.active_title()
-                                }
-                            }),
                     ),
             )
             .when(self.config.monitoring_position() == "Sidebar", |this| {
                 this.child(self.render_sidebar_monitoring_panel(cx))
             })
             .child(
-                Button::new("open-ssh-panel")
-                    .primary()
-                    .small()
-                    .label(t!("add_ssh").to_string())
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.open_new_ssh_dialog(window, cx)),
+                h_flex()
+                    .id("open-ssh-panel")
+                    .h(px(SIDEBAR_PRIMARY_ACTION_HEIGHT))
+                    .px_3()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .cursor_pointer()
+                    .hover(|this| this.bg(cx.theme().secondary_hover))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| {
+                            this.open_new_ssh_dialog(window, cx)
+                        }),
+                    )
+                    .child(
+                        div()
+                            .text_size(rems(0.833))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(t!("new_ssh_connection").to_string()),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        Icon::new(IconName::Plus)
+                            .size(px(COMPACT_ICON_SIZE))
+                            .text_color(cx.theme().muted_foreground),
                     ),
+            )
+            .child(
+                v_flex()
+                    .gap_0()
+                    .pb_1()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        h_flex()
+                            .h(px(SIDEBAR_SECTION_HEIGHT))
+                            .px_3()
+                            .items_center()
+                            .child(
+                                div()
+                                    .text_size(rems(0.833))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(cx.theme().primary)
+                                    .child(t!("session_folders").to_string()),
+                            )
+                            .child(div().flex_1())
+                            .child(
+                                Button::new("new-session-folder")
+                                    .ghost()
+                                    .small()
+                                    .icon(IconName::Plus)
+                                    .tooltip(t!("new_session_folder").to_string())
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.show_session_folder_dialog(None, None, window, cx);
+                                    })),
+                            ),
+                    )
+                    .when(!session_folders.is_empty(), |this| {
+                        this.child(
+                            v_flex()
+                                .gap_0()
+                                .max_h(px(180.))
+                                .overflow_y_scrollbar()
+                                .children(session_folders.into_iter().enumerate().map(
+                                    |(index, folder)| {
+                                        let folder_id = folder.id.clone();
+                                        let toggle_folder_id = folder.id.clone();
+                                        let edit_folder_id = folder.id.clone();
+                                        let delete_folder_id = folder.id.clone();
+                                        let folder_members = session_folder_members
+                                            .get(&folder.id)
+                                            .cloned()
+                                            .unwrap_or_default();
+                                        let is_collapsed = self
+                                            .collapsed_session_folder_ids
+                                            .contains(&folder.id);
+                                        let member_count = folder.session_ids.len();
+                                        div()
+                                            .id(("session-folder", index))
+                                            .w_full()
+                                            .px_2()
+                                            .bg(cx.theme().sidebar)
+                                            .hover(|this| this.bg(cx.theme().secondary))
+                                            .context_menu({
+                                                let view = cx.entity();
+                                                move |menu, window, _| {
+                                                    let edit_value = edit_folder_id.clone();
+                                                    let delete_value = delete_folder_id.clone();
+                                                    menu.item(
+                                                        PopupMenuItem::new(t!("edit").to_string())
+                                                            .on_click(window.listener_for(
+                                                                &view,
+                                                                move |_this, _, window, cx| {
+                                                                    let folder_id = edit_value.clone();
+                                                                    cx.on_next_frame(
+                                                                        window,
+                                                                        move |this, window, cx| {
+                                                                            this.show_session_folder_dialog(
+                                                                                Some(folder_id.clone()),
+                                                                                None,
+                                                                                window,
+                                                                                cx,
+                                                                            );
+                                                                        },
+                                                                    );
+                                                                },
+                                                            )),
+                                                    )
+                                                    .item(
+                                                        PopupMenuItem::new(
+                                                            t!("delete").to_string(),
+                                                        )
+                                                        .on_click(window.listener_for(
+                                                            &view,
+                                                            move |this, _, _, cx| {
+                                                                this.remove_session_folder(
+                                                                    delete_value.clone(),
+                                                                    cx,
+                                                                );
+                                                            },
+                                                        )),
+                                                    )
+                                                }
+                                            })
+                                            .child(
+                                                h_flex()
+                                                    .h(px(SIDEBAR_SECTION_HEIGHT))
+                                                    .items_center()
+                                                    .gap_2()
+                                                    .child(
+                                                        h_flex()
+                                                            .flex_1()
+                                                            .min_w(px(0.))
+                                                            .items_center()
+                                                            .gap_2()
+                                                            .cursor_pointer()
+                                                            .on_mouse_down(
+                                                                MouseButton::Left,
+                                                                cx.listener(move |this, _, _, cx| {
+                                                                    this.toggle_session_folder(
+                                                                        &toggle_folder_id,
+                                                                        cx,
+                                                                    );
+                                                                }),
+                                                            )
+                                                            .child(
+                                                                Icon::new(if is_collapsed {
+                                                                    IconName::ChevronRight
+                                                                } else {
+                                                                    IconName::ChevronDown
+                                                                })
+                                                                .size(px(12.))
+                                                                .text_color(cx.theme().muted_foreground),
+                                                            )
+                                                            .child(
+                                                                Icon::new(if is_collapsed {
+                                                                    IconName::Folder
+                                                                } else {
+                                                                    IconName::FolderOpen
+                                                                })
+                                                                .size(px(COMPACT_ICON_SIZE))
+                                                                .text_color(cx.theme().primary),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .flex_1()
+                                                                    .min_w(px(0.))
+                                                                    .text_size(rems(0.833))
+                                                                    .font_weight(FontWeight::MEDIUM)
+                                                                    .truncate()
+                                                                    .child(folder.name),
+                                                            ),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_size(rems(0.708))
+                                                            .text_color(cx.theme().muted_foreground)
+                                                            .child(member_count.to_string()),
+                                                    )
+                                                    .child(
+                                                        Button::new(format!(
+                                                            "open-session-folder-{index}"
+                                                        ))
+                                                        .ghost()
+                                                        .small()
+                                                        .icon(IconName::Play)
+                                                        .tooltip(
+                                                            t!("open_folder_sessions").to_string(),
+                                                        )
+                                                        .on_click(cx.listener(
+                                                            move |this, _, _, cx| {
+                                                                this.connect_session_folder(
+                                                                    &folder_id, cx,
+                                                                );
+                                                            },
+                                                        )),
+                                                    ),
+                                            )
+                                            .when(!is_collapsed, |this| {
+                                                this.child(
+                                                    v_flex()
+                                                        .gap_0()
+                                                        .py_1()
+                                                        .children(folder_members.into_iter().enumerate().map(
+                                                            |(member_index, session)| {
+                                                                let session_id = session.id.clone();
+                                                                let is_active = active_session_id.as_deref()
+                                                                    == Some(session.id.as_str());
+                                                                let is_connected = connected_session_ids
+                                                                    .contains(&session.id);
+                                                                let detail = self.session_detail(&session);
+                                                                div()
+                                                                    .id(format!(
+                                                                        "session-folder-member-{index}-{member_index}"
+                                                                    ))
+                                                                    .relative()
+                                                                    .ml_2()
+                                                                    .mr_1()
+                                                                    .my(px(3.))
+                                                                    .h(px(40.))
+                                                                    .px_2()
+                                                                    .rounded(px(5.))
+                                                                    .cursor_pointer()
+                                                                    .bg(if is_active {
+                                                                        cx.theme().secondary
+                                                                    } else {
+                                                                        cx.theme().sidebar
+                                                                    })
+                                                                    .hover(|this| {
+                                                                        this.bg(cx.theme().secondary_hover)
+                                                                    })
+                                                                    .on_mouse_down(
+                                                                        MouseButton::Left,
+                                                                        cx.listener(
+                                                                            move |this, _, window, cx| {
+                                                                                this.connect_saved_session(
+                                                                                    session_id.clone(),
+                                                                                    window,
+                                                                                    cx,
+                                                                                );
+                                                                            },
+                                                                        ),
+                                                                    )
+                                                                    .when(is_active || is_connected, |this| {
+                                                                        let rail_height = if is_active {
+                                                                            px(28.)
+                                                                        } else {
+                                                                            px(22.)
+                                                                        };
+                                                                        let rail_width = if is_active {
+                                                                            px(3.)
+                                                                        } else {
+                                                                            px(2.)
+                                                                        };
+                                                                        let rail_top = if is_active {
+                                                                            px(6.)
+                                                                        } else {
+                                                                            px(9.)
+                                                                        };
+                                                                        let rail_color = if is_active {
+                                                                            cx.theme().primary
+                                                                        } else {
+                                                                            cx.theme().success.opacity(0.7)
+                                                                        };
+                                                                        this.child(
+                                                                            Transition::new(
+                                                                                std::time::Duration::from_millis(140),
+                                                                            )
+                                                                            .fade(0.25, 1.)
+                                                                            .height(px(10.), rail_height)
+                                                                            .apply(
+                                                                                div()
+                                                                                    .absolute()
+                                                                                    .left_0()
+                                                                                    .top(rail_top)
+                                                                                    .w(rail_width)
+                                                                                    .rounded(px(2.))
+                                                                                    .bg(rail_color),
+                                                                                format!(
+                                                                                    "session-folder-member-rail-{index}-{member_index}-{is_active}"
+                                                                                ),
+                                                                            ),
+                                                                        )
+                                                                    })
+                                                                    .child(
+                                                                        h_flex()
+                                                                            .size_full()
+                                                                            .items_center()
+                                                                            .gap_2()
+                                                                            .child(
+                                                                                div()
+                                                                                    .flex_1()
+                                                                                    .min_w(px(0.))
+                                                                                    .text_size(rems(0.75))
+                                                                                    .text_color(cx.theme().foreground)
+                                                                                    .truncate()
+                                                                                    .child(session.name),
+                                                                            )
+                                                                            .child(
+                                                                                div()
+                                                                                    .text_size(rems(0.667))
+                                                                                    .text_color(cx.theme().muted_foreground)
+                                                                                    .truncate()
+                                                                                    .child(detail),
+                                                                            ),
+                                                                    )
+                                                            },
+                                                        )),
+                                                )
+                                            })
+                                    },
+                                )),
+                        )
+                    }),
             )
             .child(
                 v_flex()
                     .flex_1()
                     .min_h(px(0.))
-                    .gap_2()
+                    .gap_0()
+                    .px_2()
                     .child(
                         h_flex()
+                            .h(px(SIDEBAR_SECTION_HEIGHT))
                             .items_center()
                             .child(
                                 div()
-                                    .text_size(rems(0.917))
+                                    .text_size(rems(0.833))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(cx.theme().primary)
                                     .child(t!("saved")),
@@ -1674,9 +1881,9 @@ impl Ashell {
                             .child(
                                 Button::new("connect-all-saved-sessions")
                                     .ghost()
-                                    .xsmall()
+                                    .small()
                                     .icon(IconName::Play)
-                                    .tooltip("Open all saved sessions")
+                                    .tooltip(t!("open_all_saved_sessions").to_string())
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.connect_all_saved_sessions(cx);
                                     })),
@@ -1695,34 +1902,33 @@ impl Ashell {
                                     .track_scroll(&self.saved_scroll_handle)
                                     .overflow_y_scroll()
                                     .gap_1()
+                                    .py_1()
                                     .children(sessions.into_iter().enumerate().map(
                                         |(ix, session)| {
                                             let connect_id = session.id.clone();
+                                            let folder_session_id = session.id.clone();
                                             let edit_id = session.id.clone();
                                             let delete_id = session.id.clone();
                                             let is_active = active_session_id.as_deref()
                                                 == Some(session.id.as_str());
+                                            let is_connected = connected_session_ids
+                                                .contains(&session.id);
                                             let name = session.name.clone();
                                             let detail = self.session_detail(&session);
                                             div()
                                                 .id(("saved-connect", ix))
+                                                .relative()
                                                 .w_full()
+                                                .h(px(40.))
                                                 .px_2()
-                                                .py_1()
-                                                .rounded_sm()
-                                                .border_1()
-                                                .border_color(if is_active {
-                                                    cx.theme().primary
-                                                } else {
-                                                    cx.theme().border
-                                                })
+                                                .rounded(px(5.))
                                                 .bg(if is_active {
-                                                    cx.theme().tab_active
+                                                    cx.theme().secondary
                                                 } else {
-                                                    cx.theme().muted
+                                                    cx.theme().sidebar
                                                 })
                                                 .cursor_pointer()
-                                                .hover(|this| this.bg(cx.theme().secondary))
+                                                .hover(|this| this.bg(cx.theme().secondary_hover))
                                                 .on_mouse_down(
                                                     MouseButton::Left,
                                                     cx.listener(move |this, _, window, cx| {
@@ -1735,10 +1941,120 @@ impl Ashell {
                                                 )
                                                 .context_menu({
                                                     let view = cx.entity();
-                                                    move |menu, window, _| {
+                                                    let folders = session_folder_menu_entries.clone();
+                                                    move |menu, window, cx| {
+                                                        let create_session_value =
+                                                            folder_session_id.clone();
+                                                        let copy_session_value =
+                                                            folder_session_id.clone();
+                                                        let move_session_value =
+                                                            folder_session_id.clone();
+                                                        let copy_folders = folders.clone();
+                                                        let move_folders = folders.clone();
                                                         let edit_value = edit_id.clone();
                                                         let clone_value = edit_id.clone();
                                                         let delete_value = delete_id.clone();
+                                                        let menu = menu.item(
+                                                            PopupMenuItem::new(
+                                                                t!("create_folder_from_session")
+                                                                    .to_string(),
+                                                            )
+                                                            .on_click(window.listener_for(
+                                                                &view,
+                                                                move |this, _, window, cx| {
+                                                                    this.show_session_folder_dialog(
+                                                                        None,
+                                                                        Some(create_session_value.clone()),
+                                                                        window,
+                                                                        cx,
+                                                                    );
+                                                                },
+                                                            )),
+                                                        );
+                                                        let menu = if copy_folders.is_empty() {
+                                                            menu.item(
+                                                                PopupMenuItem::new(
+                                                                    t!("copy_to_session_folder").to_string(),
+                                                                )
+                                                                .disabled(true),
+                                                            )
+                                                        } else {
+                                                            menu.submenu(
+                                                                t!("copy_to_session_folder").to_string(),
+                                                                window,
+                                                                cx,
+                                                                {
+                                                                    let view = view.clone();
+                                                                    move |menu, window, _| {
+                                                                        copy_folders.iter().fold(
+                                                                            menu,
+                                                                            |menu, folder| {
+                                                                                let folder_id = folder.id.clone();
+                                                                                let session_id = copy_session_value.clone();
+                                                                                menu.item(
+                                                                                    PopupMenuItem::new(folder.name.clone()).on_click(
+                                                                                        window.listener_for(
+                                                                                            &view,
+                                                                                            move |this, _, window, cx| {
+                                                                                                this.add_session_to_folder(
+                                                                                                    session_id.clone(),
+                                                                                                    folder_id.clone(),
+                                                                                                    false,
+                                                                                                    window,
+                                                                                                    cx,
+                                                                                                );
+                                                                                            },
+                                                                                        ),
+                                                                                    ),
+                                                                                )
+                                                                            },
+                                                                        )
+                                                                    }
+                                                                },
+                                                            )
+                                                        };
+                                                        let menu = if move_folders.is_empty() {
+                                                            menu.item(
+                                                                PopupMenuItem::new(
+                                                                    t!("move_to_session_folder").to_string(),
+                                                                )
+                                                                .disabled(true),
+                                                            )
+                                                        } else {
+                                                            menu.submenu(
+                                                                t!("move_to_session_folder").to_string(),
+                                                                window,
+                                                                cx,
+                                                                {
+                                                                    let view = view.clone();
+                                                                    move |menu, window, _| {
+                                                                        move_folders.iter().fold(
+                                                                            menu,
+                                                                            |menu, folder| {
+                                                                                let folder_id = folder.id.clone();
+                                                                                let session_id = move_session_value.clone();
+                                                                                menu.item(
+                                                                                    PopupMenuItem::new(folder.name.clone()).on_click(
+                                                                                        window.listener_for(
+                                                                                            &view,
+                                                                                            move |this, _, window, cx| {
+                                                                                                this.add_session_to_folder(
+                                                                                                    session_id.clone(),
+                                                                                                    folder_id.clone(),
+                                                                                                    true,
+                                                                                                    window,
+                                                                                                    cx,
+                                                                                                );
+                                                                                            },
+                                                                                        ),
+                                                                                    ),
+                                                                                )
+                                                                            },
+                                                                        )
+                                                                    }
+                                                                },
+                                                            )
+                                                        };
                                                         menu.item(
                                                             PopupMenuItem::new(
                                                                 t!("clone").to_string(),
@@ -1785,6 +2101,47 @@ impl Ashell {
                                                         )
                                                     }
                                                 })
+                                                .when(is_active || is_connected, |this| {
+                                                    let rail_height = if is_active {
+                                                        px(28.)
+                                                    } else {
+                                                        px(22.)
+                                                    };
+                                                    let rail_width = if is_active {
+                                                        px(3.)
+                                                    } else {
+                                                        px(2.)
+                                                    };
+                                                    let rail_top = if is_active {
+                                                        px(6.)
+                                                    } else {
+                                                        px(9.)
+                                                    };
+                                                    let rail_color = if is_active {
+                                                        cx.theme().primary
+                                                    } else {
+                                                        cx.theme().success.opacity(0.7)
+                                                    };
+                                                    this.child(
+                                                        Transition::new(
+                                                            std::time::Duration::from_millis(140),
+                                                        )
+                                                        .fade(0.25, 1.)
+                                                        .height(px(10.), rail_height)
+                                                        .apply(
+                                                            div()
+                                                                .absolute()
+                                                                .left_0()
+                                                                .top(rail_top)
+                                                                .w(rail_width)
+                                                                .rounded(px(2.))
+                                                                .bg(rail_color),
+                                                            format!(
+                                                                "saved-session-rail-{ix}-{is_active}"
+                                                            ),
+                                                        ),
+                                                    )
+                                                })
                                                 .child(
                                                     v_flex()
                                                         .gap_1()
@@ -1792,14 +2149,13 @@ impl Ashell {
                                                             div()
                                                                 .text_size(rems(0.875))
                                                                 .font_weight(FontWeight::SEMIBOLD)
+                                                                .text_color(cx.theme().foreground)
                                                                 .child(name),
                                                         )
                                                         .child(
                                                             div()
                                                                 .text_size(rems(0.75))
-                                                                .text_color(
-                                                                    cx.theme().muted_foreground,
-                                                                )
+                                                                .text_color(cx.theme().muted_foreground)
                                                                 .child(detail),
                                                         ),
                                                 )
@@ -1828,199 +2184,30 @@ impl Ashell {
             )
     }
 
-    fn render_collapsed_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let sessions = self.config.sessions().to_vec();
-        let active_session_id = self.active_session_id().map(ToOwned::to_owned);
-
+    fn render_activity_rail(&self, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
-            .w_full()
+            .id("workspace-activity-rail")
+            .w(px(COLLAPSED_SIDEBAR_WIDTH))
             .h_full()
-            .min_w(px(0.))
-            .p_2()
+            .flex_none()
+            .items_center()
+            .gap_1()
+            .py_2()
             .border_r_1()
             .border_color(cx.theme().sidebar_border)
             .bg(cx.theme().sidebar)
-            .overflow_hidden()
-            .items_center()
-            // Top: expand button only
             .child(
-                div()
-                    .w_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .pb_2()
-                    .child(
-                        Button::new("sidebar-expand-toggle")
-                            .ghost()
-                            .icon(IconName::PanelLeftOpen)
-                            .tooltip(t!("settings_toggle_sidebar").to_string())
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.sidebar_collapsed = false;
-                                this.config.set_sidebar_collapsed(false);
-                                this.save_preferences_background();
-                                cx.notify();
-                            })),
-                    ),
-            )
-            // Saved sessions as compact cards
-            .child(
-                div()
-                    .relative()
-                    .flex_1()
-                    .min_h(px(0.))
-                    .w_full()
-                    .child(
-                        v_flex()
-                            .size_full()
-                            .id("collapsed-saved-sessions-scroll")
-                            .track_scroll(&self.collapsed_saved_scroll_handle)
-                            .overflow_y_scroll()
-                            .gap_2()
-                            .items_center()
-                            .children(sessions.into_iter().enumerate().map(|(ix, session)| {
-                                let connect_id = session.id.clone();
-                                let is_active =
-                                    active_session_id.as_deref() == Some(session.id.as_str());
-                                let name = session.name.clone();
-
-                                // Abbreviate: first 1 char for CJK, first 2 chars for Latin
-                                let abbrev = {
-                                    let mut chars = name.chars();
-                                    if let Some(first) = chars.next() {
-                                        if first > '\u{2E7F}' {
-                                            // CJK character range — show 1 char
-                                            first.to_string()
-                                        } else {
-                                            // Latin / ASCII — show first 2 chars
-                                            let mut s = first.to_string();
-                                            if let Some(second) = chars.next() {
-                                                s.push(second);
-                                            }
-                                            s
-                                        }
-                                    } else {
-                                        "?".to_string()
-                                    }
-                                };
-
-                                let edit_id = session.id.clone();
-                                let delete_id = session.id.clone();
-                                div()
-                                    .id(("collapsed-saved", ix))
-                                    .w(px(36.))
-                                    .h(px(36.))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded_md()
-                                    .border_1()
-                                    .border_color(if is_active {
-                                        cx.theme().primary
-                                    } else {
-                                        cx.theme().border
-                                    })
-                                    .bg(if is_active {
-                                        cx.theme().tab_active
-                                    } else {
-                                        cx.theme().muted
-                                    })
-                                    .cursor_pointer()
-                                    .hover(|this| this.bg(cx.theme().secondary))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, window, cx| {
-                                            this.connect_saved_session(
-                                                connect_id.clone(),
-                                                window,
-                                                cx,
-                                            )
-                                        }),
-                                    )
-                                    .tooltip({
-                                        let tooltip_text = format!("{} {}", name, session.user);
-                                        move |window, cx| {
-                                            gpui_component::tooltip::Tooltip::new(
-                                                tooltip_text.clone(),
-                                            )
-                                            .build(window, cx)
-                                        }
-                                    })
-                                    .context_menu({
-                                        let view = cx.entity();
-                                        move |menu, window, _| {
-                                            let edit_value = edit_id.clone();
-                                            let clone_value = edit_id.clone();
-                                            let delete_value = delete_id.clone();
-                                            menu.item(
-                                                PopupMenuItem::new(t!("clone").to_string())
-                                                    .on_click(window.listener_for(
-                                                        &view,
-                                                        move |this, _, window, cx| {
-                                                            this.clone_saved_session(
-                                                                clone_value.clone(),
-                                                                window,
-                                                                cx,
-                                                            )
-                                                        },
-                                                    )),
-                                            )
-                                            .item(
-                                                PopupMenuItem::new(t!("edit").to_string())
-                                                    .on_click(window.listener_for(
-                                                        &view,
-                                                        move |this, _, window, cx| {
-                                                            this.edit_saved_session(
-                                                                edit_value.clone(),
-                                                                window,
-                                                                cx,
-                                                            )
-                                                        },
-                                                    )),
-                                            )
-                                            .item(
-                                                PopupMenuItem::new(t!("delete").to_string())
-                                                    .on_click(window.listener_for(
-                                                        &view,
-                                                        move |this, _, _, cx| {
-                                                            this.remove_saved_session(
-                                                                delete_value.clone(),
-                                                                cx,
-                                                            )
-                                                        },
-                                                    )),
-                                            )
-                                        }
-                                    })
-                                    .child(
-                                        div()
-                                            .text_size(rems(0.833))
-                                            .font_weight(FontWeight::BOLD)
-                                            .text_color(if is_active {
-                                                cx.theme().primary
-                                            } else {
-                                                cx.theme().foreground
-                                            })
-                                            .child(abbrev),
-                                    )
-                            })),
-                    )
-                    .child(
-                        div()
-                            .absolute()
-                            .top_0()
-                            .bottom_0()
-                            .left_0()
-                            .right_0()
-                            .child(
-                                gpui_component::scroll::Scrollbar::new(
-                                    &self.collapsed_saved_scroll_handle,
-                                )
-                                .id("collapsed-saved-scrollbar")
-                                .axis(gpui_component::scroll::ScrollbarAxis::Vertical)
-                                .scrollbar_show(gpui_component::scroll::ScrollbarShow::Scrolling),
-                            ),
-                    ),
+                Button::new("activity-rail-sessions")
+                    .ghost()
+                    .small()
+                    .icon(IconName::PanelLeftOpen)
+                    .tooltip(t!("settings_toggle_sidebar").to_string())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.sidebar_collapsed = false;
+                        this.config.set_sidebar_collapsed(false);
+                        this.save_preferences_background();
+                        cx.notify();
+                    })),
             )
     }
 
@@ -2201,10 +2388,18 @@ impl Ashell {
                             }
                         })
                         .unwrap_or(cx.theme().success);
+                    let connected_ssh = pane_ids.iter().any(|id| {
+                        self.tabs.iter().any(|tab| {
+                            tab.id == *id
+                                && tab.kind == crate::terminal::TabKind::Ssh
+                                && tab.connected
+                        })
+                    });
                     Some(WorkspaceTabRenderData {
                         workspace_id: workspace_id.clone(),
                         label,
                         accent,
+                        connected_ssh,
                         close_target: WorkspaceCloseTarget::Session(close_id),
                     })
                 }
@@ -2232,6 +2427,7 @@ impl Ashell {
                         workspace_id: workspace_id.clone(),
                         label,
                         accent,
+                        connected_ssh: false,
                         close_target: WorkspaceCloseTarget::Document(document_id.clone()),
                     })
                 }
@@ -2247,6 +2443,7 @@ impl Ashell {
             })
             .unwrap_or(0);
         let has_active_document = self.active_document_id().is_some();
+        let has_active_terminal = self.active_tab.is_some();
         h_flex()
             .flex_1()
             .min_w(px(0.))
@@ -2261,33 +2458,89 @@ impl Ashell {
                     .window_control_area(gpui::WindowControlArea::Drag)
                     .overflow_x_hidden()
                     .child({
-                        TabBar::new("ashell-tab-bar")
+                        h_flex()
+                            .id("ashell-tab-bar")
+                            .w_full()
+                            .h_full()
+                            .items_end()
+                            .gap_1()
                             .track_scroll(&self.tabs_scroll_handle)
-                            .selected_index(selected)
+                            .overflow_x_scroll()
                             .children(tabs_data.iter().enumerate().map(|(ix, tab_data)| {
                                 let workspace_id = tab_data.workspace_id.clone();
                                 let close_target = tab_data.close_target.clone();
-                                Tab::new()
+                                let is_selected = ix == selected;
+                                let connected_ssh = tab_data.connected_ssh;
+                                let foreground = if connected_ssh && is_selected {
+                                    gpui::white()
+                                } else if connected_ssh {
+                                    cx.theme().muted_foreground
+                                } else if is_selected {
+                                    cx.theme().tab_active_foreground
+                                } else {
+                                    cx.theme().tab_foreground
+                                };
+                                h_flex()
+                                    .id(("workspace-tab", ix))
+                                    .flex_none()
+                                    .relative()
                                     .min_w(px(80.))
-                                    .prefix(div().w(px(5.)).h(px(32.)).bg(tab_data.accent))
-                                    .child(
-                                        div()
-                                            .when(ix == selected, |this| {
-                                                this.font_weight(FontWeight::BOLD)
-                                                    .text_color(cx.theme().primary)
-                                                    .text_base()
-                                            })
-                                            .child(tab_data.label.clone()),
-                                    )
+                                    .max_w(px(240.))
+                                    .h(px(32.))
+                                    .px_2()
+                                    .gap_2()
+                                    .items_center()
+                                    .overflow_hidden()
+                                    .rounded_tl(px(6.))
+                                    .rounded_tr(px(6.))
+                                    .bg(if connected_ssh {
+                                        gpui::black()
+                                    } else if is_selected {
+                                        cx.theme().tab_active
+                                    } else {
+                                        cx.theme().transparent
+                                    })
+                                    .text_color(foreground)
+                                    .cursor_pointer()
+                                    .when(!is_selected && !connected_ssh, |this| {
+                                        this.hover(|this| this.bg(cx.theme().secondary_hover))
+                                    })
+                                    .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                                        window.prevent_default();
+                                        cx.stop_propagation();
+                                    })
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         this.activate_workspace(workspace_id.clone(), window, cx)
                                     }))
-                                    .suffix(
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .size(px(6.))
+                                            .rounded_full()
+                                            .opacity(if connected_ssh && !is_selected {
+                                                0.55
+                                            } else {
+                                                1.0
+                                            })
+                                            .bg(tab_data.accent),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w(px(0.))
+                                            .truncate()
+                                            .text_size(rems(0.833))
+                                            .when(is_selected, |this| {
+                                                this.font_weight(FontWeight::SEMIBOLD)
+                                            })
+                                            .child(tab_data.label.clone()),
+                                    )
+                                    .child(
                                         Button::new(("tab-close", ix))
                                             .ghost()
                                             .xsmall()
                                             .icon(IconName::Close)
-                                            .mr(px(5.))
+                                            .text_color(foreground)
                                             .on_mouse_down(MouseButton::Left, |_, window, cx| {
                                                 window.prevent_default();
                                                 cx.stop_propagation();
@@ -2312,10 +2565,21 @@ impl Ashell {
                                                 }
                                             })),
                                     )
+                                    .when(connected_ssh && is_selected, |this| {
+                                        this.child(
+                                            div()
+                                                .absolute()
+                                                .left(px(6.))
+                                                .right(px(6.))
+                                                .bottom_0()
+                                                .h(px(2.))
+                                                .rounded_tl(px(2.))
+                                                .rounded_tr(px(2.))
+                                                .bg(cx.theme().primary),
+                                        )
+                                    })
                             }))
-                            .last_empty_space(div().w_3())
-                            .w_full()
-                            .h_full()
+                            .child(div().flex_none().w_3().h_full())
                     }),
             )
             .child(
@@ -2324,6 +2588,7 @@ impl Ashell {
                     .items_center()
                     .gap_1()
                     .pr(px(6.))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(
                         Button::new("open-selector")
                             .secondary()
@@ -2335,7 +2600,7 @@ impl Ashell {
                                 this.show_selector_dialog(window, cx)
                             })),
                     )
-                    .when(!has_active_document, |this| {
+                    .when(has_active_terminal && !has_active_document, |this| {
                         this.child(
                             Button::new("split-horizontal")
                                 .secondary()
@@ -2362,6 +2627,9 @@ impl Ashell {
                                     this.split_current_pane("right", cx);
                                 })),
                         )
+                        .when(self.active_connected_ssh_tab_id().is_some(), |this| {
+                            this.child(self.render_command_bar_button(cx))
+                        })
                         .child(self.render_search_button(cx))
                     }),
             )
@@ -2389,7 +2657,7 @@ impl Ashell {
                     .window_control_area(gpui::WindowControlArea::Min)
                     .on_click(|_, window, _| window.minimize_window())
                     .hover(|this| this.bg(cx.theme().accent))
-                    .child(Icon::new(IconName::WindowMinimize).size(px(14.))),
+                    .child(Icon::new(IconName::WindowMinimize).size(px(COMPACT_ICON_SIZE))),
             )
             .child(
                 div()
@@ -2403,7 +2671,7 @@ impl Ashell {
                     .window_control_area(gpui::WindowControlArea::Max)
                     .on_click(|_, window, _| window.zoom_window())
                     .hover(|this| this.bg(cx.theme().accent))
-                    .child(Icon::new(IconName::WindowMaximize).size(px(14.))),
+                    .child(Icon::new(IconName::WindowMaximize).size(px(COMPACT_ICON_SIZE))),
             )
             .child(
                 div()
@@ -2413,14 +2681,16 @@ impl Ashell {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_color(cx.theme().primary_foreground)
-                    .bg(cx.theme().danger.opacity(0.8))
+                    .text_color(cx.theme().foreground)
                     .window_control_area(gpui::WindowControlArea::Close)
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.request_application_close(window, cx);
                     }))
-                    .hover(|this| this.bg(cx.theme().danger))
-                    .child(Icon::new(IconName::WindowClose).size(px(14.))),
+                    .hover(|this| {
+                        this.bg(cx.theme().danger)
+                            .text_color(cx.theme().primary_foreground)
+                    })
+                    .child(Icon::new(IconName::WindowClose).size(px(COMPACT_ICON_SIZE))),
             )
     }
 
@@ -2433,14 +2703,14 @@ impl Ashell {
             .id("windows-title-bar")
             .flex_none()
             .items_center()
-            .h(px(44.))
+            .h(px(TAB_BAR_HEIGHT))
             .w_full()
             .bg(cx.theme().tab_bar)
             .border_b_1()
             .border_color(cx.theme().border)
             .child(
                 h_flex()
-                    .w(px(136.))
+                    .w(px(SIDEBAR_WIDTH))
                     .h_full()
                     .px_3()
                     .gap_2()
@@ -2467,19 +2737,11 @@ impl Ashell {
                     .gap_1()
                     .px_2()
                     .child(
-                        Button::new("windows-title-search")
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::Search)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.show_selector_dialog(window, cx);
-                            })),
-                    )
-                    .child(
                         Button::new("windows-title-settings")
                             .ghost()
-                            .xsmall()
+                            .small()
                             .icon(IconName::Settings)
+                            .tooltip(t!("settings_open_settings").to_string())
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.show_settings_dialog(window, cx);
                             })),
@@ -2493,6 +2755,11 @@ impl Ashell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        self.terminal_cell_width = crate::app::theme::measure_terminal_cell_width(
+            self.terminal_font_family.clone(),
+            self.terminal_font_size,
+            window,
+        );
         let has_active = self.active_tab.is_some();
         let pane_tree = self.pane_root.clone();
         let view = cx.entity();
@@ -2500,41 +2767,59 @@ impl Ashell {
         div()
             .size_full()
             .relative()
+            .px(px(TERMINAL_PADDING_X))
+            .py(px(TERMINAL_PADDING_Y))
             .child(
-                div()
+                v_flex()
                     .size_full()
-                    .on_prepaint(move |bounds, _window, cx| {
-                        let _ = view.update(cx, |this, cx| {
-                            if this.terminal_panel_bounds != Some(bounds) {
-                                this.terminal_panel_bounds = Some(bounds);
-                                cx.notify();
-                            }
-                        });
-                    })
-                    .overflow_hidden()
-                    .track_focus(&self.focus_handle)
-                    .key_context(TERMINAL_KEY_CONTEXT)
-                    .on_mouse_down(MouseButton::Left, cx.listener(Self::focus_terminal))
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(Self::on_terminal_right_click),
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h(px(0.))
+                            .on_prepaint(move |bounds, _window, cx| {
+                                let _ = view.update(cx, |this, cx| {
+                                    if this.terminal_panel_bounds != Some(bounds) {
+                                        this.terminal_panel_bounds = Some(bounds);
+                                        cx.notify();
+                                    }
+                                });
+                            })
+                            .overflow_hidden()
+                            .track_focus(&self.focus_handle)
+                            .key_context(TERMINAL_KEY_CONTEXT)
+                            .on_mouse_down(MouseButton::Left, cx.listener(Self::focus_terminal))
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(Self::on_terminal_right_click),
+                            )
+                            .on_mouse_move(cx.listener(Self::on_terminal_mouse_move))
+                            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_terminal_mouse_up))
+                            .on_key_down(cx.listener(Self::on_terminal_key_down))
+                            .on_key_up(cx.listener(Self::on_terminal_key_up))
+                            .on_action(cx.listener(Self::on_terminal_tab_action))
+                            .on_action(cx.listener(Self::on_terminal_backtab_action))
+                            .on_scroll_wheel(cx.listener(Self::on_terminal_scroll))
+                            .child(if has_active {
+                                Self::render_pane_tree(self, &pane_tree, &[], cx).into_any_element()
+                            } else {
+                                self.render_home_page(cx).into_any_element()
+                            }),
                     )
-                    .on_mouse_move(cx.listener(Self::on_terminal_mouse_move))
-                    .on_mouse_up(MouseButton::Left, cx.listener(Self::on_terminal_mouse_up))
-                    .on_key_down(cx.listener(Self::on_terminal_key_down))
-                    .on_action(cx.listener(Self::on_terminal_tab_action))
-                    .on_action(cx.listener(Self::on_terminal_backtab_action))
-                    .on_scroll_wheel(cx.listener(Self::on_terminal_scroll))
-                    .child(if has_active {
-                        Self::render_pane_tree(self, &pane_tree, &[], cx).into_any_element()
-                    } else {
-                        self.render_home_page(cx).into_any_element()
+                    .when(has_active && self.command_bar_open, |this| {
+                        this.child(self.render_command_bar(window, cx))
                     }),
             )
             // Search bar overlay — only when search is active.
             .when(self.search_active, |el| {
                 el.child(self.render_search_bar(window, cx))
             })
+            .when(self.command_history_panel_open, |el| {
+                el.child(self.render_command_history_panel(window, cx))
+            })
+            .when(
+                !self.search_active && !self.command_history_panel_open,
+                |el| el.child(self.render_terminal_completion(cx)),
+            )
     }
 
     fn render_pane_tree(
@@ -2572,10 +2857,11 @@ impl Ashell {
                 let is_url_hovered = this
                     .hovered_url
                     .as_ref()
-                    .map_or(false, |hu| hu.tab_id == *tab_id);
+                    .is_some_and(|hu| hu.tab_id == *tab_id && this.terminal_link_ctrl_pressed);
                 let mut el = div()
                     .size_full()
                     .overflow_hidden()
+                    .pr(px(TERMINAL_SCROLLBAR_GUTTER))
                     .when(is_url_hovered, |d| d.cursor_pointer())
                     .on_mouse_down(
                         MouseButton::Left,
@@ -2612,7 +2898,9 @@ impl Ashell {
                     .find(|t| t.id == *tab_id)
                     .and_then(|tab| tab.disconnected_reason.clone());
                 if let Some(reason) = disconnected_reason {
-                    let tab_id_for_reconnect = tab_id.clone();
+                    let tab_id_for_bar_reconnect = tab_id.clone();
+                    let tab_id_for_button_reconnect = tab_id.clone();
+                    let reconnect_button_id = format!("terminal-reconnect-{tab_id}");
                     el = div().size_full().relative().child(el).child(
                         div().absolute().bottom_0().left_0().right_0().child(
                             h_flex()
@@ -2624,6 +2912,9 @@ impl Ashell {
                                 .bg(cx.theme().danger.opacity(0.15))
                                 .child(
                                     div()
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .truncate()
                                         .text_size(rems(0.85))
                                         .text_color(cx.theme().danger)
                                         .child(
@@ -2632,15 +2923,28 @@ impl Ashell {
                                         ),
                                 )
                                 .child(
-                                    div()
-                                        .text_size(rems(0.85))
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(format!("— {}", t!("press_enter_to_reconnect"))),
+                                    div().flex_none().child(
+                                        Button::new(reconnect_button_id)
+                                            .secondary()
+                                            .small()
+                                            .icon(IconName::Redo2)
+                                            .label(t!("reconnect").to_string())
+                                            .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                                                window.prevent_default();
+                                                cx.stop_propagation();
+                                            })
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.retry_disconnected_tab(
+                                                    &tab_id_for_button_reconnect,
+                                                    cx,
+                                                );
+                                            })),
+                                    ),
                                 )
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(move |this, _, _, cx| {
-                                        this.retry_disconnected_tab(&tab_id_for_reconnect, cx);
+                                        this.retry_disconnected_tab(&tab_id_for_bar_reconnect, cx);
                                     }),
                                 ),
                         ),
@@ -2832,8 +3136,8 @@ impl Ashell {
 
         let is_monitor_bottom = self.config.monitoring_position() == "Bottom";
         let minimized_height = if is_monitor_bottom { 104. } else { 24. };
-        let min_panel_height = if is_monitor_bottom { 260. } else { 180. };
-        let default_panel_height = if is_monitor_bottom { 328. } else { 248. };
+        let min_panel_height = if is_monitor_bottom { 220. } else { 130. };
+        let default_panel_height = if is_monitor_bottom { 304. } else { 154. };
         let sftp_size = if self.sftp_panel_minimized {
             px(minimized_height)
         } else {
@@ -2862,13 +3166,7 @@ impl Ashell {
         if self.sidebar_collapsed {
             h_flex()
                 .size_full()
-                .child(
-                    div()
-                        .flex_none()
-                        .w(px(COLLAPSED_SIDEBAR_WIDTH))
-                        .h_full()
-                        .child(self.render_collapsed_sidebar(cx)),
-                )
+                .child(self.render_activity_rail(cx))
                 .child(
                     div().flex_1().h_full().min_w(px(0.)).child(
                         v_flex()
@@ -2886,7 +3184,7 @@ impl Ashell {
                     .workspace_panels()
                     .and_then(|sizes| sizes.first().copied())
                     .unwrap_or(SIDEBAR_WIDTH)))
-                .size_range(px(240.)..px(520.))
+                .size_range(px(210.)..px(360.))
                 .flex_none()
                 .child(self.sidebar(cx));
             let main_area = resizable_panel().child(
@@ -2896,11 +3194,17 @@ impl Ashell {
                     .overflow_hidden()
                     .child(body_panel),
             );
-            h_resizable("ashell-workspace")
-                .lock(self.config.lock_layout())
-                .with_state(&self.workspace_panels)
-                .child(sidebar_area)
-                .child(main_area)
+            h_flex()
+                .size_full()
+                .child(
+                    div().flex_1().min_w(px(0.)).h_full().child(
+                        h_resizable("ashell-workspace")
+                            .lock(self.config.lock_layout())
+                            .with_state(&self.workspace_panels)
+                            .child(sidebar_area)
+                            .child(main_area),
+                    ),
+                )
                 .into_any_element()
         }
     }

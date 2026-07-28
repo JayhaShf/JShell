@@ -6,26 +6,32 @@
       "name": "Ashell Light",
       "mode": "light",
       "colors": {
-        "background": "#ffffff", "foreground": "#111111", "border": "#d8d8d8", "window_border": "#c8c8c8",
-        "title_bar.background": "#f6f6f6", "title_bar.border": "#d8d8d8", "panel.background": "#f0f0f0",
-        "popover.background": "#ffffff", "popover.foreground": "#111111", "muted.background": "#eeeeee", "muted.foreground": "#606060",
-        "primary.background": "#111111", "primary.foreground": "#ffffff", "secondary.background": "#eeeeee", "secondary.foreground": "#111111",
-        "secondary.hover.background": "#e0e0e0", "secondary.active.background": "#d8d8d8", "accent.background": "#e8e8e8", "accent.foreground": "#111111",
-        "ring": "#111111", "scrollbar.thumb.background": "#a0a0a0", "base.red": "#b4232a", "base.green": "#16794f",
-        "base.yellow": "#8a6400", "base.blue": "#202020", "base.magenta": "#4a4a4a", "base.cyan": "#363636"
+        "background": "#ffffff", "foreground": "#151515", "border": "#d7d7d7", "window_border": "#d7d7d7",
+        "title_bar.background": "#f5f5f5", "title_bar.border": "#d7d7d7", "panel.background": "#f5f5f5",
+        "popover.background": "#f5f5f5", "popover.foreground": "#151515", "muted.background": "#ededed", "muted.foreground": "#6b6b6b",
+        "primary.background": "#151515", "primary.foreground": "#ffffff", "secondary.background": "#ededed", "secondary.foreground": "#151515",
+        "secondary.hover.background": "#e6e6e6", "secondary.active.background": "#d7d7d7", "accent.background": "#ededed", "accent.foreground": "#151515",
+        "sidebar.background": "#f5f5f5", "sidebar.foreground": "#151515", "sidebar.border": "#d7d7d7", "sidebar.accent.background": "#e6e6e6", "sidebar.accent.foreground": "#151515", "sidebar.primary.background": "#151515", "sidebar.primary.foreground": "#ffffff",
+        "tab.background": "#f5f5f5", "tab.foreground": "#151515", "tab.active.background": "#151515", "tab.active.foreground": "#ffffff", "tab_bar.background": "#f5f5f5", "tab_bar.segmented.background": "#ededed",
+        "danger.background": "#b4232a", "danger.hover.background": "#b4232a", "danger.active.background": "#b4232a", "danger.foreground": "#ffffff", "progress.bar.background": "#ededed",
+        "ring": "#151515", "scrollbar.thumb.background": "#a0a0a0", "base.red": "#b4232a", "base.green": "#267a43",
+        "base.yellow": "#816200", "base.blue": "#202020", "base.magenta": "#4a4a4a", "base.cyan": "#363636"
       }
     },
     {
       "name": "Ashell Dark",
       "mode": "dark",
       "colors": {
-        "background": "#0b0b0b", "foreground": "#f5f5f5", "border": "#303030", "window_border": "#3a3a3a",
-        "title_bar.background": "#111111", "title_bar.border": "#303030", "panel.background": "#191919",
-        "popover.background": "#141414", "popover.foreground": "#f5f5f5", "muted.background": "#202020", "muted.foreground": "#a0a0a0",
+        "background": "#0b0b0b", "foreground": "#f5f5f5", "border": "#303030", "window_border": "#303030",
+        "title_bar.background": "#171717", "title_bar.border": "#303030", "panel.background": "#171717",
+        "popover.background": "#171717", "popover.foreground": "#f5f5f5", "muted.background": "#202020", "muted.foreground": "#969696",
         "primary.background": "#f5f5f5", "primary.foreground": "#0b0b0b", "secondary.background": "#202020", "secondary.foreground": "#f5f5f5",
-        "secondary.hover.background": "#2a2a2a", "secondary.active.background": "#303030", "accent.background": "#252525", "accent.foreground": "#f5f5f5",
-        "ring": "#f5f5f5", "scrollbar.thumb.background": "#606060", "base.red": "#ef6b73", "base.green": "#d8d8d8",
-        "base.yellow": "#c8c8c8", "base.blue": "#f5f5f5", "base.magenta": "#b8b8b8", "base.cyan": "#e0e0e0"
+        "secondary.hover.background": "#292929", "secondary.active.background": "#303030", "accent.background": "#202020", "accent.foreground": "#f5f5f5",
+        "sidebar.background": "#171717", "sidebar.foreground": "#f5f5f5", "sidebar.border": "#303030", "sidebar.accent.background": "#292929", "sidebar.accent.foreground": "#f5f5f5", "sidebar.primary.background": "#f5f5f5", "sidebar.primary.foreground": "#0b0b0b",
+        "tab.background": "#171717", "tab.foreground": "#f5f5f5", "tab.active.background": "#f5f5f5", "tab.active.foreground": "#0b0b0b", "tab_bar.background": "#171717", "tab_bar.segmented.background": "#202020",
+        "danger.background": "#d75050", "danger.hover.background": "#d75050", "danger.active.background": "#d75050", "danger.foreground": "#0b0b0b", "progress.bar.background": "#202020",
+        "ring": "#f5f5f5", "scrollbar.thumb.background": "#606060", "base.red": "#d75050", "base.green": "#a7d797",
+        "base.yellow": "#d8ca77", "base.blue": "#f5f5f5", "base.magenta": "#b8b8b8", "base.cyan": "#e0e0e0"
       }
     }
   ]

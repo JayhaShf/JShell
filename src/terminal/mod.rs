@@ -31,6 +31,7 @@ pub enum BackendCommand {
     Input(Vec<u8>),
     Resize { cols: u16, rows: u16 },
     SampleMetrics,
+    LoadCommandHistory,
     Close,
 }
 
@@ -65,6 +66,14 @@ pub enum BackendEvent {
         snapshot: SystemSnapshot,
     },
     RemoteSystemUnavailable {
+        tab_id: String,
+        reason: String,
+    },
+    CommandHistory {
+        tab_id: String,
+        entries: Vec<String>,
+    },
+    CommandHistoryUnavailable {
         tab_id: String,
         reason: String,
     },

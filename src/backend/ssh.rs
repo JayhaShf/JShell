@@ -84,6 +84,43 @@ async fn sample_remote_system_with_handle(
     remote_snapshot_from_kv(&output)
 }
 
+async fn load_remote_command_history_with_handle(
+    handle: Arc<tokio::sync::Mutex<russh::client::Handle<ClientHandler>>>,
+) -> Result<Vec<String>> {
+    let mut channel = handle
+        .lock()
+        .await
+        .channel_open_session()
+        .await
+        .context("open command history session")?;
+    channel
+        .exec(true, REMOTE_COMMAND_HISTORY_PROBE)
+        .await
+        .context("exec remote command history probe")?;
+
+    let mut stdout = Vec::new();
+    while let Some(msg) = channel.wait().await {
+        match msg {
+            ChannelMsg::Data { data } => {
+                if stdout.len().saturating_add(data.len()) > MAX_REMOTE_HISTORY_BYTES {
+                    return Err(anyhow!("remote command history exceeds size limit"));
+                }
+                stdout.extend_from_slice(&data);
+            }
+            ChannelMsg::Close => break,
+            _ => {}
+        }
+    }
+
+    let output = String::from_utf8_lossy(&stdout);
+    if !output.starts_with(REMOTE_HISTORY_FORMAT_PREFIX) {
+        return Err(anyhow!(
+            "remote shell did not return a supported history format"
+        ));
+    }
+    Ok(parse_remote_command_history(&output))
+}
+
 async fn run_ssh(
     tab_id: String,
     session: Session,
@@ -158,6 +195,29 @@ async fn run_ssh(
                                         tab_id: tab_id_clone,
                                         reason: format!("remote metrics unavailable: {err:#}"),
                                     });
+                                }
+                            }
+                        });
+                    }
+                    Some(BackendCommand::LoadCommandHistory) => {
+                        let handle_clone = handle.clone();
+                        let tab_id_clone = tab_id.clone();
+                        let events_clone = events.clone();
+                        tokio::spawn(async move {
+                            match load_remote_command_history_with_handle(handle_clone).await {
+                                Ok(entries) => {
+                                    let _ = events_clone.send(BackendEvent::CommandHistory {
+                                        tab_id: tab_id_clone,
+                                        entries,
+                                    });
+                                }
+                                Err(err) => {
+                                    let _ = events_clone.send(
+                                        BackendEvent::CommandHistoryUnavailable {
+                                            tab_id: tab_id_clone,
+                                            reason: format!("remote command history unavailable: {err:#}"),
+                                        },
+                                    );
                                 }
                             }
                         });
@@ -619,6 +679,80 @@ echo "NET_RX=0"
 echo "NET_TX=0"
 '"#;
 
+const REMOTE_HISTORY_FORMAT_PREFIX: &str = "__ASHELL_HISTORY_FORMAT__:";
+const MAX_REMOTE_HISTORY_ENTRIES: usize = 500;
+const MAX_REMOTE_HISTORY_BYTES: usize = 4 * 1024 * 1024;
+
+const REMOTE_COMMAND_HISTORY_PROBE: &str = r#"sh -lc '
+shell_name=${SHELL##*/}
+format=""
+history_file=""
+
+case "$shell_name" in
+  zsh)
+    format="zsh"
+    history_file=${HISTFILE:-"$HOME/.zsh_history"}
+    ;;
+  fish)
+    format="fish"
+    history_file="$HOME/.local/share/fish/fish_history"
+    ;;
+  *)
+    format="bash"
+    history_file=${HISTFILE:-"$HOME/.bash_history"}
+    ;;
+esac
+
+printf "__ASHELL_HISTORY_FORMAT__:%s\n" "$format"
+if [ -r "$history_file" ]; then
+  tail -n 2000 "$history_file" 2>/dev/null || cat "$history_file" 2>/dev/null
+fi
+'"#;
+
+fn parse_remote_command_history(output: &str) -> Vec<String> {
+    let mut lines = output.lines();
+    let Some(format) = lines
+        .next()
+        .and_then(|line| line.strip_prefix(REMOTE_HISTORY_FORMAT_PREFIX))
+    else {
+        return Vec::new();
+    };
+
+    let mut entries = match format.trim() {
+        "bash" => lines
+            .filter_map(|line| {
+                let command = line.trim();
+                let is_timestamp = command.strip_prefix('#').is_some_and(|value| {
+                    !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit())
+                });
+                (!command.is_empty() && !is_timestamp).then(|| command.to_string())
+            })
+            .collect::<Vec<_>>(),
+        "zsh" => lines
+            .filter_map(|line| {
+                let command = line
+                    .strip_prefix(": ")
+                    .and_then(|value| value.split_once(';').map(|(_, command)| command))
+                    .unwrap_or(line)
+                    .trim();
+                (!command.is_empty()).then(|| command.to_string())
+            })
+            .collect::<Vec<_>>(),
+        "fish" => lines
+            .filter_map(|line| line.trim_start().strip_prefix("- cmd: "))
+            .map(str::trim)
+            .filter(|command| !command.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>(),
+        _ => return Vec::new(),
+    };
+
+    entries.reverse();
+    entries.dedup();
+    entries.truncate(MAX_REMOTE_HISTORY_ENTRIES);
+    entries
+}
+
 #[derive(Clone)]
 struct ClientHandler;
 
@@ -631,5 +765,47 @@ impl Handler for ClientHandler {
         _server_public_key: &russh::keys::ssh_key::PublicKey,
     ) -> Result<bool, Self::Error> {
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod command_history_tests {
+    use super::parse_remote_command_history;
+
+    #[test]
+    fn parses_bash_history_newest_first_and_skips_timestamps() {
+        let output = "__ASHELL_HISTORY_FORMAT__:bash\n#1712345678\nls -la\npwd\npwd\n";
+
+        assert_eq!(
+            parse_remote_command_history(output),
+            vec!["pwd".to_string(), "ls -la".to_string()]
+        );
+    }
+
+    #[test]
+    fn parses_zsh_extended_history_prefixes() {
+        let output =
+            "__ASHELL_HISTORY_FORMAT__:zsh\n: 1712345678:0;git status\n: 1712345680:2;cargo test\n";
+
+        assert_eq!(
+            parse_remote_command_history(output),
+            vec!["cargo test".to_string(), "git status".to_string()]
+        );
+    }
+
+    #[test]
+    fn parses_fish_history_command_entries_only() {
+        let output = "__ASHELL_HISTORY_FORMAT__:fish\n- cmd: echo hello\n  when: 1712345678\n- cmd: printf '%s' 中文\n  paths:\n    - /tmp\n";
+
+        assert_eq!(
+            parse_remote_command_history(output),
+            vec!["printf '%s' 中文".to_string(), "echo hello".to_string()]
+        );
+    }
+
+    #[test]
+    fn ignores_missing_format_marker_and_blank_commands() {
+        assert!(parse_remote_command_history("ls\npwd\n").is_empty());
+        assert!(parse_remote_command_history("__ASHELL_HISTORY_FORMAT__:bash\n\n  \n").is_empty());
     }
 }

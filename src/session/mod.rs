@@ -11,11 +11,11 @@ use rust_i18n::t;
 use std::collections::HashSet;
 use uuid::Uuid;
 
-use self::config::{AuthMethod, Session};
+use self::config::{AuthMethod, Session, SessionFolder};
 
 use crate::{
     Ashell, PaneLayout, SelectorEntry, TabGroup,
-    app::constants::{DEFAULT_COLS, DEFAULT_ROWS},
+    app::constants::{DEFAULT_COLS, DEFAULT_ROWS, TERMINAL_LINE_HEIGHT_EM},
     backend::{local, ssh},
     terminal::{BackendCommand, RenderSnapshot, TabKind, TerminalTab},
 };
@@ -46,6 +46,16 @@ fn saved_session_ids_without_connected_tabs<'a>(
         .filter(|session_id| !connected_session_ids.contains(*session_id))
         .map(ToOwned::to_owned)
         .collect()
+}
+
+fn should_open_terminal_url(button: MouseButton, control: bool) -> bool {
+    button == MouseButton::Left && control
+}
+
+fn open_terminal_url(url: &str) {
+    if let Err(error) = open::that(url) {
+        tracing::warn!(url, %error, "failed to open terminal URL");
+    }
 }
 
 impl Ashell {
@@ -410,11 +420,11 @@ impl Ashell {
     }
 
     pub(crate) fn terminal_cell_width(&self) -> f32 {
-        (self.terminal_font_size * 0.646).max(6.0)
+        self.terminal_cell_width
     }
 
     pub(crate) fn terminal_line_height(&self) -> f32 {
-        (self.terminal_font_size * 1.385).max(self.terminal_font_size + 2.0)
+        (self.terminal_font_size * TERMINAL_LINE_HEIGHT_EM).max(self.terminal_font_size + 2.0)
     }
 
     pub(crate) fn change_terminal_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
@@ -426,7 +436,7 @@ impl Ashell {
     }
 
     pub(crate) fn change_ui_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
-        self.ui_font_size = (self.ui_font_size + delta).clamp(8.0, 24.0);
+        self.ui_font_size = crate::session::config::clamp_ui_font_size(self.ui_font_size + delta);
         self.config.set_ui_font_size(self.ui_font_size);
         self.save_preferences_background();
         Theme::global_mut(cx).font_size = px(self.ui_font_size);
@@ -443,15 +453,26 @@ impl Ashell {
         self.ui_font_family = family.into();
         self.config.set_ui_font_family(family);
         self.save_preferences_background();
-        crate::app::theme::set_theme_font_names(Theme::global_mut(cx), &self.ui_font_family);
+        crate::app::theme::set_theme_font_names(
+            Theme::global_mut(cx),
+            &self.ui_font_family,
+            &self.terminal_font_family,
+        );
         cx.notify();
         window.refresh();
     }
 
     pub(crate) fn change_terminal_font_family(&mut self, family: &str, cx: &mut Context<Self>) {
-        self.terminal_font_family = family.into();
+        let installed_fonts = cx.text_system().all_font_names();
+        self.terminal_font_family =
+            crate::app::theme::resolve_terminal_font_family(family, &installed_fonts).into();
         self.config.set_terminal_font_family(family);
         self.save_preferences_background();
+        crate::app::theme::set_theme_font_names(
+            Theme::global_mut(cx),
+            &self.ui_font_family,
+            &self.terminal_font_family,
+        );
         cx.notify();
     }
 
@@ -599,6 +620,157 @@ impl Ashell {
         } else {
             format!("opening {count} saved sessions").into()
         };
+        cx.notify();
+    }
+
+    pub(crate) fn connect_session_folder(&mut self, folder_id: &str, cx: &mut Context<Self>) {
+        let Some(folder) = self
+            .config
+            .session_folders()
+            .iter()
+            .find(|folder| folder.id == folder_id)
+            .cloned()
+        else {
+            self.status = "session folder not found".into();
+            cx.notify();
+            return;
+        };
+
+        let pending_session_ids: HashSet<String> = saved_session_ids_without_connected_tabs(
+            folder.session_ids.iter().map(String::as_str),
+            self.tabs
+                .iter()
+                .map(|tab| (tab.connected, tab.session.as_ref())),
+        )
+        .into_iter()
+        .collect();
+        let sessions_by_id: std::collections::HashMap<_, _> = self
+            .config
+            .sessions()
+            .iter()
+            .map(|session| (session.id.as_str(), session.clone()))
+            .collect();
+        let pending_sessions: Vec<Session> = folder
+            .session_ids
+            .iter()
+            .filter(|session_id| pending_session_ids.contains(session_id.as_str()))
+            .filter_map(|session_id| sessions_by_id.get(session_id.as_str()).cloned())
+            .collect();
+        let count = pending_sessions.len();
+
+        for session in pending_sessions {
+            if session.protocol == "serial" {
+                self.open_serial_session(session, cx);
+            } else {
+                self.open_ssh_session(session, cx);
+            }
+        }
+        self.status = if count == 0 {
+            format!("all sessions in {} are already connected", folder.name).into()
+        } else {
+            format!("opening {count} sessions from {}", folder.name).into()
+        };
+        cx.notify();
+    }
+
+    pub(crate) fn save_session_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let name = self
+            .session_folder_name_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        if name.is_empty() {
+            self.status = "session folder name is required".into();
+            cx.notify();
+            return;
+        }
+
+        let session_ids = self
+            .config
+            .sessions()
+            .iter()
+            .filter(|session| {
+                self.editing_session_folder_members
+                    .contains(session.id.as_str())
+            })
+            .map(|session| session.id.clone())
+            .collect();
+        let folder = if let Some(id) = self.editing_session_folder_id.clone() {
+            SessionFolder {
+                id,
+                name,
+                session_ids,
+            }
+        } else {
+            SessionFolder::new(name, session_ids)
+        };
+        self.config.upsert_session_folder(folder);
+        if let Err(err) = self.config.save() {
+            tracing::warn!("failed to save session folders: {err:#}");
+            self.status = "failed to save session folder".into();
+            cx.notify();
+            return;
+        }
+
+        self.editing_session_folder_id = None;
+        self.editing_session_folder_members.clear();
+        self.active_dialog = None;
+        self.status = "session folder saved".into();
+        window.close_dialog(cx);
+        cx.notify();
+    }
+
+    pub(crate) fn remove_session_folder(&mut self, folder_id: String, cx: &mut Context<Self>) {
+        self.config.remove_session_folder(&folder_id);
+        if let Err(err) = self.config.save() {
+            tracing::warn!("failed to remove session folder: {err:#}");
+            self.status = "failed to remove session folder".into();
+        } else {
+            self.status = "session folder removed".into();
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_session_folder(&mut self, folder_id: &str, cx: &mut Context<Self>) {
+        if !self
+            .collapsed_session_folder_ids
+            .insert(folder_id.to_string())
+        {
+            self.collapsed_session_folder_ids.remove(folder_id);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn add_session_to_folder(
+        &mut self,
+        session_id: String,
+        folder_id: String,
+        move_from_other_folders: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self
+            .config
+            .add_session_to_folder(&session_id, &folder_id, move_from_other_folders)
+        {
+            self.status = "session or folder not found".into();
+            cx.notify();
+            return;
+        }
+        if let Err(err) = self.config.save() {
+            tracing::warn!("failed to update session folder membership: {err:#}");
+            self.status = "failed to update session folder".into();
+            cx.notify();
+            return;
+        }
+        self.active_dialog = None;
+        self.status = if move_from_other_folders {
+            "session moved to folder".into()
+        } else {
+            "session copied to folder".into()
+        };
+        window.close_dialog(cx);
         cx.notify();
     }
 
@@ -997,6 +1169,11 @@ impl Ashell {
     }
 
     pub(crate) fn handle_tab_close(&mut self, id: String) {
+        self.command_history_by_tab.remove(&id);
+        if self.command_history_target_tab.as_deref() == Some(id.as_str()) {
+            self.command_history_panel_open = false;
+            self.command_history_target_tab = None;
+        }
         if self
             .connection_progress
             .as_ref()
@@ -1195,7 +1372,7 @@ impl Ashell {
             }
         }
         if event.button == MouseButton::Left {
-            if event.modifiers.platform {
+            if should_open_terminal_url(event.button, event.modifiers.control) {
                 if let Some((row, col, _side)) = self.terminal_grid_point_and_side(event.position) {
                     if let Some(snapshot) = self.active_snapshot() {
                         if let Some((url, _)) = crate::terminal::highlight::find_url_at_cell(
@@ -1204,7 +1381,10 @@ impl Ashell {
                             row,
                             col,
                         ) {
-                            let _ = open::that(&url);
+                            open_terminal_url(&url);
+                            window.prevent_default();
+                            cx.stop_propagation();
+                            self.terminal_selecting = false;
                             return;
                         }
                     }
@@ -1233,30 +1413,6 @@ impl Ashell {
             .as_ref()
             .and_then(|id| self.tabs.iter().find(|t| &t.id == id))
             .map(|t| t.render_snapshot(self.config.keyword_highlight()))
-    }
-
-    pub(crate) fn active_kind(&self) -> Option<TabKind> {
-        self.active_tab
-            .as_ref()
-            .and_then(|id| self.tabs.iter().find(|t| &t.id == id))
-            .map(|tab| tab.kind)
-    }
-
-    pub(crate) fn active_title(&self) -> String {
-        self.active_tab
-            .as_ref()
-            .and_then(|id| self.tabs.iter().find(|t| &t.id == id))
-            .map(|t| t.title.clone())
-            .unwrap_or_else(|| t!("idle_no_session").into())
-    }
-
-    pub(crate) fn active_ssh_session(&self) -> Option<(String, Session)> {
-        let active_id = self.active_tab.as_ref()?;
-        let tab = self.tabs.iter().find(|tab| &tab.id == active_id)?;
-        if !tab.connected {
-            return None;
-        }
-        Some((tab.id.clone(), tab.session.clone()?))
     }
 
     pub(crate) fn active_session_id(&self) -> Option<&str> {
@@ -1800,5 +1956,12 @@ mod tests {
             saved_session_ids_without_connected_tabs(session_ids, tabs),
             vec!["staging".to_string()]
         );
+    }
+
+    #[test]
+    fn terminal_urls_require_control_and_left_click() {
+        assert!(should_open_terminal_url(MouseButton::Left, true));
+        assert!(!should_open_terminal_url(MouseButton::Left, false));
+        assert!(!should_open_terminal_url(MouseButton::Right, true));
     }
 }

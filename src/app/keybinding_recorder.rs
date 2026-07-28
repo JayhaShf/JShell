@@ -49,82 +49,82 @@ pub(crate) const WORKSPACE_ACTIONS: &[WorkspaceAction] = &[
     WorkspaceAction {
         id: "OpenSettings",
         label_key: "settings_open_settings",
-        default_suffix: ",",
+        default_suffix: "shift-,",
     },
     WorkspaceAction {
         id: "OpenSession",
         label_key: "settings_open_session",
-        default_suffix: "o",
+        default_suffix: "shift-o",
     },
     WorkspaceAction {
         id: "OpenTransfers",
         label_key: "settings_open_transfers",
-        default_suffix: "t",
+        default_suffix: "shift-t",
     },
     WorkspaceAction {
         id: "NewSsh",
         label_key: "settings_new_ssh",
-        default_suffix: "n",
+        default_suffix: "shift-n",
     },
     WorkspaceAction {
         id: "OpenSearch",
         label_key: "settings_open_search",
-        default_suffix: "f",
+        default_suffix: "shift-f",
     },
     WorkspaceAction {
         id: "ToggleSidebar",
         label_key: "settings_toggle_sidebar",
-        default_suffix: "s",
+        default_suffix: "shift-b",
     },
     WorkspaceAction {
         id: "ToggleSftpZoom",
         label_key: "settings_toggle_sftp_zoom",
-        default_suffix: "m",
+        default_suffix: "shift-m",
     },
     WorkspaceAction {
         id: "FocusPaneLeft",
         label_key: "settings_focus_pane_left",
-        default_suffix: "h",
+        default_suffix: "alt-left",
     },
     WorkspaceAction {
         id: "FocusPaneRight",
         label_key: "settings_focus_pane_right",
-        default_suffix: "l",
+        default_suffix: "alt-right",
     },
     WorkspaceAction {
         id: "FocusPaneUp",
         label_key: "settings_focus_pane_up",
-        default_suffix: "k",
+        default_suffix: "alt-up",
     },
     WorkspaceAction {
         id: "FocusPaneDown",
         label_key: "settings_focus_pane_down",
-        default_suffix: "j",
+        default_suffix: "alt-down",
     },
     WorkspaceAction {
         id: "SplitPaneLeft",
         label_key: "settings_split_pane_left",
-        default_suffix: "shift-h",
+        default_suffix: "alt-shift-left",
     },
     WorkspaceAction {
         id: "SplitPaneRight",
         label_key: "settings_split_pane_right",
-        default_suffix: "shift-l",
+        default_suffix: "alt-shift-right",
     },
     WorkspaceAction {
         id: "SplitPaneUp",
         label_key: "settings_split_pane_up",
-        default_suffix: "shift-k",
+        default_suffix: "alt-shift-up",
     },
     WorkspaceAction {
         id: "SplitPaneDown",
         label_key: "settings_split_pane_down",
-        default_suffix: "shift-j",
+        default_suffix: "alt-shift-down",
     },
     WorkspaceAction {
         id: "ClosePane",
         label_key: "settings_close_pane",
-        default_suffix: "w",
+        default_suffix: "shift-w",
     },
     WorkspaceAction {
         id: "Copy",
@@ -467,8 +467,9 @@ impl KeybindingsPage {
 
 #[cfg(test)]
 mod tests {
-    use super::action_key_context;
+    use super::{WORKSPACE_ACTIONS, action_key_context, default_keystroke};
     use crate::app::constants::{DOCUMENT_KEY_CONTEXT, TERMINAL_KEY_CONTEXT};
+    use gpui::Keystroke;
 
     #[test]
     fn assigns_terminal_and_document_actions_to_separate_contexts() {
@@ -482,5 +483,53 @@ mod tests {
             Some(DOCUMENT_KEY_CONTEXT)
         );
         assert_eq!(action_key_context("OpenSettings"), None);
+    }
+
+    #[test]
+    fn terminal_defaults_do_not_capture_plain_control_letters() {
+        for action in WORKSPACE_ACTIONS {
+            if action_key_context(action.id) != Some(TERMINAL_KEY_CONTEXT) {
+                continue;
+            }
+
+            let keystroke = default_keystroke(action.id).unwrap();
+            assert!(
+                Keystroke::parse(&keystroke).is_ok(),
+                "{} has an invalid default key {}",
+                action.id,
+                keystroke
+            );
+            let is_plain_control_letter = keystroke
+                .strip_prefix("ctrl-")
+                .is_some_and(|key| key.len() == 1 && key.as_bytes()[0].is_ascii_alphabetic());
+            assert!(
+                !is_plain_control_letter,
+                "{} must not capture Linux terminal key {}",
+                action.id, keystroke
+            );
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn windows_and_linux_defaults_use_terminal_safe_modifiers() {
+        assert_eq!(
+            default_keystroke("OpenSettings").as_deref(),
+            Some("ctrl-shift-,")
+        );
+        assert_eq!(
+            default_keystroke("OpenSession").as_deref(),
+            Some("ctrl-shift-o")
+        );
+        assert_eq!(default_keystroke("Copy").as_deref(), Some("ctrl-shift-c"));
+        assert_eq!(default_keystroke("Paste").as_deref(), Some("ctrl-shift-v"));
+        assert_eq!(
+            default_keystroke("FocusPaneLeft").as_deref(),
+            Some("ctrl-alt-left")
+        );
+        assert_eq!(
+            default_keystroke("SplitPaneRight").as_deref(),
+            Some("ctrl-alt-shift-right")
+        );
     }
 }

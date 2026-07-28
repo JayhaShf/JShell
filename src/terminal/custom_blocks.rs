@@ -2,6 +2,7 @@ use gpui::{Bounds, Hsla, Path, Pixels, Window, fill, point, px, size};
 
 pub fn is_custom_block_supported(c: char) -> bool {
     match c as u32 {
+        0x25CF => true,                                     // Black Circle
         0x2580..=0x258F | 0x2590 | 0x2594..=0x259F => true, // Block Elements
         0x2500 | 0x2502 | 0x250C | 0x2510 | 0x2514 | 0x2518 | 0x251C | 0x2524 | 0x252C | 0x2534
         | 0x253C => true, // Light lines
@@ -50,6 +51,22 @@ pub fn paint_custom_block(
     let cy = y + h / 2.0;
 
     match c as u32 {
+        // Some CJK fallbacks store this ambiguous-width glyph at a full CJK advance.
+        // Draw it inside one terminal cell so the following glyph cannot overlap it.
+        0x25CF => {
+            let diameter = (w * 0.72).min(h * 0.38);
+            let left = cx - diameter / 2.0;
+            let top = cy - diameter / 2.0;
+            window.paint_quad(
+                fill(
+                    Bounds::new(point(left, top), size(diameter, diameter)),
+                    color,
+                )
+                .corner_radii(diameter / 2.0),
+            );
+            painted = true;
+        }
+
         // --- Block Elements (U+2580..=U+259F) ---
         0x2580 => paint_quad(x, y, w, h / 2.0),
         0x2581 => paint_quad(x, y + h * 7.0 / 8.0, w, h / 8.0),
@@ -334,4 +351,14 @@ pub fn paint_custom_block(
     }
 
     painted
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_custom_block_supported;
+
+    #[test]
+    fn black_circle_uses_cell_fitted_custom_rendering() {
+        assert!(is_custom_block_supported('\u{25cf}'));
+    }
 }

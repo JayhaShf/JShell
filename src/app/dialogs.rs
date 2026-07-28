@@ -6,6 +6,7 @@ use gpui::{
 use gpui_component::{
     ActiveTheme as _, Disableable as _, IconName, Sizable as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
+    checkbox::Checkbox,
     dialog::Dialog,
     h_flex,
     input::Input,
@@ -18,6 +19,26 @@ use gpui_component::{
 use rust_i18n::t;
 
 use crate::{Ashell, session::config::AuthMethod, system::format_bytes};
+
+fn open_completed_download_target_with<E>(
+    target: &str,
+    opener: impl FnOnce(&str) -> Result<(), E>,
+) -> Result<(), String>
+where
+    E: std::fmt::Display,
+{
+    opener(target).map_err(|error| error.to_string())
+}
+
+fn open_completed_download_target(target: &str) {
+    if let Err(error) = open_completed_download_target_with(target, |target| open::that(target)) {
+        tracing::warn!(
+            target = target,
+            %error,
+            "failed to open completed download target"
+        );
+    }
+}
 
 impl Ashell {
     pub(crate) fn show_window_close_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -749,6 +770,170 @@ impl Ashell {
             window.focus(&focus_host_input.read(cx).focus_handle(cx), cx);
         });
     }
+
+    pub(crate) fn show_session_folder_dialog(
+        &mut self,
+        folder_id: Option<String>,
+        initial_session_id: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active_dialog.is_some() {
+            return;
+        }
+
+        let existing_folder = folder_id
+            .as_deref()
+            .and_then(|id| {
+                self.config
+                    .session_folders()
+                    .iter()
+                    .find(|folder| folder.id == id)
+            })
+            .cloned();
+        self.active_dialog = Some(crate::app::DialogKind::SessionFolder);
+        self.editing_session_folder_id = existing_folder.as_ref().map(|folder| folder.id.clone());
+        self.editing_session_folder_members = existing_folder
+            .as_ref()
+            .map(|folder| folder.session_ids.iter().cloned().collect())
+            .unwrap_or_default();
+        if existing_folder.is_none()
+            && let Some(session_id) = initial_session_id
+            && self.config.get(&session_id).is_some()
+        {
+            self.editing_session_folder_members.insert(session_id);
+        }
+        Self::set_input_value(
+            &self.session_folder_name_input,
+            existing_folder
+                .as_ref()
+                .map(|folder| folder.name.clone())
+                .unwrap_or_default(),
+            window,
+            cx,
+        );
+
+        let is_editing = existing_folder.is_some();
+        let sessions = self.config.sessions().to_vec();
+        let folder_name_input = self.session_folder_name_input.clone();
+        let view = cx.entity();
+        window.open_dialog(cx, move |dialog: Dialog, _window, _| {
+            dialog
+                .title(if is_editing {
+                    t!("edit_session_folder").to_string()
+                } else {
+                    t!("new_session_folder").to_string()
+                })
+                .w(px(480.))
+                .on_close({
+                    let view = view.clone();
+                    move |_, _, cx| {
+                        view.update(cx, |this, cx| {
+                            this.active_dialog = None;
+                            this.editing_session_folder_id = None;
+                            this.editing_session_folder_members.clear();
+                            cx.notify();
+                        });
+                    }
+                })
+                .content({
+                    let view = view.clone();
+                    let folder_name_input = folder_name_input.clone();
+                    let sessions = sessions.clone();
+                    move |content, window, cx| {
+                        let selected_members = view.read(cx).editing_session_folder_members.clone();
+                        content
+                            .child(
+                                v_flex()
+                                    .gap_2()
+                                    .child(div().text_sm().child(t!("folder_name").to_string()))
+                                    .child(Input::new(&folder_name_input).w_full().tab_index(0)),
+                            )
+                            .child(
+                                v_flex()
+                                    .mt_4()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .child(t!("sessions_in_folder").to_string()),
+                                    )
+                                    .child(
+                                        v_flex()
+                                            .w_full()
+                                            .max_h(px(260.))
+                                            .overflow_y_scrollbar()
+                                            .border_1()
+                                            .border_color(cx.theme().border)
+                                            .rounded_sm()
+                                            .children(sessions.iter().enumerate().map(
+                                                |(index, session)| {
+                                                    let session_id = session.id.clone();
+                                                    let checked = selected_members.contains(&session_id);
+                                                    let detail = format!("{}@{}:{}", session.user, session.host, session.port);
+                                                    h_flex()
+                                                        .id(("folder-session", index))
+                                                        .w_full()
+                                                        .items_center()
+                                                        .gap_2()
+                                                        .px_3()
+                                                        .py_2()
+                                                        .when(index > 0, |row| {
+                                                            row.border_t_1().border_color(cx.theme().border)
+                                                        })
+                                                        .child(
+                                                            Checkbox::new(format!("folder-session-check-{}", session.id))
+                                                                .checked(checked)
+                                                                .on_click(window.listener_for(&view, move |this, checked, _, cx| {
+                                                                    if *checked {
+                                                                        this.editing_session_folder_members.insert(session_id.clone());
+                                                                    } else {
+                                                                        this.editing_session_folder_members.remove(&session_id);
+                                                                    }
+                                                                    cx.notify();
+                                                                })),
+                                                        )
+                                                        .child(
+                                                            v_flex()
+                                                                .min_w(px(0.))
+                                                                .gap_1()
+                                                                .child(div().text_sm().child(session.name.clone()))
+                                                                .child(
+                                                                    div()
+                                                                        .text_size(rems(0.75))
+                                                                        .text_color(cx.theme().muted_foreground)
+                                                                        .child(detail),
+                                                                ),
+                                                        )
+                                                },
+                                            )),
+                                    ),
+                            )
+                            .child(
+                                h_flex()
+                                    .mt_5()
+                                    .justify_end()
+                                    .gap_2()
+                                    .child(
+                                        Button::new("session-folder-cancel")
+                                            .ghost()
+                                            .label(t!("cancel").to_string())
+                                            .on_click(|_, window, cx| window.close_dialog(cx)),
+                                    )
+                                    .child(
+                                        Button::new("session-folder-save")
+                                            .primary()
+                                            .label(t!("save").to_string())
+                                            .on_click(window.listener_for(&view, |this, _, window, cx| {
+                                                this.save_session_folder(window, cx);
+                                            })),
+                                    ),
+                            )
+                    }
+                })
+        });
+    }
+
     pub(crate) fn show_selector_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_dialog.is_some() {
             return;
@@ -1257,9 +1442,7 @@ impl Ashell {
                                         .on_click({
                                             let target = t.info.target.clone();
                                             move |_, _, _| {
-                                                let _ = std::process::Command::new("open")
-                                                    .arg(&target)
-                                                    .spawn();
+                                                open_completed_download_target(&target);
                                             }
                                         });
                                         actions = actions.child(btn_folder);
@@ -1998,15 +2181,31 @@ impl Ashell {
                                                                     .small()
                                                                     .icon(IconName::ChevronsUpDown)
                                                                     .label({
-                                                                        let current = view.read(cx).terminal_font_family.to_string();
-                                                                        current
+                                                                        let state = view.read(cx);
+                                                                        let configured = state.config.terminal_font_family();
+                                                                        if configured == crate::session::config::SYSTEM_MONOSPACE_FONT || configured.is_empty() {
+                                                                            format!(
+                                                                                "{} ({})",
+                                                                                t!("system_default"),
+                                                                                state.terminal_font_family,
+                                                                            )
+                                                                        } else {
+                                                                            configured.to_string()
+                                                                        }
                                                                     })
                                                                     .dropdown_menu_with_anchor(Anchor::BottomRight, {
                                                                         let view = view.clone();
                                                                         move |mut menu, window, cx| {
-                                                                            let current = view.read(cx).terminal_font_family.to_string();
+                                                                            let current = view.read(cx).config.terminal_font_family().to_string();
                                                                             let names = cx.text_system().all_font_names();
                                                                             menu = menu.min_w(200.).max_h(px(320.)).scrollable(true);
+                                                                            menu = menu.item(
+                                                                                PopupMenuItem::new(t!("system_default").to_string())
+                                                                                    .checked(current == crate::session::config::SYSTEM_MONOSPACE_FONT || current.is_empty())
+                                                                                    .on_click(window.listener_for(&view, move |this, _, _window, cx| {
+                                                                                        this.change_terminal_font_family(crate::session::config::SYSTEM_MONOSPACE_FONT, cx);
+                                                                                    }))
+                                                                            );
                                                                             for name in names {
                                                                                 let checked = name == current;
                                                                                 menu = menu.item(
@@ -2269,6 +2468,32 @@ impl Ashell {
                                                     ).description(t!("reset_layout_hint").to_string())
                                                 )
                                         )
+                                        .group(
+                                            SettingGroup::new()
+                                                .title(t!("settings_group_plugins").to_string())
+                                                .item(
+                                                    SettingItem::new(
+                                                        t!("plugin_history_completion").to_string(),
+                                                        SettingField::render({
+                                                            let view = view_clone_for_general.clone();
+                                                            move |_, window, cx| {
+                                                                Switch::new("history-completion-plugin")
+                                                                    .small()
+                                                                    .checked(view.read(cx).config.history_completion_plugin_enabled())
+                                                                    .on_click(window.listener_for(&view, |this, checked, _, cx| {
+                                                                        this.config.set_history_completion_plugin_enabled(*checked);
+                                                                        if !*checked {
+                                                                            this.clear_terminal_completion_inputs();
+                                                                        }
+                                                                        this.save_preferences_background();
+                                                                        cx.notify();
+                                                                    }))
+                                                                    .into_any_element()
+                                                            }
+                                                        })
+                                                    )
+                                                )
+                                        )
                                 )
                                 .page(
                                     SettingPage::new(t!("settings_config_file").to_string())
@@ -2508,29 +2733,81 @@ impl Ashell {
                                             SettingGroup::new()
                                                 .item(SettingItem::render(move |_, _window, cx| {
                                                     v_flex()
-                                                        .gap_2()
-                                                        .items_center()
-                                                        .child(div().text_size(rems(1.5)).font_weight(FontWeight::BOLD).child("Ashell"))
-                                                        .child(div().text_size(rems(0.9)).child(format!("Version {}", version)))
+                                                        .gap_1()
+                                                        .child(div().text_size(rems(1.35)).font_weight(FontWeight::BOLD).child("Ashell"))
                                                         .child(
                                                             div()
-                                                                .text_size(rems(0.9))
+                                                                .text_size(rems(0.833))
                                                                 .text_color(cx.theme().muted_foreground)
-                                                                .child("A GPUI Component based SSH and local terminal client"),
+                                                                .child(format!("{} {}", t!("about_version"), version)),
                                                         )
                                                         .child(
                                                             div()
+                                                                .mt_2()
                                                                 .text_size(rems(0.9))
+                                                                .text_color(cx.theme().muted_foreground)
+                                                                .child(t!("about_summary")),
+                                                        )
+                                                }))
+                                        )
+                                        .group(
+                                            SettingGroup::new()
+                                                .title(t!("about_workspace").to_string())
+                                                .item(SettingItem::render(move |_, _window, cx| {
+                                                    v_flex()
+                                                        .gap_2()
+                                                        .child(
+                                                            div()
+                                                                .text_size(rems(0.833))
+                                                                .text_color(cx.theme().muted_foreground)
+                                                                .child(t!("about_workspace_features")),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .text_size(rems(0.833))
+                                                                .text_color(cx.theme().muted_foreground)
+                                                                .child(t!("about_workspace_runtime")),
+                                                        )
+                                                }))
+                                        )
+                                        .group(
+                                            SettingGroup::new()
+                                                .title(t!("about_project").to_string())
+                                                .item(SettingItem::render(move |_, _window, cx| {
+                                                    v_flex()
+                                                        .gap_3()
+                                                        .child(
+                                                            div()
+                                                                .text_size(rems(0.833))
+                                                                .text_color(cx.theme().muted_foreground)
+                                                                .child(t!("about_acknowledgement")),
+                                                        )
+                                                        .child(
+                                                            h_flex()
+                                                                .gap_2()
+                                                                .child(
+                                                                    Button::new("github-project-link")
+                                                                        .small()
+                                                                        .label(t!("about_project_home").to_string())
+                                                                        .on_click(|_, _window, _cx| {
+                                                                            let _ = open::that("https://github.com/JayhaShf/ashell");
+                                                                        }),
+                                                                )
+                                                                .child(
+                                                                    Button::new("github-upstream-link")
+                                                                        .ghost()
+                                                                        .small()
+                                                                        .label(t!("about_upstream_project").to_string())
+                                                                        .on_click(|_, _window, _cx| {
+                                                                            let _ = open::that("https://github.com/rust-kotlin/ashell");
+                                                                        }),
+                                                                ),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .text_size(rems(0.75))
                                                                 .text_color(cx.theme().muted_foreground)
                                                                 .child(t!("about_feedback_hint")),
-                                                        )
-                                                        .child(
-                                                            Button::new("github-link")
-                                                                .label("https://github.com/rust-kotlin/ashell")
-                                                                .ghost()
-                                                                .on_click(|_, _window, _cx| {
-                                                                    let _ = open::that("https://github.com/rust-kotlin/ashell");
-                                                                }),
                                                         )
                                                 }))
                                         )
@@ -2540,5 +2817,31 @@ impl Ashell {
                     }
                 })
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completed_download_target_is_forwarded_to_platform_opener() {
+        let mut opened = None;
+        let result = open_completed_download_target_with("C:/Downloads/archive.zip", |target| {
+            opened = Some(target.to_string());
+            Ok::<(), &'static str>(())
+        });
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(opened.as_deref(), Some("C:/Downloads/archive.zip"));
+    }
+
+    #[test]
+    fn completed_download_open_error_is_preserved_for_logging() {
+        let result = open_completed_download_target_with("C:/Downloads/archive.zip", |_| {
+            Err::<(), _>("cannot open")
+        });
+
+        assert_eq!(result, Err("cannot open".to_string()));
     }
 }

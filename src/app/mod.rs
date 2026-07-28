@@ -1,3 +1,4 @@
+pub mod command_history;
 pub mod config_sync;
 pub mod constants;
 pub mod dialogs;
@@ -197,6 +198,7 @@ impl ScrollbarHandle for TerminalScrollbarHandle {
 pub(crate) enum DialogKind {
     Settings,
     SessionSelector,
+    SessionFolder,
     Transfers,
     NewSsh,
 }
@@ -206,6 +208,7 @@ pub(crate) struct Ashell {
     pub(crate) selector_focus_handle: FocusHandle,
     pub(crate) host_input: Entity<InputState>,
     pub(crate) session_name_input: Entity<InputState>,
+    pub(crate) session_folder_name_input: Entity<InputState>,
     pub(crate) port_input: Entity<InputState>,
     pub(crate) user_input: Entity<InputState>,
     pub(crate) password_input: Entity<InputState>,
@@ -242,12 +245,16 @@ pub(crate) struct Ashell {
     pub(crate) ssh_config_entries: Vec<SshConfigEntry>,
     pub(crate) ssh_config_selected: Option<usize>,
     pub(crate) editing_session_id: Option<String>,
+    pub(crate) editing_session_folder_id: Option<String>,
+    pub(crate) editing_session_folder_members: std::collections::HashSet<String>,
+    pub(crate) collapsed_session_folder_ids: std::collections::HashSet<String>,
     pub(crate) follow_system_theme: bool,
     pub(crate) theme_mode: ThemeMode,
     pub(crate) light_theme_name: SharedString,
     pub(crate) dark_theme_name: SharedString,
     pub(crate) ui_font_size: f32,
     pub(crate) terminal_font_size: f32,
+    pub(crate) terminal_cell_width: f32,
     pub(crate) terminal_zoom_accumulator: f32,
     pub(crate) ui_font_family: SharedString,
     pub(crate) terminal_font_family: SharedString,
@@ -293,6 +300,7 @@ pub(crate) struct Ashell {
     pub(crate) terminal_marked_text: Option<String>,
     pub(crate) sftp_panel_minimized: bool,
     pub(crate) sidebar_collapsed: bool,
+    #[allow(dead_code)]
     pub(crate) collapsed_saved_scroll_handle: gpui::ScrollHandle,
     pub(crate) prev_monitoring_size: Option<Pixels>,
     pub(crate) status: SharedString,
@@ -320,6 +328,14 @@ pub(crate) struct Ashell {
     pub(crate) search_target_tab: Option<String>,
     pub(crate) search_bar_bounds: Option<Bounds<Pixels>>,
 
+    pub(crate) command_history_input: Entity<InputState>,
+    pub(crate) command_bar_input: Entity<InputState>,
+    pub(crate) command_bar_open: bool,
+    pub(crate) command_history_panel_open: bool,
+    pub(crate) command_history_target_tab: Option<String>,
+    pub(crate) command_history_by_tab: HashMap<String, RemoteCommandHistoryState>,
+    pub(crate) command_history_scroll_handle: gpui::ScrollHandle,
+
     pub(crate) system_tab_id: Option<String>,
     pub(crate) sftp_handles: std::collections::HashMap<String, crate::sftp::SftpHandle>,
 
@@ -330,10 +346,18 @@ pub(crate) struct Ashell {
     pub(crate) last_window_size: Option<gpui::Size<Pixels>>,
     pub(crate) last_sidebar_width: Option<Pixels>,
     pub(crate) hovered_url: Option<HoveredUrl>,
-    pub(crate) cmd_ctrl_pressed: bool,
+    pub(crate) terminal_link_ctrl_pressed: bool,
     pub(crate) _subscriptions: Vec<gpui::Subscription>,
     pub(crate) save_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
     pub(crate) save_latest_seq: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RemoteCommandHistoryState {
+    pub(crate) entries: Vec<String>,
+    pub(crate) loading: bool,
+    pub(crate) error: Option<String>,
+    pub(crate) input_buffer: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -390,6 +414,8 @@ impl Ashell {
         let host_input = cx.new(|cx| InputState::new(window, cx).placeholder(t!("host")));
         let session_name_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("name (optional)"));
+        let session_folder_name_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Folder name"));
         let port_input = cx.new(|cx| InputState::new(window, cx).default_value("22"));
         let user_input = cx.new(|cx| InputState::new(window, cx).default_value("root"));
         let password_input = cx.new(|cx| {
@@ -427,6 +453,12 @@ impl Ashell {
             cx.new(|cx| InputState::new(window, cx).placeholder(t!("new_folder").to_string()));
         let search_input =
             cx.new(|cx| InputState::new(window, cx).placeholder(t!("search").to_string()));
+        let command_history_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(t!("command_history_search").to_string())
+        });
+        let command_bar_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(t!("command_bar_placeholder").to_string())
+        });
         let config = ConfigStore::load().unwrap_or_else(|err| {
             tracing::warn!("failed to load config: {err:#}");
             ConfigStore::in_memory()
@@ -514,6 +546,7 @@ impl Ashell {
         let _subscriptions = vec![
             cx.subscribe_in(&host_input, window, Self::on_input_event),
             cx.subscribe_in(&session_name_input, window, Self::on_input_event),
+            cx.subscribe_in(&session_folder_name_input, window, Self::on_input_event),
             cx.subscribe_in(&port_input, window, Self::on_input_event),
             cx.subscribe_in(&user_input, window, Self::on_input_event),
             cx.subscribe_in(&password_input, window, Self::on_input_event),
@@ -528,6 +561,8 @@ impl Ashell {
             cx.subscribe_in(&sftp_path_input, window, Self::on_input_event),
             cx.subscribe_in(&sftp_new_folder_input, window, Self::on_input_event),
             cx.subscribe_in(&search_input, window, Self::on_input_event),
+            cx.subscribe_in(&command_history_input, window, Self::on_input_event),
+            cx.subscribe_in(&command_bar_input, window, Self::on_input_event),
             cx.subscribe_in(&sync_endpoint_input, window, Self::on_input_event),
             cx.subscribe_in(&sync_username_input, window, Self::on_input_event),
             cx.subscribe_in(&sync_webdav_password_input, window, Self::on_input_event),
@@ -575,7 +610,12 @@ impl Ashell {
         rust_i18n::set_locale(&active_locale);
         gpui_component::set_locale(&active_locale);
         let ui_font_family: SharedString = config.ui_font_family().into();
-        let terminal_font_family: SharedString = config.terminal_font_family().into();
+        let installed_fonts = cx.text_system().all_font_names();
+        let terminal_font_family: SharedString = crate::app::theme::resolve_terminal_font_family(
+            config.terminal_font_family(),
+            &installed_fonts,
+        )
+        .into();
         let last_sidebar_width = Some(px(config
             .workspace_panels()
             .and_then(|s| s.first().copied())
@@ -585,6 +625,7 @@ impl Ashell {
             selector_focus_handle: cx.focus_handle(),
             host_input,
             session_name_input,
+            session_folder_name_input,
             port_input,
             user_input,
             password_input,
@@ -621,12 +662,19 @@ impl Ashell {
             ssh_config_entries: crate::session::ssh_config::parse_ssh_config().unwrap_or_default(),
             ssh_config_selected: None,
             editing_session_id: None,
+            editing_session_folder_id: None,
+            editing_session_folder_members: std::collections::HashSet::new(),
+            collapsed_session_folder_ids: std::collections::HashSet::new(),
             follow_system_theme,
             theme_mode,
             light_theme_name,
             dark_theme_name,
             ui_font_size: config.ui_font_size(),
             terminal_font_size: config.terminal_font_size(),
+            terminal_cell_width: crate::app::constants::terminal_cell_width_from_measurement(
+                f32::NAN,
+                config.terminal_font_size(),
+            ),
             terminal_zoom_accumulator: 0.0,
             cursor_style: config.cursor_style(),
             ui_font_family,
@@ -710,6 +758,14 @@ impl Ashell {
             search_target_tab: None,
             search_bar_bounds: None,
 
+            command_history_input,
+            command_bar_input,
+            command_bar_open: false,
+            command_history_panel_open: false,
+            command_history_target_tab: None,
+            command_history_by_tab: HashMap::new(),
+            command_history_scroll_handle: gpui::ScrollHandle::new(),
+
             system_tab_id: None,
             sftp_handles: std::collections::HashMap::new(),
 
@@ -720,7 +776,7 @@ impl Ashell {
             last_window_size: None,
             last_sidebar_width,
             hovered_url: None,
-            cmd_ctrl_pressed: false,
+            terminal_link_ctrl_pressed: false,
             _subscriptions,
             save_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             save_latest_seq: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -850,6 +906,12 @@ impl Ashell {
                 window.prevent_default();
                 cx.stop_propagation();
             }
+        } else if input == &self.command_bar_input {
+            if let InputEvent::PressEnter { .. } = event {
+                self.execute_command_bar_input(window, cx);
+                window.prevent_default();
+                cx.stop_propagation();
+            }
         }
         cx.notify();
     }
@@ -948,6 +1010,13 @@ impl Ashell {
                     self.sync_system_tab_to_active_group();
                     self.request_active_system_snapshot();
                     if self
+                        .tabs
+                        .iter()
+                        .any(|tab| tab.id == tab_id && tab.kind == TabKind::Ssh)
+                    {
+                        self.start_command_history_load(&tab_id);
+                    }
+                    if self
                         .connection_progress
                         .as_ref()
                         .is_some_and(|progress| progress.tab_id == tab_id && !progress.failed)
@@ -1011,6 +1080,17 @@ impl Ashell {
                         self.system_status = Some(reason.clone().into());
                         self.status = reason.into();
                     }
+                }
+                BackendEvent::CommandHistory { tab_id, entries } => {
+                    let history = self.command_history_by_tab.entry(tab_id).or_default();
+                    history.entries = entries;
+                    history.loading = false;
+                    history.error = None;
+                }
+                BackendEvent::CommandHistoryUnavailable { tab_id, reason } => {
+                    let history = self.command_history_by_tab.entry(tab_id).or_default();
+                    history.loading = false;
+                    history.error = Some(reason);
                 }
                 BackendEvent::Closed { tab_id, reason } => {
                     self.remote_sample_in_flight = false;

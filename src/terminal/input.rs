@@ -3,8 +3,8 @@ use std::ops::Range;
 use alacritty_terminal::index::Side;
 use alacritty_terminal::selection::SelectionType;
 use gpui::{
-    ClipboardItem, Context, Focusable as _, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollDelta, ScrollWheelEvent, Window, px,
+    Context, Focusable as _, KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Point, ScrollDelta, ScrollWheelEvent, Window, px,
 };
 
 use crate::{
@@ -23,7 +23,7 @@ impl Ashell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.cmd_ctrl_pressed = event.keystroke.modifiers.platform;
+        self.terminal_link_ctrl_pressed = event.keystroke.modifiers.control;
         // If the search input is focused, skip terminal key processing
         // so the input can handle text entry, paste, etc. normally.
         if self
@@ -31,86 +31,18 @@ impl Ashell {
             .read(cx)
             .focus_handle(cx)
             .is_focused(window)
+            || self
+                .command_history_input
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+            || self
+                .command_bar_input
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
         {
             return;
-        }
-
-        // Pane navigation: Alt + h/j/k/l
-        if event.keystroke.modifiers.alt
-            && !event.keystroke.modifiers.shift
-            && !event.keystroke.modifiers.control
-            && !event.keystroke.modifiers.platform
-        {
-            match event.keystroke.key.to_ascii_lowercase().as_str() {
-                "h" => self.focus_adjacent_pane("left", cx),
-                "j" => self.focus_adjacent_pane("down", cx),
-                "k" => self.focus_adjacent_pane("up", cx),
-                "l" => self.focus_adjacent_pane("right", cx),
-                "q" => {
-                    if let Some(active_id) = self.active_tab.clone() {
-                        self.close_tab(active_id, cx);
-                    }
-                }
-                _ => return,
-            }
-            window.prevent_default();
-            cx.stop_propagation();
-            cx.notify();
-            return;
-        }
-
-        // Pane split: Shift+Alt + h/j/k/l
-        if event.keystroke.modifiers.shift
-            && event.keystroke.modifiers.alt
-            && !event.keystroke.modifiers.control
-            && !event.keystroke.modifiers.platform
-        {
-            let direction = match event.keystroke.key.to_ascii_lowercase().as_str() {
-                "h" => Some("left"),
-                "j" => Some("down"),
-                "k" => Some("up"),
-                "l" => Some("right"),
-                _ => None,
-            };
-            if let Some(dir) = direction {
-                self.split_current_pane(dir, cx);
-                window.prevent_default();
-                cx.stop_propagation();
-                cx.notify();
-                return;
-            }
-        }
-
-        if event.keystroke.modifiers.secondary() && event.keystroke.key == "," {
-            self.show_settings_dialog(window, cx);
-            window.prevent_default();
-            cx.stop_propagation();
-            return;
-        }
-        if event.keystroke.modifiers.shift
-            && event.keystroke.modifiers.secondary()
-            && event.keystroke.key == "o"
-        {
-            self.show_selector_dialog(window, cx);
-            window.prevent_default();
-            cx.stop_propagation();
-            return;
-        }
-        if event.keystroke.modifiers.secondary() && event.keystroke.key.eq_ignore_ascii_case("c") {
-            if let Some(text) = self.active_terminal_selection_text() {
-                cx.write_to_clipboard(ClipboardItem::new_string(text));
-                window.prevent_default();
-                cx.stop_propagation();
-                return;
-            }
-        }
-        if event.keystroke.modifiers.secondary() && event.keystroke.key.eq_ignore_ascii_case("v") {
-            if let Some(clipboard) = cx.read_from_clipboard() {
-                if let Some(text) = clipboard.text() {
-                    self.paste_into_terminal(&text, window, cx);
-                    return;
-                }
-            }
         }
 
         // If the active tab is disconnected and user presses Enter, reconnect
@@ -171,9 +103,23 @@ impl Ashell {
         tab.clear_selection();
 
         if let Some(bytes) = encode_key(&event.keystroke, tab.app_cursor_mode(), false) {
-            tab.send_backend(BackendCommand::Input(bytes));
+            tab.send_backend(BackendCommand::Input(bytes.clone()));
+            self.record_terminal_input_bytes(&active_id, &bytes);
             window.prevent_default();
             cx.stop_propagation();
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn on_terminal_key_up(
+        &mut self,
+        event: &KeyUpEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let control = event.keystroke.modifiers.control;
+        if self.terminal_link_ctrl_pressed != control {
+            self.terminal_link_ctrl_pressed = control;
             cx.notify();
         }
     }
@@ -200,6 +146,7 @@ impl Ashell {
         let Some(active_id) = self.active_tab.clone() else {
             return;
         };
+        self.record_terminal_input_bytes(&active_id, &bytes);
         let Some(tab) = self.tabs.iter_mut().find(|t| t.id == active_id) else {
             return;
         };
@@ -232,6 +179,7 @@ impl Ashell {
         let Some(active_id) = self.active_tab.clone() else {
             return;
         };
+        self.record_terminal_paste(&active_id, text);
         let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == active_id) else {
             return;
         };
@@ -287,6 +235,7 @@ impl Ashell {
         let Some(active_id) = self.active_tab.clone() else {
             return;
         };
+        self.record_terminal_input_bytes(&active_id, text.as_bytes());
         let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == active_id) else {
             return;
         };
@@ -383,7 +332,7 @@ impl Ashell {
 
         // Track URL hover
         let mut hovered_url = None;
-        let cmd_ctrl_pressed = event.modifiers.platform;
+        let ctrl_pressed = event.modifiers.control;
         if let Some((row, col, _side)) = self.terminal_grid_point_and_side(event.position) {
             if let Some(snapshot) = self.active_snapshot() {
                 if let Some(active_id) = &self.active_tab {
@@ -403,9 +352,9 @@ impl Ashell {
             }
         }
 
-        if self.hovered_url != hovered_url || self.cmd_ctrl_pressed != cmd_ctrl_pressed {
+        if self.hovered_url != hovered_url || self.terminal_link_ctrl_pressed != ctrl_pressed {
             self.hovered_url = hovered_url;
-            self.cmd_ctrl_pressed = cmd_ctrl_pressed;
+            self.terminal_link_ctrl_pressed = ctrl_pressed;
             cx.notify();
         }
 

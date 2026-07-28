@@ -24,6 +24,8 @@ impl Ashell {
     }
 
     pub(crate) fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.command_history_panel_open = false;
+        self.command_history_target_tab = None;
         self.search_active = true;
         // Focus the search input on the next frame so it happens after the
         // current render cycle completes, avoiding focus being stolen back
