@@ -1,10 +1,10 @@
 [中文](README.md) | [English](README.en.md)
 
-# ashell
+# JShell
 
 ![Preview](preview.png)
 
-`ashell` is a modern, GPUI Component-based desktop terminal client written in Rust.
+`JShell` is a modern, GPUI Component-based desktop terminal client written in Rust, reworked from upstream Ashell for Windows-focused SSH workflows.
 
 This project focuses on providing a high-performance and visually appealing shell workspace by combining local and remote environments with a rich set of built-in features. 
 
@@ -61,7 +61,7 @@ The current version provides a fully-featured GPUI-native workspace:
 - **SFTP Integration:** Built-in SFTP file manager to browse, upload, download, and manage remote files.
 - **Robust Terminal Emulator:** Parses terminal output with `alacritty_terminal`, supporting rich ANSI color spans, fast rendering, and complete keyboard input forwarding.
 - **System Telemetry:** Real-time visualization of CPU, memory, swap, network, and disk metrics in the left cockpit sidebar.
-- **Theming System:** Choose Ashell Light, Ashell Dark, or VS Code Dark. The Ashell light and dark themes use monochrome palettes, while VS Code Dark uses blue active accents.
+- **Theming System:** Choose JShell Light, JShell Dark, or VS Code Dark. The JShell light and dark themes use monochrome palettes, while VS Code Dark uses blue active accents.
 - **Default Fonts:** The UI uses bundled `NotoSansCJKsc-Regular.otf`. Terminals follow the system monospace font and measure the selected font's real glyph advance for the grid; bundled `NotoSansMonoCJKsc-Regular.otf` remains available as a fallback for missing fonts and CJK glyphs.
 - **Windows Title Bar:** A compact custom Windows-style title bar follows the active theme and places minimize, maximize, and close controls on the right.
 - **v0.3 Core Enhancements:** Global font and font-size controls, concurrent SFTP transfers, persistent layout state, disconnect awareness, hot-swappable i18n, and smart terminal right-click copy/paste.
@@ -78,7 +78,7 @@ cargo run --release
 
 ```bash
 ./scripts/package-macos-app.sh
-open target/release/ashell.app
+open target/release/JShell.app
 ```
 
 The packaging script creates a standard `.app` bundle. It does not attach an entitlements file, and after signing, it verifies that `com.apple.security.app-sandbox` is not present (meaning it runs non-sandboxed).

@@ -134,7 +134,7 @@ impl Ashell {
     ) {
         let local_config = self.config.cache.clone();
         let file_dialog = rfd::AsyncFileDialog::new()
-            .set_file_name("ashell-config.json")
+            .set_file_name("jshell-config.json")
             .add_filter("JSON", &["json"])
             .save_file();
 

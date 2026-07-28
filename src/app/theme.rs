@@ -7,8 +7,8 @@ use crate::{
     session::config::SYSTEM_MONOSPACE_FONT,
 };
 
-pub(crate) const ASHELL_LIGHT_THEME: &str = "Ashell Light";
-pub(crate) const ASHELL_DARK_THEME: &str = "Ashell Dark";
+pub(crate) const JSHELL_LIGHT_THEME: &str = "JShell Light";
+pub(crate) const JSHELL_DARK_THEME: &str = "JShell Dark";
 pub(crate) const VSCODE_DARK_THEME: &str = "VS Code Dark";
 pub(crate) const BUNDLED_TERMINAL_FONT: &str = "Noto Sans Mono CJK SC";
 
@@ -30,16 +30,16 @@ pub(crate) const EMBEDDED_THEME_JSONS: &[&str] = &[
 ];
 
 pub(crate) fn allowed_theme_names() -> [&'static str; 3] {
-    [ASHELL_LIGHT_THEME, ASHELL_DARK_THEME, VSCODE_DARK_THEME]
+    [JSHELL_LIGHT_THEME, JSHELL_DARK_THEME, VSCODE_DARK_THEME]
 }
 
 pub(crate) fn validated_theme_name(name: &str, is_dark: bool) -> &'static str {
     match name {
-        ASHELL_LIGHT_THEME => ASHELL_LIGHT_THEME,
-        ASHELL_DARK_THEME => ASHELL_DARK_THEME,
+        JSHELL_LIGHT_THEME | "Ashell Light" => JSHELL_LIGHT_THEME,
+        JSHELL_DARK_THEME | "Ashell Dark" => JSHELL_DARK_THEME,
         VSCODE_DARK_THEME => VSCODE_DARK_THEME,
-        _ if is_dark => ASHELL_DARK_THEME,
-        _ => ASHELL_LIGHT_THEME,
+        _ if is_dark => JSHELL_DARK_THEME,
+        _ => JSHELL_LIGHT_THEME,
     }
 }
 
@@ -222,12 +222,12 @@ impl Ashell {
             .themes()
             .get(&self.light_theme_name)
             .cloned()
-            .expect("Ashell Light theme must be registered");
+            .expect("JShell Light theme must be registered");
         let dark_theme = ThemeRegistry::global(cx)
             .themes()
             .get(&self.dark_theme_name)
             .cloned()
-            .expect("Ashell Dark theme must be registered");
+            .expect("JShell Dark theme must be registered");
         let theme = Theme::global_mut(cx);
         theme.light_theme = light_theme;
         theme.dark_theme = dark_theme;
@@ -264,14 +264,16 @@ mod tests {
     fn allowed_theme_names_are_the_only_selectable_themes() {
         assert_eq!(
             allowed_theme_names(),
-            ["Ashell Light", "Ashell Dark", "VS Code Dark"]
+            ["JShell Light", "JShell Dark", "VS Code Dark"]
         );
     }
 
     #[test]
-    fn removed_theme_name_falls_back_to_the_matching_ashell_default() {
-        assert_eq!(validated_theme_name("Tokyo Night", true), "Ashell Dark");
-        assert_eq!(validated_theme_name("Solarized", false), "Ashell Light");
+    fn legacy_and_removed_theme_names_fall_back_to_the_matching_jshell_default() {
+        assert_eq!(validated_theme_name("Ashell Dark", true), "JShell Dark");
+        assert_eq!(validated_theme_name("Ashell Light", false), "JShell Light");
+        assert_eq!(validated_theme_name("Tokyo Night", true), "JShell Dark");
+        assert_eq!(validated_theme_name("Solarized", false), "JShell Light");
     }
 
     #[test]

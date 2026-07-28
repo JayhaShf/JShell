@@ -1,9 +1,9 @@
 [package]
-name = "ashell"
-version = "0.4.12"
+name = "jshell"
+version = "0.1.0-beta.1"
 edition = "2024"
-authors = ["ashell contributors"]
-description = "A GPUI Component based SSH and local terminal client"
+authors = ["JShell contributors"]
+description = "A Windows-focused SSH and local terminal workspace"
 license = "GPL-3.0-or-later"
 rust-version = "1.85.0"
 
@@ -80,13 +80,13 @@ libc = "0.2"
 winreg = "0.52"
 
 [package.metadata.deb]
-maintainer = "ashell contributors"
+maintainer = "JShell contributors"
 license-file = ["LICENSE"]
 extended-description = "A GPUI Component based SSH and local terminal client"
 section = "terminal"
 priority = "optional"
 assets = [
-    ["target/release/ashell", "usr/bin/", "755"],
+    ["target/release/jshell", "usr/bin/", "755"],
     ["assets/ashell.desktop", "usr/share/applications/", "644"],
     ["assets/icons/ashell.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
 ]

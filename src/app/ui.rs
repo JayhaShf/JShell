@@ -58,7 +58,7 @@ impl Ashell {
                 div()
                     .text_size(rems(2.333))
                     .font_weight(FontWeight::BOLD)
-                    .child("Ashell"),
+                    .child("JShell"),
             )
             .child(
                 div()
@@ -2717,7 +2717,7 @@ impl Ashell {
                     .items_center()
                     .text_color(cx.theme().foreground)
                     .child(Icon::new(IconName::SquareTerminal).size(px(16.)))
-                    .child(div().font_weight(FontWeight::MEDIUM).child("ashell")),
+                    .child(div().font_weight(FontWeight::MEDIUM).child("JShell")),
             )
             .child(
                 div()

@@ -491,7 +491,7 @@ impl Ashell {
         });
         let sync_endpoint_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("https://dav.example.com/ashell/")
+                .placeholder("https://dav.example.com/jshell/")
                 .default_value(config.sync_endpoint())
         });
         let sync_username_input = cx.new(|cx| {
@@ -521,7 +521,7 @@ impl Ashell {
         });
         let sync_s3_object_key_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("ashell-sync.json")
+                .placeholder("jshell-sync.json")
                 .default_value(config.sync_s3_object_key())
         });
         let sync_s3_access_key_input = cx.new(|cx| {

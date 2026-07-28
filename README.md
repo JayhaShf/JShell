@@ -1,10 +1,10 @@
 [中文](README.md) | [English](README.en.md)
 
-# Ashell
+# JShell
 
-Ashell 是一个用 Rust 与 GPUI 构建的桌面终端工作区。它把 SSH、SFTP、文件传输、会话组织和主机状态放进一套紧凑的 Windows 风格界面，适合在多个服务器之间持续切换和操作。
+JShell 是一个用 Rust 与 GPUI 构建的桌面终端工作区。它基于上游 Ashell 演进，把 SSH、SFTP、文件传输、会话组织和主机状态放进一套紧凑的 Windows 风格界面，适合在多个服务器之间持续切换和操作。
 
-![Ashell 工作区预览](assets/screenshots/compact-workspace.png)
+![JShell 工作区预览](assets/screenshots/compact-workspace.png)
 
 ## 当前能力
 
@@ -34,7 +34,7 @@ Ashell 是一个用 Rust 与 GPUI 构建的桌面终端工作区。它把 SSH、
 
 - 自定义 Windows 标题栏、会话标签、窗口控制和当前 SSH 标签状态。
 - 左侧工作区包含 CPU、内存、Swap、网络和磁盘监测。
-- 提供 Ashell Light、Ashell Dark 和 VS Code Dark 三套主题。
+- 提供 JShell Light、JShell Dark 和 VS Code Dark 三套主题。
 - SFTP 面板、侧边栏和窗口布局可按需要调整和保存。
 
 ## 开始使用
@@ -61,7 +61,7 @@ cargo build --release
 Windows 可执行文件位于：
 
 ```text
-target/release/ashell.exe
+target/release/jshell.exe
 ```
 
 ## 配置
@@ -69,13 +69,13 @@ target/release/ashell.exe
 默认配置文件：
 
 ```text
-~/.config/ashell/sessions.json
+~/.config/jshell/sessions.json
 ```
 
 Windows 上通常为：
 
 ```text
-C:\Users\<用户名>\.config\ashell\sessions.json
+C:\Users\<用户名>\.config\jshell\sessions.json
 ```
 
 配置中会保存已保存会话、会话文件夹、主题、字体、快捷键、窗口布局和 SFTP 显示选项。可在设置中的“配置文件”页面导出或导入本地配置。
@@ -91,7 +91,7 @@ cargo build --release
 
 ## 致谢
 
-本项目基于 [TomZz](https://github.com/TomZz) 创建的 [rust-kotlin/ashell](https://github.com/rust-kotlin/ashell) 演进而来。感谢原作者和所有上游贡献者提供的基础与持续投入。
+JShell 基于 [TomZz](https://github.com/TomZz) 创建的 [rust-kotlin/ashell](https://github.com/rust-kotlin/ashell) 演进而来。相较上游原版，本分支重做了 Windows 工作区、会话组织、SFTP 布局、主题和命令历史流程。感谢原作者和所有上游贡献者提供的基础与持续投入。
 
 ## 许可证
 

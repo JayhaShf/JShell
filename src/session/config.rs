@@ -305,7 +305,7 @@ fn default_s3_region() -> String {
 }
 
 fn default_s3_object_key() -> String {
-    "ashell-sync.json".to_string()
+    "jshell-sync.json".to_string()
 }
 
 fn default_follow_system_theme() -> bool {
@@ -443,6 +443,7 @@ pub struct ConfigStore {
 impl ConfigStore {
     pub fn load() -> Result<Self> {
         let path = Self::config_path()?;
+        let legacy_path = Self::legacy_config_path()?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create config dir {}", parent.display()))?;
@@ -461,9 +462,18 @@ impl ConfigStore {
             let _ = fs::create_dir_all(&tmp_dir);
         }
 
-        let mut cache = if path.exists() {
-            let raw_bytes =
-                fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
+        let source_path = if path.exists() {
+            path.clone()
+        } else if legacy_path.exists() {
+            legacy_path
+        } else {
+            path.clone()
+        };
+        let migrated_config_location = source_path != path;
+
+        let mut cache = if source_path.exists() {
+            let raw_bytes = fs::read(&source_path)
+                .with_context(|| format!("failed to read {}", source_path.display()))?;
             let hardware_uuid = get_hardware_uuid();
             match decrypt_config(&raw_bytes, &hardware_uuid) {
                 Ok(cache) => cache,
@@ -472,17 +482,17 @@ impl ConfigStore {
                     match serde_json::from_slice::<ConfigFile>(&raw_bytes) {
                         Ok(cache) => cache,
                         Err(json_err) => {
-                            let backup_path = path.with_extension("json.bak");
+                            let backup_path = source_path.with_extension("json.bak");
                             if let Err(backup_err) = fs::write(&backup_path, &raw_bytes) {
                                 tracing::warn!(
                                     "failed to parse config {} (decrypt err: {decrypt_err:#}, json err: {json_err:#}); backup to {} also failed: {backup_err:#}",
-                                    path.display(),
+                                    source_path.display(),
                                     backup_path.display(),
                                 );
                             } else {
                                 tracing::warn!(
                                     "failed to parse config {} (decrypt err: {decrypt_err:#}, json err: {json_err:#}); backed up the original to {} and loaded defaults",
-                                    path.display(),
+                                    source_path.display(),
                                     backup_path.display(),
                                 );
                             }
@@ -500,7 +510,9 @@ impl ConfigStore {
         }
         let migrated_font_preferences = migrate_legacy_font_preferences(&mut cache);
         let store = Self { path, cache };
-        if migrated_font_preferences && let Err(err) = store.save() {
+        if (migrated_font_preferences || migrated_config_location)
+            && let Err(err) = store.save()
+        {
             tracing::warn!("failed to persist migrated font preferences: {err:#}");
         }
         Ok(store)
@@ -518,6 +530,15 @@ impl ConfigStore {
     }
 
     fn config_path() -> Result<PathBuf> {
+        let dirs = BaseDirs::new().context("could not determine user home directory")?;
+        Ok(dirs
+            .home_dir()
+            .join(".config")
+            .join("jshell")
+            .join("sessions.json"))
+    }
+
+    fn legacy_config_path() -> Result<PathBuf> {
         let dirs = BaseDirs::new().context("could not determine user home directory")?;
         Ok(dirs
             .home_dir()
@@ -609,7 +630,7 @@ impl ConfigStore {
 
     pub fn sync_s3_object_key(&self) -> &str {
         if self.cache.sync_s3_object_key.is_empty() {
-            "ashell-sync.json"
+            "jshell-sync.json"
         } else {
             &self.cache.sync_s3_object_key
         }
@@ -1494,6 +1515,27 @@ mod tests {
     fn test_get_hardware_uuid() {
         let uuid = get_hardware_uuid();
         assert!(!uuid.is_empty());
+    }
+
+    #[test]
+    fn jshell_config_path_uses_the_new_directory_and_retains_a_legacy_source_path() {
+        let config_path = ConfigStore::config_path().unwrap();
+        let legacy_path = ConfigStore::legacy_config_path().unwrap();
+
+        assert!(
+            config_path.ends_with(
+                std::path::Path::new(".config")
+                    .join("jshell")
+                    .join("sessions.json")
+            )
+        );
+        assert!(
+            legacy_path.ends_with(
+                std::path::Path::new(".config")
+                    .join("ashell")
+                    .join("sessions.json")
+            )
+        );
     }
 
     #[test]

@@ -1850,7 +1850,6 @@ impl Ashell {
                     move |content, _window, cx| {
                         use gpui_component::setting::{Settings, SettingPage, SettingGroup, SettingItem, SettingField};
                         use gpui::IntoElement;
-                        let version = env!("CARGO_PKG_VERSION");
                         let view_clone_for_general = view.clone();
                         let sync_endpoint_input = view.read(cx).sync_endpoint_input.clone();
                         let sync_username_input = view.read(cx).sync_username_input.clone();
@@ -2734,12 +2733,12 @@ impl Ashell {
                                                 .item(SettingItem::render(move |_, _window, cx| {
                                                     v_flex()
                                                         .gap_1()
-                                                        .child(div().text_size(rems(1.35)).font_weight(FontWeight::BOLD).child("Ashell"))
+                                                        .child(div().text_size(rems(1.35)).font_weight(FontWeight::BOLD).child("JShell"))
                                                         .child(
                                                             div()
                                                                 .text_size(rems(0.833))
                                                                 .text_color(cx.theme().muted_foreground)
-                                                                .child(format!("{} {}", t!("about_version"), version)),
+                                                                .child(t!("about_edition")),
                                                         )
                                                         .child(
                                                             div()
@@ -2752,7 +2751,7 @@ impl Ashell {
                                         )
                                         .group(
                                             SettingGroup::new()
-                                                .title(t!("about_workspace").to_string())
+                                                .title(t!("about_compared_to_upstream").to_string())
                                                 .item(SettingItem::render(move |_, _window, cx| {
                                                     v_flex()
                                                         .gap_2()
@@ -2760,13 +2759,19 @@ impl Ashell {
                                                             div()
                                                                 .text_size(rems(0.833))
                                                                 .text_color(cx.theme().muted_foreground)
-                                                                .child(t!("about_workspace_features")),
+                                                                .child(t!("about_comparison_features")),
                                                         )
                                                         .child(
                                                             div()
                                                                 .text_size(rems(0.833))
                                                                 .text_color(cx.theme().muted_foreground)
-                                                                .child(t!("about_workspace_runtime")),
+                                                                .child(t!("about_comparison_interface")),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .text_size(rems(0.833))
+                                                                .text_color(cx.theme().muted_foreground)
+                                                                .child(t!("about_upstream_foundation")),
                                                         )
                                                 }))
                                         )
