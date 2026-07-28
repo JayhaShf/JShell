@@ -62,7 +62,7 @@ The current version provides a fully-featured GPUI-native workspace:
 - **Robust Terminal Emulator:** Parses terminal output with `alacritty_terminal`, supporting rich ANSI color spans, fast rendering, and complete keyboard input forwarding.
 - **System Telemetry:** Real-time visualization of CPU, memory, swap, network, and disk metrics in the left cockpit sidebar.
 - **Theming System:** Choose Ashell Light, Ashell Dark, or VS Code Dark. The Ashell light and dark themes use monochrome palettes, while VS Code Dark uses blue active accents.
-- **Default Fonts:** UI and terminal text default to the system-installed Noto Sans CJK SC font.
+- **Default Fonts:** The UI uses bundled `NotoSansCJKsc-Regular.otf`. Terminals follow the system monospace font and measure the selected font's real glyph advance for the grid; bundled `NotoSansMonoCJKsc-Regular.otf` remains available as a fallback for missing fonts and CJK glyphs.
 - **Windows Title Bar:** A compact custom Windows-style title bar follows the active theme and places minimize, maximize, and close controls on the right.
 - **v0.3 Core Enhancements:** Global font and font-size controls, concurrent SFTP transfers, persistent layout state, disconnect awareness, hot-swappable i18n, and smart terminal right-click copy/paste.
 
