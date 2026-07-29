@@ -38,7 +38,7 @@
 
 - 修改 `src/app/ui.rs`，从顶部工具区删除入口，并在 SFTP 状态栏的两个渲染分支中加入入口。
 - 修改 `src/app/command_history.rs`，让按钮提示随 `command_bar_open` 状态变化，并采用状态栏样式。
-- 修改 `locales/zh-CN.yml` 和 `locales/en.yml`，增加“隐藏命令输入”翻译。
+- 复用 `locales/zh-CN.yml` 和 `locales/en.yml` 中已有的 `command_bar_toggle` 与 `command_bar_hide` 翻译，不新增重复键。
 - 如直接在两个 SFTP 分支插入按钮会产生重复判断，则提取只负责显示条件和按钮渲染的小型辅助方法；不借此重构整个 SFTP 面板。
 
 ## 非目标
