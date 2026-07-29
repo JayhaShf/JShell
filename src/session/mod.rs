@@ -22,6 +22,82 @@ use crate::{
     terminal::{BackendCommand, RenderSnapshot, TabKind, TerminalTab},
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionProxyPolicy {
+    Inherit,
+    Direct,
+    Custom,
+}
+
+pub(crate) fn session_proxy_policy(proxy_type: &str) -> SessionProxyPolicy {
+    match proxy_type.trim().to_ascii_lowercase().as_str() {
+        "" | "none" => SessionProxyPolicy::Inherit,
+        "direct" => SessionProxyPolicy::Direct,
+        _ => SessionProxyPolicy::Custom,
+    }
+}
+
+pub(crate) fn proxy_type_for_policy(current: &str, policy: SessionProxyPolicy) -> String {
+    match policy {
+        SessionProxyPolicy::Inherit => "none".to_string(),
+        SessionProxyPolicy::Direct => "direct".to_string(),
+        SessionProxyPolicy::Custom => match current.trim().to_ascii_lowercase().as_str() {
+            "socks5" | "socks5h" | "http" | "https" => current.trim().to_ascii_lowercase(),
+            _ => "socks5".to_string(),
+        },
+    }
+}
+
+pub(crate) fn supported_proxy_protocol(proxy_type: &str) -> Option<String> {
+    match proxy_type.trim().to_ascii_lowercase().as_str() {
+        "socks5" | "socks5h" | "http" | "https" => Some(proxy_type.trim().to_ascii_lowercase()),
+        _ => None,
+    }
+}
+
+pub(crate) fn parse_non_zero_u16(value: &str) -> Option<u16> {
+    value.trim().parse::<u16>().ok().filter(|port| *port != 0)
+}
+
+pub(crate) fn can_submit_ssh_session(
+    auth_method: AuthMethod,
+    ssh_config_selected: bool,
+    editing_session_auth: Option<AuthMethod>,
+) -> bool {
+    auth_method != AuthMethod::Config
+        || ssh_config_selected
+        || editing_session_auth == Some(AuthMethod::Config)
+}
+
+fn apply_session_proxy(
+    session: &mut Session,
+    proxy_type: &str,
+    proxy_host: String,
+    proxy_port: Option<u16>,
+    proxy_user: String,
+    proxy_password: String,
+) {
+    session.proxy_type = if proxy_type.trim().is_empty() {
+        "none".to_string()
+    } else {
+        proxy_type.trim().to_ascii_lowercase()
+    };
+    match session_proxy_policy(&session.proxy_type) {
+        SessionProxyPolicy::Inherit | SessionProxyPolicy::Direct => {
+            session.proxy_host.clear();
+            session.proxy_port = None;
+            session.proxy_user.clear();
+            session.proxy_password.clear();
+        }
+        SessionProxyPolicy::Custom => {
+            session.proxy_host = proxy_host;
+            session.proxy_port = proxy_port;
+            session.proxy_user = proxy_user;
+            session.proxy_password = proxy_password;
+        }
+    }
+}
+
 fn connected_session_tab_id<'a>(
     tabs: impl IntoIterator<Item = (&'a str, bool, Option<&'a Session>)>,
     session_id: &str,
@@ -61,6 +137,13 @@ fn open_terminal_url(url: &str) {
 }
 
 impl Ashell {
+    fn editing_session_auth(&self) -> Option<AuthMethod> {
+        self.editing_session_id
+            .as_deref()
+            .and_then(|id| self.config.get(id))
+            .map(|session| session.auth)
+    }
+
     fn register_session_workspace(&mut self, group_id: String) {
         if !self.workspace_tabs.iter().any(|workspace| {
             matches!(
@@ -181,6 +264,8 @@ impl Ashell {
         let key_path = self.key_path_input.read(cx).value().trim().to_string();
         let key_inline = self.key_inline_input.read(cx).value().to_string();
         let passphrase = self.passphrase_input.read(cx).value().to_string();
+        let ssh_config_selected = self.ssh_config_selected.is_some();
+        let editing_session_auth = self.editing_session_auth();
 
         if host.is_empty() || user.is_empty() {
             self.status = t!("host_and_user_required").into();
@@ -188,12 +273,26 @@ impl Ashell {
             return;
         }
 
-        if self.ssh_proxy_type != "none" {
+        if !can_submit_ssh_session(
+            self.ssh_auth_method,
+            ssh_config_selected,
+            editing_session_auth,
+        ) {
+            self.status = t!("ssh_config_selection_required").into();
+            cx.notify();
+            return;
+        }
+
+        if session_proxy_policy(&self.ssh_proxy_type) == SessionProxyPolicy::Custom {
+            if supported_proxy_protocol(&self.ssh_proxy_type).is_none() {
+                self.status = t!("proxy_protocol_unsupported").into();
+                cx.notify();
+                return;
+            }
             let proxy_host = self.proxy_host_input.read(cx).value().trim().to_string();
-            let proxy_port_str = self.proxy_port_input.read(cx).value().trim().to_string();
-            let proxy_port = proxy_port_str.parse::<u16>().ok();
+            let proxy_port = parse_non_zero_u16(&self.proxy_port_input.read(cx).value());
             if proxy_host.is_empty() || proxy_port.is_none() {
-                self.status = "Proxy host and port are required".into();
+                self.status = t!("proxy_host_port_required").into();
                 cx.notify();
                 return;
             }
@@ -227,17 +326,24 @@ impl Ashell {
             session.id = id;
         }
         session.last_used = existing_last_used;
-        session.proxy_type = self.ssh_proxy_type.clone();
-        session.proxy_host = self.proxy_host_input.read(cx).value().trim().to_string();
-        session.proxy_port = self
+        let proxy_host = self.proxy_host_input.read(cx).value().trim().to_string();
+        let proxy_port = self
             .proxy_port_input
             .read(cx)
             .value()
             .trim()
             .parse::<u16>()
             .ok();
-        session.proxy_user = self.proxy_user_input.read(cx).value().trim().to_string();
-        session.proxy_password = self.proxy_password_input.read(cx).value().to_string();
+        let proxy_user = self.proxy_user_input.read(cx).value().trim().to_string();
+        let proxy_password = self.proxy_password_input.read(cx).value().to_string();
+        apply_session_proxy(
+            &mut session,
+            &self.ssh_proxy_type,
+            proxy_host,
+            proxy_port,
+            proxy_user,
+            proxy_password,
+        );
         self.config.upsert(session.clone());
         if let Err(err) = self.config.save() {
             tracing::warn!("failed to save config: {err:#}");
@@ -553,9 +659,17 @@ impl Ashell {
             Self::set_input_value(&self.password_input, String::new(), window, cx);
             Self::set_input_value(&self.key_inline_input, String::new(), window, cx);
             Self::set_input_value(&self.passphrase_input, String::new(), window, cx);
-            // Auto-connect on selection
-            self.connect_ssh(window, cx);
+            cx.notify();
         }
+    }
+
+    pub(crate) fn set_ssh_proxy_policy(
+        &mut self,
+        policy: SessionProxyPolicy,
+        cx: &mut Context<Self>,
+    ) {
+        self.ssh_proxy_type = proxy_type_for_policy(&self.ssh_proxy_type, policy);
+        cx.notify();
     }
 
     pub(crate) fn set_ssh_proxy_type(&mut self, proxy_type: String, cx: &mut Context<Self>) {
@@ -1921,6 +2035,103 @@ mod tests {
         );
         session.id = id.to_string();
         session
+    }
+
+    #[test]
+    fn proxy_policy_maps_inherit_direct_and_legacy_custom_values() {
+        assert_eq!(session_proxy_policy(""), SessionProxyPolicy::Inherit);
+        assert_eq!(session_proxy_policy("none"), SessionProxyPolicy::Inherit);
+        assert_eq!(session_proxy_policy("direct"), SessionProxyPolicy::Direct);
+        assert_eq!(session_proxy_policy("socks5"), SessionProxyPolicy::Custom);
+        assert_eq!(session_proxy_policy("socks5h"), SessionProxyPolicy::Custom);
+        assert_eq!(session_proxy_policy("http"), SessionProxyPolicy::Custom);
+        assert_eq!(session_proxy_policy("https"), SessionProxyPolicy::Custom);
+    }
+
+    #[test]
+    fn proxy_policy_selection_preserves_a_known_protocol_or_defaults_to_socks5() {
+        assert_eq!(
+            proxy_type_for_policy("none", SessionProxyPolicy::Custom),
+            "socks5"
+        );
+        assert_eq!(
+            proxy_type_for_policy("https", SessionProxyPolicy::Custom),
+            "https"
+        );
+        assert_eq!(
+            proxy_type_for_policy("socks5h", SessionProxyPolicy::Custom),
+            "socks5h"
+        );
+        assert_eq!(
+            proxy_type_for_policy("http", SessionProxyPolicy::Direct),
+            "direct"
+        );
+    }
+
+    #[test]
+    fn inactive_proxy_policy_clears_all_saved_endpoint_fields() {
+        for proxy_type in ["none", "direct"] {
+            let mut session = test_session(proxy_type);
+            apply_session_proxy(
+                &mut session,
+                proxy_type,
+                "proxy.example".to_string(),
+                Some(443),
+                "proxy-user".to_string(),
+                "proxy-secret".to_string(),
+            );
+            assert_eq!(session.proxy_type, proxy_type);
+            assert!(session.proxy_host.is_empty());
+            assert_eq!(session.proxy_port, None);
+            assert!(session.proxy_user.is_empty());
+            assert!(session.proxy_password.is_empty());
+        }
+    }
+
+    #[test]
+    fn ssh_config_submission_requires_selection_except_for_existing_config_sessions() {
+        assert!(can_submit_ssh_session(AuthMethod::Password, false, None));
+        assert!(can_submit_ssh_session(AuthMethod::Key, false, None));
+        assert!(can_submit_ssh_session(AuthMethod::Config, true, None));
+        assert!(can_submit_ssh_session(
+            AuthMethod::Config,
+            false,
+            Some(AuthMethod::Config)
+        ));
+        assert!(!can_submit_ssh_session(AuthMethod::Config, false, None));
+        assert!(!can_submit_ssh_session(
+            AuthMethod::Config,
+            false,
+            Some(AuthMethod::Password)
+        ));
+        assert!(!can_submit_ssh_session(
+            AuthMethod::Config,
+            false,
+            Some(AuthMethod::Key)
+        ));
+    }
+
+    #[test]
+    fn supported_proxy_protocol_normalizes_whitespace_and_known_values_only() {
+        assert_eq!(
+            supported_proxy_protocol("  SOCKS5H  ").as_deref(),
+            Some("socks5h")
+        );
+        assert_eq!(supported_proxy_protocol("http").as_deref(), Some("http"));
+        assert_eq!(supported_proxy_protocol("HTTPS").as_deref(), Some("https"));
+        assert_eq!(supported_proxy_protocol(""), None);
+        assert_eq!(supported_proxy_protocol(" none "), None);
+        assert_eq!(supported_proxy_protocol("direct"), None);
+        assert_eq!(supported_proxy_protocol("ftp"), None);
+    }
+
+    #[test]
+    fn non_zero_u16_parser_rejects_empty_invalid_and_zero() {
+        assert_eq!(parse_non_zero_u16("443"), Some(443));
+        assert_eq!(parse_non_zero_u16(" 1080 "), Some(1080));
+        assert_eq!(parse_non_zero_u16(""), None);
+        assert_eq!(parse_non_zero_u16("abc"), None);
+        assert_eq!(parse_non_zero_u16("0"), None);
     }
 
     #[test]

@@ -18,7 +18,14 @@ use gpui_component::{
 };
 use rust_i18n::t;
 
-use crate::{Ashell, session::config::AuthMethod, system::format_bytes};
+use crate::{
+    Ashell,
+    session::{
+        SessionProxyPolicy, can_submit_ssh_session, config::AuthMethod, parse_non_zero_u16,
+        session_proxy_policy, supported_proxy_protocol,
+    },
+    system::format_bytes,
+};
 
 fn open_completed_download_target_with<E>(
     target: &str,
@@ -415,7 +422,20 @@ impl Ashell {
                         let is_config = auth_method == AuthMethod::Config;
                         let is_editing = view.read(cx).editing_session_id.is_some();
                         let proxy_type = view.read(cx).ssh_proxy_type.clone();
-                        let show_proxy_fields = proxy_type != "none";
+                        let normalized_proxy_type = proxy_type.trim().to_ascii_lowercase();
+                        let proxy_policy = session_proxy_policy(&normalized_proxy_type);
+                        let show_proxy_fields = proxy_policy == SessionProxyPolicy::Custom;
+                        let socks5_selected =
+                            matches!(normalized_proxy_type.as_str(), "socks5" | "socks5h");
+                        let ssh_config_selected = view.read(cx).ssh_config_selected.is_some();
+                        let editing_session_auth = view.read(cx).editing_session_id.as_deref()
+                            .and_then(|id| view.read(cx).config.get(id))
+                            .map(|session| session.auth);
+                        let can_submit = can_submit_ssh_session(
+                            auth_method,
+                            ssh_config_selected,
+                            editing_session_auth,
+                        );
                         let protocol = view.read(cx).session_protocol.clone();
                         let is_ssh = protocol == "ssh";
                         let is_serial = protocol == "serial";
@@ -646,38 +666,77 @@ impl Ashell {
                                             )
                                         }
                                     })
-                                    .when(!is_config, |this| {
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(FontWeight::BOLD)
+                                            .child(t!("proxy").to_string()),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .gap_2()
+                                            .child(
+                                                Button::new("proxy-inherit")
+                                                    .label(t!("proxy_none").to_string())
+                                                    .when(proxy_policy == SessionProxyPolicy::Inherit, |button| {
+                                                        button.primary()
+                                                    })
+                                                    .on_click(window.listener_for(
+                                                        &view,
+                                                        |this, _, _, cx| {
+                                                            this.set_ssh_proxy_policy(
+                                                                SessionProxyPolicy::Inherit,
+                                                                cx,
+                                                            )
+                                                        },
+                                                    )),
+                                            )
+                                            .child(
+                                                Button::new("proxy-direct")
+                                                    .label(t!("proxy_direct").to_string())
+                                                    .when(proxy_policy == SessionProxyPolicy::Direct, |button| {
+                                                        button.primary()
+                                                    })
+                                                    .on_click(window.listener_for(
+                                                        &view,
+                                                        |this, _, _, cx| {
+                                                            this.set_ssh_proxy_policy(
+                                                                SessionProxyPolicy::Direct,
+                                                                cx,
+                                                            )
+                                                        },
+                                                    )),
+                                            )
+                                            .child(
+                                                Button::new("proxy-custom")
+                                                    .label(t!("proxy_use").to_string())
+                                                    .when(proxy_policy == SessionProxyPolicy::Custom, |button| {
+                                                        button.primary()
+                                                    })
+                                                    .on_click(window.listener_for(
+                                                        &view,
+                                                        |this, _, _, cx| {
+                                                            this.set_ssh_proxy_policy(
+                                                                SessionProxyPolicy::Custom,
+                                                                cx,
+                                                            )
+                                                        },
+                                                    )),
+                                            ),
+                                    )
+                                    .when(show_proxy_fields, |this| {
                                         this.child(
                                             div()
                                                 .text_sm()
-                                                .font_weight(FontWeight::BOLD)
-                                                .child(t!("proxy").to_string()),
+                                                .child(t!("proxy_protocol").to_string()),
                                         )
                                         .child(
                                             h_flex()
                                                 .gap_2()
                                                 .child(
-                                                    Button::new("proxy-none")
-                                                        .label(t!("proxy_none").to_string())
-                                                        .when(proxy_type == "none", |button| {
-                                                            button.primary()
-                                                        })
-                                                        .on_click(window.listener_for(
-                                                            &view,
-                                                            |this, _, _, cx| {
-                                                                this.set_ssh_proxy_type(
-                                                                    "none".to_string(),
-                                                                    cx,
-                                                                )
-                                                            },
-                                                        )),
-                                                )
-                                                .child(
-                                                    Button::new("proxy-socks5")
+                                                    Button::new("proxy-type-socks5")
                                                         .label("SOCKS5")
-                                                        .when(proxy_type == "socks5", |button| {
-                                                            button.primary()
-                                                        })
+                                                        .when(socks5_selected, |button| button.primary())
                                                         .on_click(window.listener_for(
                                                             &view,
                                                             |this, _, _, cx| {
@@ -689,11 +748,9 @@ impl Ashell {
                                                         )),
                                                 )
                                                 .child(
-                                                    Button::new("proxy-http")
+                                                    Button::new("proxy-type-http")
                                                         .label("HTTP")
-                                                        .when(proxy_type == "http", |button| {
-                                                            button.primary()
-                                                        })
+                                                        .when(normalized_proxy_type == "http", |button| button.primary())
                                                         .on_click(window.listener_for(
                                                             &view,
                                                             |this, _, _, cx| {
@@ -703,28 +760,33 @@ impl Ashell {
                                                                 )
                                                             },
                                                         )),
-                                                ),
-                                        )
-                                        .when(
-                                            show_proxy_fields,
-                                            |this| {
-                                                this.child(
-                                                    h_flex()
-                                                        .gap_2()
-                                                        .child(Input::new(&proxy_host_input).flex_1())
-                                                        .child(
-                                                            Input::new(&proxy_port_input).w(px(96.)),
-                                                        ),
                                                 )
                                                 .child(
-                                                    h_flex()
-                                                        .gap_2()
-                                                        .child(Input::new(&proxy_user_input).flex_1())
-                                                        .child(
-                                                            Input::new(&proxy_password_input).flex_1(),
-                                                        ),
-                                                )
-                                            },
+                                                    Button::new("proxy-type-https")
+                                                        .label("HTTPS")
+                                                        .when(normalized_proxy_type == "https", |button| button.primary())
+                                                        .on_click(window.listener_for(
+                                                            &view,
+                                                            |this, _, _, cx| {
+                                                                this.set_ssh_proxy_type(
+                                                                    "https".to_string(),
+                                                                    cx,
+                                                                )
+                                                            },
+                                                        )),
+                                                ),
+                                        )
+                                        .child(
+                                            h_flex()
+                                                .gap_2()
+                                                .child(Input::new(&proxy_host_input).flex_1())
+                                                .child(Input::new(&proxy_port_input).w(px(96.))),
+                                        )
+                                        .child(
+                                            h_flex()
+                                                .gap_2()
+                                                .child(Input::new(&proxy_user_input).flex_1())
+                                                .child(Input::new(&proxy_password_input).flex_1()),
                                         )
                                     })
                                 })
@@ -744,7 +806,7 @@ impl Ashell {
                                                     },
                                                 )),
                                         )
-                                        .when(!is_config, |this| {
+                                        .when(can_submit, |this| {
                                             this.child(
                                                 Button::new("connect-ssh-confirm")
                                                     .primary()
@@ -2651,6 +2713,7 @@ impl Ashell {
                                                     let global_proxy_password_input = view.read(cx).global_proxy_password_input.clone();
                                                     move |_, window, cx| {
                                                         let proxy_type = view.read(cx).global_proxy_type.clone();
+                                                        let normalized_proxy_type = proxy_type.trim().to_ascii_lowercase();
                                                         v_flex()
                                                             .w_full()
                                                             .gap_3()
@@ -2662,7 +2725,7 @@ impl Ashell {
                                                                         Button::new("global-proxy-type-socks5")
                                                                             .small()
                                                                             .label("SOCKS5")
-                                                                            .when(proxy_type == "socks5", |b| b.primary())
+                                                                            .when(normalized_proxy_type == "socks5", |b| b.primary())
                                                                             .on_click(window.listener_for(&view, |this, _, _, cx| {
                                                                                 this.global_proxy_type = "socks5".to_string();
                                                                                 cx.notify();
@@ -2672,9 +2735,19 @@ impl Ashell {
                                                                         Button::new("global-proxy-type-http")
                                                                             .small()
                                                                             .label("HTTP")
-                                                                            .when(proxy_type == "http", |b| b.primary())
+                                                                            .when(normalized_proxy_type == "http", |b| b.primary())
                                                                             .on_click(window.listener_for(&view, |this, _, _, cx| {
                                                                                 this.global_proxy_type = "http".to_string();
+                                                                                cx.notify();
+                                                                            }))
+                                                                    )
+                                                                    .child(
+                                                                        Button::new("global-proxy-type-https")
+                                                                            .small()
+                                                                            .label("HTTPS")
+                                                                            .when(normalized_proxy_type == "https", |b| b.primary())
+                                                                            .on_click(window.listener_for(&view, |this, _, _, cx| {
+                                                                                this.global_proxy_type = "https".to_string();
                                                                                 cx.notify();
                                                                             }))
                                                                     )
@@ -2690,16 +2763,22 @@ impl Ashell {
                                                                     .label(t!("save_proxy").to_string())
                                                                     .on_click(window.listener_for(&view, |this, _, _, cx| {
                                                                         let host = this.global_proxy_host_input.read(cx).value().trim().to_string();
-                                                                        let port_str = this.global_proxy_port_input.read(cx).value();
-                                                                        let port = port_str.trim().parse::<u16>().ok();
+                                                                        let port = parse_non_zero_u16(&this.global_proxy_port_input.read(cx).value());
                                                                         let user = this.global_proxy_user_input.read(cx).value().trim().to_string();
                                                                         let password = this.global_proxy_password_input.read(cx).value().to_string();
+                                                                        let Some(proxy_type) = supported_proxy_protocol(&this.global_proxy_type) else {
+                                                                            this.status = t!("proxy_protocol_unsupported").into();
+                                                                            cx.notify();
+                                                                            return;
+                                                                        };
 
                                                                         if host.is_empty() || port.is_none() {
+                                                                            this.status = t!("proxy_host_port_required").into();
+                                                                            cx.notify();
                                                                             return;
                                                                         }
 
-                                                                        this.config.set_global_proxy_type(this.global_proxy_type.clone());
+                                                                        this.config.set_global_proxy_type(proxy_type);
                                                                         this.config.set_global_proxy_host(host);
                                                                         this.config.set_global_proxy_port(port);
                                                                         this.config.set_global_proxy_user(user);
