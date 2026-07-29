@@ -58,7 +58,7 @@ pub struct Session {
     #[serde(default)]
     pub last_used: Option<String>,
     #[serde(default = "default_session_proxy_type")]
-    pub proxy_type: String, // "none", "socks5", "http"
+    pub proxy_type: String, // "none", "direct", "socks5", "socks5h", "http", "https"
     #[serde(default)]
     pub proxy_host: String,
     #[serde(default)]
@@ -1263,6 +1263,7 @@ pub struct ConnectionProxyConfig {
 enum ProxyKind {
     Socks5,
     Http,
+    Https,
 }
 
 impl ProxyKind {
@@ -1270,6 +1271,7 @@ impl ProxyKind {
         match self {
             Self::Socks5 => "socks5",
             Self::Http => "http",
+            Self::Https => "https",
         }
     }
 }
@@ -1333,7 +1335,7 @@ fn parse_env_proxy(variable: &str, value: &str) -> std::result::Result<ProxyEndp
         .map_err(|error| format!("{variable} is not a valid proxy URL: {error}"))?;
     let proxy_type = match url.scheme() {
         "socks5" | "socks5h" => url.scheme().to_string(),
-        "http" => "http".to_string(),
+        "http" | "https" => url.scheme().to_string(),
         scheme => {
             return Err(format!(
                 "{variable} uses unsupported proxy scheme '{scheme}'"
@@ -1363,6 +1365,7 @@ fn validate_proxy(endpoint: ProxyEndpoint, source: &str) -> Result<ResolvedProxy
     let kind = match endpoint.proxy_type.trim().to_ascii_lowercase().as_str() {
         "socks5" | "socks5h" => ProxyKind::Socks5,
         "http" => ProxyKind::Http,
+        "https" => ProxyKind::Https,
         proxy_type => bail!("{source} proxy type '{proxy_type}' is unsupported"),
     };
     let host = endpoint.host.trim();
@@ -1384,6 +1387,9 @@ fn validate_proxy(endpoint: ProxyEndpoint, source: &str) -> Result<ResolvedProxy
 
 fn resolve_proxy(session: &Session, config: &ConnectionProxyConfig) -> Result<ProxyRoute> {
     let session_proxy_type = session.proxy_type.trim();
+    if session_proxy_type.eq_ignore_ascii_case("direct") {
+        return Ok(ProxyRoute::Direct);
+    }
     if !session_proxy_type.is_empty() && !session_proxy_type.eq_ignore_ascii_case("none") {
         return validate_proxy(
             ProxyEndpoint {
@@ -1465,7 +1471,12 @@ pub async fn connect_proxy(
                     })?;
                 Ok(Box::new(stream) as Box<dyn ProxyStream>)
             }
-            ProxyRoute::Proxy(proxy) if proxy.kind == ProxyKind::Socks5 => {
+            ProxyRoute::Proxy(
+                proxy @ ResolvedProxy {
+                    kind: ProxyKind::Socks5,
+                    ..
+                },
+            ) => {
                 let proxy_address = (proxy.host.as_str(), proxy.port);
                 if proxy.user.is_empty() {
                     let stream = tokio_socks::tcp::Socks5Stream::connect(
@@ -1487,7 +1498,12 @@ pub async fn connect_proxy(
                     Ok(Box::new(stream) as Box<dyn ProxyStream>)
                 }
             }
-            ProxyRoute::Proxy(proxy) => {
+            ProxyRoute::Proxy(
+                proxy @ ResolvedProxy {
+                    kind: ProxyKind::Http,
+                    ..
+                },
+            ) => {
                 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
                 let stream = tokio::net::TcpStream::connect((proxy.host.as_str(), proxy.port))
@@ -1531,6 +1547,10 @@ pub async fn connect_proxy(
                 validate_http_connect_response(&response)?;
                 Ok(Box::new(stream) as Box<dyn ProxyStream>)
             }
+            ProxyRoute::Proxy(ResolvedProxy {
+                kind: ProxyKind::Https,
+                ..
+            }) => bail!("HTTPS proxy TLS transport is not established"),
         }
     };
 
@@ -1814,7 +1834,10 @@ fn decrypt_config_v1(raw: &[u8], password: &str) -> Result<ConfigFile> {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::{Cell, RefCell};
+    use std::{
+        cell::{Cell, RefCell},
+        time::Duration,
+    };
 
     use super::*;
 
@@ -1878,6 +1901,217 @@ mod tests {
             user: String::new(),
             password: String::new(),
         }
+    }
+
+    #[test]
+    fn explicit_direct_bypasses_environment_global_and_persistence_gate() {
+        let mut session = Session::password(
+            "example.test".to_string(),
+            22,
+            "root".to_string(),
+            "secret".to_string(),
+        );
+        session.proxy_type = "direct".to_string();
+
+        let mut config = direct_proxy_config();
+        config.read_env_proxy = true;
+        config.env_proxy = Err("invalid environment proxy".to_string());
+        config.use_global_proxy = true;
+        config.global_proxy = proxy_endpoint("unknown", "", 0);
+        config.allow_direct = false;
+
+        assert_eq!(
+            resolve_proxy(&session, &config).unwrap(),
+            ProxyRoute::Direct
+        );
+    }
+
+    #[test]
+    fn none_and_empty_session_proxy_inherit_environment_then_global() {
+        for session_proxy_type in ["", "none"] {
+            let mut session = Session::password(
+                "example.test".to_string(),
+                22,
+                "root".to_string(),
+                "secret".to_string(),
+            );
+            session.proxy_type = session_proxy_type.to_string();
+
+            let mut config = direct_proxy_config();
+            config.read_env_proxy = true;
+            config.env_proxy = Ok(Some(proxy_endpoint("https", "env.proxy", 443)));
+            config.use_global_proxy = true;
+            config.global_proxy = proxy_endpoint("http", "global.proxy", 8080);
+
+            assert_eq!(
+                resolve_proxy(&session, &config).unwrap(),
+                ProxyRoute::Proxy(ResolvedProxy {
+                    kind: ProxyKind::Https,
+                    host: "env.proxy".to_string(),
+                    port: 443,
+                    user: String::new(),
+                    password: String::new(),
+                })
+            );
+
+            config.env_proxy = Ok(None);
+            assert_eq!(
+                resolve_proxy(&session, &config).unwrap(),
+                ProxyRoute::Proxy(ResolvedProxy {
+                    kind: ProxyKind::Http,
+                    host: "global.proxy".to_string(),
+                    port: 8080,
+                    user: String::new(),
+                    password: String::new(),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_explicit_proxy_types_remain_supported() {
+        for (proxy_type, expected_kind) in [
+            ("socks5", ProxyKind::Socks5),
+            ("socks5h", ProxyKind::Socks5),
+            ("http", ProxyKind::Http),
+        ] {
+            let mut session = Session::password(
+                "example.test".to_string(),
+                22,
+                "root".to_string(),
+                "secret".to_string(),
+            );
+            session.proxy_type = proxy_type.to_string();
+            session.proxy_host = "session.proxy".to_string();
+            session.proxy_port = Some(8080);
+
+            assert_eq!(
+                resolve_proxy(&session, &direct_proxy_config()).unwrap(),
+                ProxyRoute::Proxy(ResolvedProxy {
+                    kind: expected_kind,
+                    host: "session.proxy".to_string(),
+                    port: 8080,
+                    user: String::new(),
+                    password: String::new(),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn https_environment_proxy_uses_port_443_by_default() {
+        let proxy = parse_env_proxy("HTTPS_PROXY", "https://proxy.example").unwrap();
+
+        assert_eq!(proxy.proxy_type, "https");
+        assert_eq!(proxy.host, "proxy.example");
+        assert_eq!(proxy.port, Some(443));
+    }
+
+    #[test]
+    fn global_https_proxy_is_resolved_for_an_inherited_session() {
+        let session = Session::password(
+            "example.test".to_string(),
+            22,
+            "root".to_string(),
+            "secret".to_string(),
+        );
+        let mut config = direct_proxy_config();
+        config.use_global_proxy = true;
+        config.global_proxy = proxy_endpoint("https", "global.proxy", 443);
+
+        assert_eq!(
+            resolve_proxy(&session, &config).unwrap(),
+            ProxyRoute::Proxy(ResolvedProxy {
+                kind: ProxyKind::Https,
+                host: "global.proxy".to_string(),
+                port: 443,
+                user: String::new(),
+                password: String::new(),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn https_proxy_route_fails_closed_before_tls_is_established() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let proxy_port = listener.local_addr().unwrap().port();
+        let mut session = Session::password(
+            "example.test".to_string(),
+            22,
+            "root".to_string(),
+            "secret".to_string(),
+        );
+        session.proxy_type = "https".to_string();
+        session.proxy_host = "127.0.0.1".to_string();
+        session.proxy_port = Some(proxy_port);
+        session.proxy_user = "https-proxy-user-must-not-leak".to_string();
+        session.proxy_password = "https-proxy-password-must-not-leak".to_string();
+        let config = direct_proxy_config();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::select! {
+                biased;
+                accepted = listener.accept() => match accepted {
+                    Ok((_, peer_address)) => panic!(
+                        "HTTPS proxy route opened a TCP connection to {peer_address} before TLS was established"
+                    ),
+                    Err(error) => panic!("accept HTTPS proxy connection: {error}"),
+                },
+                result = connect_proxy(&session, &config) => result,
+            }
+        })
+        .await
+        .expect("HTTPS proxy route did not fail closed within the overall timeout");
+        let error = result
+            .err()
+            .expect("HTTPS proxy route must fail until TLS is established");
+
+        assert!(
+            format!("{error:#}").contains("HTTPS proxy TLS transport is not established"),
+            "unexpected HTTPS proxy error: {error:#}"
+        );
+        let error_chain = format!("{error:#}");
+        for sensitive_value in [
+            session.proxy_user.as_str(),
+            session.proxy_password.as_str(),
+            "Basic",
+            "Proxy-Authorization",
+        ] {
+            assert!(
+                !error_chain.contains(sensitive_value),
+                "HTTPS proxy error leaked '{sensitive_value}': {error_chain}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_type_and_zero_port_fail_closed() {
+        let mut session = Session::password(
+            "example.test".to_string(),
+            22,
+            "root".to_string(),
+            "secret".to_string(),
+        );
+        session.proxy_type = "ftp".to_string();
+        session.proxy_host = "proxy.example".to_string();
+        session.proxy_port = Some(21);
+
+        let unsupported = resolve_proxy(&session, &direct_proxy_config())
+            .expect_err("unknown proxy types must be rejected");
+        assert!(unsupported.to_string().contains("unsupported"));
+
+        session.proxy_type = "http".to_string();
+        session.proxy_port = Some(0);
+        let zero_port = resolve_proxy(&session, &direct_proxy_config())
+            .expect_err("zero proxy ports must be rejected");
+        assert!(zero_port.to_string().contains("missing or invalid"));
+
+        session.proxy_port = None;
+        let missing_port = resolve_proxy(&session, &direct_proxy_config())
+            .expect_err("missing proxy ports must be rejected");
+        assert!(missing_port.to_string().contains("missing or invalid"));
     }
 
     #[test]
@@ -1977,8 +2211,8 @@ mod tests {
 
     #[test]
     fn environment_proxy_parser_rejects_unsupported_schemes() {
-        let error = parse_env_proxy("HTTPS_PROXY", "https://proxy.example:443").unwrap_err();
-        assert!(error.contains("unsupported proxy scheme 'https'"));
+        let error = parse_env_proxy("ALL_PROXY", "ftp://proxy.example:21").unwrap_err();
+        assert!(error.contains("unsupported proxy scheme 'ftp'"));
 
         let proxy = parse_env_proxy("HTTP_PROXY", "http://user:pass@proxy.example").unwrap();
         assert_eq!(proxy.host, "proxy.example");
