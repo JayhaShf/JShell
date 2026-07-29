@@ -166,7 +166,7 @@ impl Ashell {
             .add_filter("JSON", &["json"])
             .pick_file();
 
-        cx.spawn_in(window, async move |this, mut cx| {
+        cx.spawn_in(window, async move |this, cx| {
             if let Some(file_handle) = file_dialog.await {
                 let path = file_handle.path().to_path_buf();
                 let read_result = cx
@@ -174,21 +174,20 @@ impl Ashell {
                     .spawn(async move { std::fs::read_to_string(path) })
                     .await;
 
-                if let Ok(json_str) = read_result {
-                    if let Ok(config_file) =
+                if let Ok(json_str) = read_result
+                    && let Ok(config_file) =
                         serde_json::from_str::<crate::session::config::ConfigFile>(&json_str)
-                    {
-                        let _ = gpui::AsyncWindowContext::update(&mut cx, |window, cx| {
-                            let _ = this.update(cx, |this, cx| {
-                                this.config.cache = config_file;
-                                if let Err(err) = this.config.save() {
-                                    tracing::error!("failed to save imported config: {err:#}");
-                                } else {
-                                    this.apply_loaded_config(window, cx);
-                                }
-                            });
+                {
+                    let _ = gpui::AsyncWindowContext::update(cx, |window, cx| {
+                        let _ = this.update(cx, |this, cx| {
+                            this.config.cache = config_file;
+                            if let Err(err) = this.config.save() {
+                                tracing::error!("failed to save imported config: {err:#}");
+                            } else {
+                                this.apply_loaded_config(window, cx);
+                            }
                         });
-                    }
+                    });
                 }
             }
             Ok::<(), anyhow::Error>(())

@@ -19,6 +19,13 @@ use crate::session::config::Session;
 use crate::sftp::{PreviewData, RemoteEntry};
 use crate::system::SystemSnapshot;
 
+type HighlightCache = std::cell::RefCell<
+    Option<(
+        Vec<RenderCell>,
+        std::collections::HashMap<(i32, i32), gpui::Hsla>,
+    )>,
+>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TabKind {
     Local,
@@ -149,12 +156,7 @@ pub struct TerminalTab {
     pub rows: u16,
     pub backend: std::sync::Arc<std::sync::Mutex<BackendTx>>,
     pub scroll_pixel_y: f32,
-    pub(crate) highlight_cache: std::cell::RefCell<
-        Option<(
-            Vec<RenderCell>,
-            std::collections::HashMap<(i32, i32), gpui::Hsla>,
-        )>,
-    >,
+    pub(crate) highlight_cache: HighlightCache,
 }
 
 #[derive(Clone, Copy)]

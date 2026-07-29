@@ -55,11 +55,11 @@ fn main() {
                 Some(app::constants::TERMINAL_KEY_CONTEXT),
             ),
         ]);
-        app::startup::bind_workspace_keys(cx);
+        let startup_config = app::startup::load_startup_config_and_bind_workspace_keys(cx);
         app::theme::load_embedded_themes(cx);
         if let Err(err) = app::theme::load_fonts(cx) {
             tracing::warn!("failed to load theme fonts: {err:#}");
         }
-        app::startup::open_main_window(cx);
+        app::startup::open_main_window_with_config(cx, startup_config);
     });
 }

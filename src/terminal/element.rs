@@ -165,6 +165,19 @@ pub struct TerminalElement {
     search_highlights: Option<std::collections::HashMap<(i32, i32), Hsla>>,
 }
 
+pub(crate) struct TerminalElementOptions {
+    pub(crate) view: Entity<Ashell>,
+    pub(crate) focus_handle: FocusHandle,
+    pub(crate) snapshot: RenderSnapshot,
+    pub(crate) marked_text: Option<String>,
+    pub(crate) font_family: SharedString,
+    pub(crate) font_size: Pixels,
+    pub(crate) line_height: Pixels,
+    pub(crate) cell_width: Pixels,
+    pub(crate) tab_id: String,
+    pub(crate) search_highlights: Option<std::collections::HashMap<(i32, i32), Hsla>>,
+}
+
 pub struct PrepaintState {
     bounds: Bounds<Pixels>,
     metrics: TerminalMetrics,
@@ -293,18 +306,19 @@ impl InputHandler for TerminalInputHandler {
 }
 
 impl TerminalElement {
-    pub fn new(
-        view: Entity<Ashell>,
-        focus_handle: FocusHandle,
-        snapshot: RenderSnapshot,
-        marked_text: Option<String>,
-        font_family: SharedString,
-        font_size: Pixels,
-        line_height: Pixels,
-        cell_width: Pixels,
-        tab_id: String,
-        search_highlights: Option<std::collections::HashMap<(i32, i32), Hsla>>,
-    ) -> Self {
+    pub(crate) fn new(options: TerminalElementOptions) -> Self {
+        let TerminalElementOptions {
+            view,
+            focus_handle,
+            snapshot,
+            marked_text,
+            font_family,
+            font_size,
+            line_height,
+            cell_width,
+            tab_id,
+            search_highlights,
+        } = options;
         Self {
             view,
             focus_handle,
@@ -435,19 +449,19 @@ impl TerminalElement {
             }
 
             // Apply hover underline if mouse is hovering over this URL
-            if link_modifier_pressed && let Some(hu) = &hovered_url {
-                if hu.tab_id == self.tab_id
-                    && hu
-                        .cells
-                        .contains(&(render_cell.row as usize, render_cell.col as usize))
-                {
-                    underlines.push(LayoutUnderline {
-                        row: render_cell.row,
-                        col: render_cell.col,
-                        cells: terminal_cell_span(cell.flags),
-                        color: style.color,
-                    });
-                }
+            if link_modifier_pressed
+                && let Some(hu) = &hovered_url
+                && hu.tab_id == self.tab_id
+                && hu
+                    .cells
+                    .contains(&(render_cell.row as usize, render_cell.col as usize))
+            {
+                underlines.push(LayoutUnderline {
+                    row: render_cell.row,
+                    col: render_cell.col,
+                    cells: terminal_cell_span(cell.flags),
+                    color: style.color,
+                });
             }
 
             // Box Drawing & Block Elements interception
@@ -467,11 +481,11 @@ impl TerminalElement {
                 continue;
             }
 
-            if let Some(run) = current_run.as_mut() {
-                if run.can_append(&style, render_cell.row, render_cell.col) {
-                    run.append(cell.c, cell.zerowidth());
-                    continue;
-                }
+            if let Some(run) = current_run.as_mut()
+                && run.can_append(&style, render_cell.row, render_cell.col)
+            {
+                run.append(cell.c, cell.zerowidth());
+                continue;
             }
 
             if let Some(run) = current_run.take() {
@@ -591,7 +605,7 @@ impl Element for TerminalElement {
         // This is 100% accurate because it is recorded during layout prepaint.
         let view = self.view.clone();
         let tab_id = self.tab_id.clone();
-        let _ = view.update(cx, |this, cx| {
+        view.update(cx, |this, cx| {
             let old_bounds = this.terminal_bounds.insert(tab_id.clone(), bounds);
 
             // Sync PTY size unconditionally on every prepaint layout pass to ensure
@@ -686,47 +700,47 @@ impl Element for TerminalElement {
             cx,
         );
 
-        if let Some(marked_text) = self.marked_text.as_ref().filter(|text| !text.is_empty()) {
-            if let Some(cursor) = prepaint.cursor {
-                let pos = point(
-                    draw_origin.x + prepaint.metrics.cell_width * cursor.col as f32,
-                    draw_origin.y + prepaint.metrics.line_height * cursor.row as f32,
-                );
-                let mut base_style = self.base_text_style(cx);
-                base_style.underline = Some(UnderlineStyle {
-                    color: Some(base_style.color),
-                    thickness: px(1.0),
-                    wavy: false,
-                });
-                let shaped = window.text_system().shape_line(
-                    marked_text.clone().into(),
-                    self.font_size,
-                    &[TextRun {
-                        len: marked_text.len(),
-                        font: Font {
-                            family: self.font_family.clone(),
-                            ..Font::default()
-                        },
-                        color: base_style.color,
-                        underline: base_style.underline,
-                        ..Default::default()
-                    }],
+        if let Some(marked_text) = self.marked_text.as_ref().filter(|text| !text.is_empty())
+            && let Some(cursor) = prepaint.cursor
+        {
+            let pos = point(
+                draw_origin.x + prepaint.metrics.cell_width * cursor.col as f32,
+                draw_origin.y + prepaint.metrics.line_height * cursor.row as f32,
+            );
+            let mut base_style = self.base_text_style(cx);
+            base_style.underline = Some(UnderlineStyle {
+                color: Some(base_style.color),
+                thickness: px(1.0),
+                wavy: false,
+            });
+            let shaped = window.text_system().shape_line(
+                marked_text.clone().into(),
+                self.font_size,
+                &[TextRun {
+                    len: marked_text.len(),
+                    font: Font {
+                        family: self.font_family.clone(),
+                        ..Font::default()
+                    },
+                    color: base_style.color,
+                    underline: base_style.underline,
+                    ..Default::default()
+                }],
+                None,
+            );
+            let bg_bounds =
+                Bounds::new(pos, gpui::size(shaped.width, prepaint.metrics.line_height));
+            window.paint_quad(fill(bg_bounds, cx.theme().background));
+            shaped
+                .paint(
+                    pos,
+                    prepaint.metrics.line_height,
+                    gpui::TextAlign::Left,
                     None,
-                );
-                let bg_bounds =
-                    Bounds::new(pos, gpui::size(shaped.width, prepaint.metrics.line_height));
-                window.paint_quad(fill(bg_bounds, cx.theme().background));
-                shaped
-                    .paint(
-                        pos,
-                        prepaint.metrics.line_height,
-                        gpui::TextAlign::Left,
-                        None,
-                        window,
-                        cx,
-                    )
-                    .ok();
-            }
+                    window,
+                    cx,
+                )
+                .ok();
         }
 
         if let Some(cursor) = prepaint.cursor {
@@ -783,14 +797,13 @@ fn merge_rects(mut rects: Vec<LayoutRect>) -> Vec<LayoutRect> {
     let mut merged: Vec<LayoutRect> = Vec::with_capacity(rects.len());
 
     for rect in rects {
-        if let Some(last) = merged.last_mut() {
-            if last.row == rect.row
-                && last.color == rect.color
-                && last.col + last.cells as i32 == rect.col
-            {
-                last.cells += rect.cells;
-                continue;
-            }
+        if let Some(last) = merged.last_mut()
+            && last.row == rect.row
+            && last.color == rect.color
+            && last.col + last.cells as i32 == rect.col
+        {
+            last.cells += rect.cells;
+            continue;
         }
         merged.push(rect);
     }
@@ -803,11 +816,13 @@ fn merge_underlines(mut underlines: Vec<LayoutUnderline>) -> Vec<LayoutUnderline
     let mut merged: Vec<LayoutUnderline> = Vec::with_capacity(underlines.len());
 
     for u in underlines {
-        if let Some(last) = merged.last_mut() {
-            if last.row == u.row && last.color == u.color && last.col + last.cells as i32 == u.col {
-                last.cells += u.cells;
-                continue;
-            }
+        if let Some(last) = merged.last_mut()
+            && last.row == u.row
+            && last.color == u.color
+            && last.col + last.cells as i32 == u.col
+        {
+            last.cells += u.cells;
+            continue;
         }
         merged.push(u);
     }

@@ -4,7 +4,6 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
-use async_trait::async_trait;
 use directories::BaseDirs;
 use russh::{
     ChannelMsg, Disconnect,
@@ -15,7 +14,8 @@ use tokio::sync::mpsc;
 
 use crate::{
     session::{
-        config::{AuthMethod, Session},
+        config::{AuthMethod, ConnectionProxyConfig, Session},
+        host_keys::HostKeyVerifier,
         ssh_keys::{
             authenticate_with_default_keys, normalize_inline_private_key, private_keys_with_algs,
             session_has_explicit_key,
@@ -29,6 +29,7 @@ pub fn spawn_ssh_terminal(
     runtime: &tokio::runtime::Handle,
     tab_id: String,
     session: Session,
+    proxy_config: ConnectionProxyConfig,
     cols: u16,
     rows: u16,
     events: std::sync::mpsc::Sender<BackendEvent>,
@@ -39,6 +40,7 @@ pub fn spawn_ssh_terminal(
         if let Err(err) = run_ssh(
             task_tab.clone(),
             session,
+            proxy_config,
             cols,
             rows,
             cmd_rx,
@@ -124,6 +126,7 @@ async fn load_remote_command_history_with_handle(
 async fn run_ssh(
     tab_id: String,
     session: Session,
+    proxy_config: ConnectionProxyConfig,
     cols: u16,
     rows: u16,
     mut commands: mpsc::UnboundedReceiver<BackendCommand>,
@@ -138,7 +141,7 @@ async fn run_ssh(
     });
 
     let handle = Arc::new(tokio::sync::Mutex::new(
-        connect_and_authenticate(&tab_id, &session, &events).await?,
+        connect_and_authenticate(&tab_id, &session, &proxy_config, &events).await?,
     ));
 
     let mut channel = handle
@@ -282,6 +285,7 @@ async fn run_ssh(
 async fn connect_and_authenticate(
     tab_id: &str,
     session: &Session,
+    proxy_config: &ConnectionProxyConfig,
     events: &std::sync::mpsc::Sender<BackendEvent>,
 ) -> Result<russh::client::Handle<ClientHandler>> {
     let config = Arc::new(client::Config {
@@ -296,24 +300,25 @@ async fn connect_and_authenticate(
         addr,
         session.user
     );
-    let status_text =
-        if let Some((ptype, phost, pport)) = crate::session::config::active_proxy(session) {
-            let pport_val = pport.unwrap_or_else(|| if ptype == "http" { 8080 } else { 1080 });
-            format!(
-                "connecting to {addr} via {} proxy {}:{}",
-                ptype.to_uppercase(),
-                phost,
-                pport_val
-            )
-        } else {
-            format!("opening tcp connection to {addr}")
-        };
+    let status_text = if let Some((ptype, phost, pport)) =
+        crate::session::config::active_proxy(session, proxy_config)?
+    {
+        format!(
+            "connecting to {addr} via {} proxy {}:{}",
+            ptype.to_uppercase(),
+            phost,
+            pport
+        )
+    } else {
+        format!("opening tcp connection to {addr}")
+    };
     let _ = events.send(BackendEvent::Status {
         tab_id: tab_id.to_string(),
         text: status_text,
     });
-    let stream = crate::session::config::connect_proxy(session).await?;
-    let mut handle = client::connect_stream(config, stream, ClientHandler)
+    let stream = crate::session::config::connect_proxy(session, proxy_config).await?;
+    let handler = ClientHandler::new(&session.host, session.port)?;
+    let mut handle = client::connect_stream(config, stream, handler)
         .await
         .with_context(|| format!("connect {addr} failed"))?;
 
@@ -337,6 +342,7 @@ async fn connect_and_authenticate(
                 .authenticate_password(&session.user, &session.password)
                 .await
                 .context("password authentication failed")?
+                .success()
         }
         AuthMethod::Key => {
             let has_explicit_key = session_has_explicit_key(session);
@@ -366,22 +372,22 @@ async fn connect_and_authenticate(
             let passphrase = session.passphrase.trim();
             let passphrase = (!passphrase.is_empty()).then_some(passphrase);
 
-            let success = if has_explicit_key {
+            if has_explicit_key {
                 let keypair = load_session_private_key(session)?;
                 let algorithm = format!("{:?}", keypair.algorithm());
                 let _ = events.send(BackendEvent::Status {
                     tab_id: tab_id.to_string(),
                     text: format!("private key loaded from {source}, algorithm {algorithm}, sending public key authentication for {}", session.user),
                 });
-                let keys = private_keys_with_algs(keypair).context("invalid private key")?;
+                let keys = private_keys_with_algs(keypair);
                 let mut success = false;
                 for key in keys {
                     match handle.authenticate_publickey(&session.user, key).await {
-                        Ok(true) => {
+                        Ok(result) if result.success() => {
                             success = true;
                             break;
                         }
-                        Ok(false) => {
+                        Ok(_) => {
                             tracing::debug!(
                                 "[ssh] public key auth failed with algorithm, trying next"
                             );
@@ -416,8 +422,7 @@ async fn connect_and_authenticate(
                     ));
                 }
                 success
-            };
-            success
+            }
         }
         AuthMethod::Config => {
             // SSH Config auth: try the identity file from config, or default keys
@@ -440,15 +445,15 @@ async fn connect_and_authenticate(
             if has_explicit_key {
                 let keypair = load_session_private_key(session)?;
                 let algorithm = format!("{:?}", keypair.algorithm());
-                let keys = private_keys_with_algs(keypair).context("invalid private key")?;
+                let keys = private_keys_with_algs(keypair);
                 let mut success = false;
                 for key in keys {
                     match handle.authenticate_publickey(&session.user, key).await {
-                        Ok(true) => {
+                        Ok(result) if result.success() => {
                             success = true;
                             break;
                         }
-                        Ok(false) => {
+                        Ok(_) => {
                             continue;
                         }
                         Err(_) => {
@@ -754,23 +759,60 @@ fn parse_remote_command_history(output: &str) -> Vec<String> {
 }
 
 #[derive(Clone)]
-struct ClientHandler;
+struct ClientHandler {
+    host_keys: HostKeyVerifier,
+}
 
-#[async_trait]
+impl ClientHandler {
+    fn new(host: &str, port: u16) -> Result<Self> {
+        Ok(Self {
+            host_keys: HostKeyVerifier::new(host, port)?,
+        })
+    }
+
+    #[cfg(test)]
+    fn with_known_hosts_path(host: &str, port: u16, path: PathBuf) -> Self {
+        Self {
+            host_keys: HostKeyVerifier::with_known_hosts_path(host, port, path),
+        }
+    }
+}
+
 impl Handler for ClientHandler {
     type Error = anyhow::Error;
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &russh::keys::ssh_key::PublicKey,
+        server_public_key: &russh::keys::ssh_key::PublicKey,
     ) -> Result<bool, Self::Error> {
+        self.host_keys.verify(server_public_key)?;
         Ok(true)
     }
 }
 
 #[cfg(test)]
 mod command_history_tests {
-    use super::parse_remote_command_history;
+    use super::{ClientHandler, parse_remote_command_history};
+
+    const TEST_HOST_KEY: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ";
+
+    #[tokio::test]
+    async fn client_handler_rejects_unknown_host_key() {
+        let path = std::env::temp_dir().join(format!(
+            "jshell-missing-known-hosts-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut handler = ClientHandler::with_known_hosts_path("example.test", 2222, path);
+        let key = russh::keys::ssh_key::PublicKey::from_openssh(TEST_HOST_KEY)
+            .expect("parse test public key");
+
+        assert!(
+            russh::client::Handler::check_server_key(&mut handler, &key)
+                .await
+                .is_err()
+        );
+    }
 
     #[test]
     fn parses_bash_history_newest_first_and_skips_timestamps() {

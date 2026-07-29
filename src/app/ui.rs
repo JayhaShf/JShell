@@ -7,12 +7,14 @@ use gpui::{
 };
 use gpui_component::{
     ActiveTheme, Disableable as _, ElementExt, Icon, IconName, Root, Sizable as _, Size,
+    WindowExt as _,
     animation::Transition,
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,
     h_flex,
     input::Input,
     menu::{ContextMenuExt as _, PopupMenuItem},
+    notification::Notification,
     progress::Progress,
     scroll::{ScrollableElement as _, Scrollbar, ScrollbarShow},
     v_flex,
@@ -211,7 +213,7 @@ impl Ashell {
                     .child(t!("remote_files")),
             )
             .child(div().flex_1())
-            .when_some(active_sftp.clone(), |this, sftp| {
+            .when_some(active_sftp, |this, sftp| {
                 let selected_entries = sftp.selected_entries.clone();
                 this.child(
                     Button::new("sftp-sync-cwd")
@@ -572,9 +574,6 @@ impl Ashell {
                             let selected_path = selected_path.clone();
                             let view = view.clone();
                             let theme = cx.theme().clone();
-                            let icon_col_width = icon_col_width;
-                            let size_col_width = size_col_width;
-                            let modified_col_width = modified_col_width;
                             uniform_list(
                                 "sftp-entries-list",
                                 entries.len(),
@@ -2777,7 +2776,7 @@ impl Ashell {
                             .flex_1()
                             .min_h(px(0.))
                             .on_prepaint(move |bounds, _window, cx| {
-                                let _ = view.update(cx, |this, cx| {
+                                view.update(cx, |this, cx| {
                                     if this.terminal_panel_bounds != Some(bounds) {
                                         this.terminal_panel_bounds = Some(bounds);
                                         cx.notify();
@@ -2871,20 +2870,22 @@ impl Ashell {
                         }),
                     )
                     .child(terminal::element::TerminalElement::new(
-                        cx.entity(),
-                        focus_handle,
-                        snapshot,
-                        marked_text,
-                        font_family,
-                        font_size,
-                        line_height,
-                        cell_width,
-                        tab_id.to_string(),
-                        this.search_highlight_map(
-                            tab_id,
-                            cx.theme().danger.opacity(0.35),
-                            cx.theme().danger.opacity(0.70),
-                        ),
+                        terminal::element::TerminalElementOptions {
+                            view: cx.entity(),
+                            focus_handle,
+                            snapshot,
+                            marked_text,
+                            font_family,
+                            font_size,
+                            line_height,
+                            cell_width,
+                            tab_id: tab_id.to_string(),
+                            search_highlights: this.search_highlight_map(
+                                tab_id,
+                                cx.theme().danger.opacity(0.35),
+                                cx.theme().danger.opacity(0.70),
+                            ),
+                        },
                     ));
                 let scrollbar = this.terminal_scrollbars.entry(tab_id.clone()).or_default();
                 el = el.vertical_scrollbar(scrollbar);
@@ -3212,6 +3213,17 @@ impl Ashell {
 
 impl Render for Ashell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !self.config.is_persistent() && self.startup_config_error.take().is_some() {
+            let title = t!("config_load_failed_title").to_string();
+            let message = t!("config_load_failed_message").to_string();
+            cx.defer_in(window, move |_, window, cx| {
+                window.push_notification(
+                    Notification::error(message).title(title).autohide(false),
+                    cx,
+                );
+            });
+        }
+
         let active_document_id = self.active_document_id();
         if self
             .active_tab
@@ -3231,26 +3243,21 @@ impl Render for Ashell {
         if active_document_id.is_none()
             && let Some(active_id) = self.active_tab.clone()
         {
-            if let Some(scrollbar) = self.terminal_scrollbars.get(&active_id) {
-                if let Some(new_display_offset) = scrollbar.future_display_offset.take() {
-                    if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == active_id) {
-                        let current = tab.render_snapshot(false).display_offset;
-                        match new_display_offset.cmp(&current) {
-                            std::cmp::Ordering::Greater => {
-                                tab.scroll_up_by(new_display_offset - current)
-                            }
-                            std::cmp::Ordering::Less => {
-                                tab.scroll_down_by(current - new_display_offset)
-                            }
-                            std::cmp::Ordering::Equal => {}
-                        }
-                    }
+            if let Some(scrollbar) = self.terminal_scrollbars.get(&active_id)
+                && let Some(new_display_offset) = scrollbar.future_display_offset.take()
+                && let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == active_id)
+            {
+                let current = tab.render_snapshot(false).display_offset;
+                match new_display_offset.cmp(&current) {
+                    std::cmp::Ordering::Greater => tab.scroll_up_by(new_display_offset - current),
+                    std::cmp::Ordering::Less => tab.scroll_down_by(current - new_display_offset),
+                    std::cmp::Ordering::Equal => {}
                 }
             }
-            if let Some(snapshot) = self.active_snapshot().as_ref() {
-                if let Some(scrollbar) = self.terminal_scrollbars.get(&active_id) {
-                    scrollbar.update(snapshot, px(self.terminal_line_height()));
-                }
+            if let Some(snapshot) = self.active_snapshot().as_ref()
+                && let Some(scrollbar) = self.terminal_scrollbars.get(&active_id)
+            {
+                scrollbar.update(snapshot, px(self.terminal_line_height()));
             }
         }
 
@@ -3312,11 +3319,10 @@ impl Render for Ashell {
                 if window.focused(cx) == Some(this.focus_handle.clone()) {
                     if let Some(text) = this.active_terminal_selection_text() {
                         cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
-                        if let Some(active_id) = &this.active_tab {
-                            if let Some(tab) = this.tabs.iter_mut().find(|tab| &tab.id == active_id) {
+                        if let Some(active_id) = &this.active_tab
+                            && let Some(tab) = this.tabs.iter_mut().find(|tab| &tab.id == active_id) {
                                 tab.clear_selection();
                             }
-                        }
                         window.prevent_default();
                         cx.stop_propagation();
                     }
@@ -3326,11 +3332,10 @@ impl Render for Ashell {
             }))
             .on_action(cx.listener(|this, _: &crate::Paste, window, cx| {
                 if window.focused(cx) == Some(this.focus_handle.clone()) {
-                    if let Some(clipboard) = cx.read_from_clipboard() {
-                        if let Some(text) = clipboard.text() {
+                    if let Some(clipboard) = cx.read_from_clipboard()
+                        && let Some(text) = clipboard.text() {
                             this.paste_into_terminal(&text, window, cx);
                         }
-                    }
                 } else {
                     cx.propagate();
                 }
@@ -3552,19 +3557,18 @@ impl Render for Ashell {
                 move |_, window, cx| {
                     view.update(cx, |this, cx| {
                         let current_win_size = window.viewport_size();
-                        let size_changed = this.last_window_size.map_or(true, |prev| prev != current_win_size);
+                        let size_changed = this.last_window_size != Some(current_win_size);
                         this.last_window_size = Some(current_win_size);
 
                         let current_sizes = this.workspace_panels.read(cx).sizes().clone();
                         if let Some(current_first_size) = current_sizes.first().copied() {
                             if size_changed {
-                                if let Some(target_width) = this.last_sidebar_width {
-                                    if current_first_size != target_width {
+                                if let Some(target_width) = this.last_sidebar_width
+                                    && current_first_size != target_width {
                                         this.workspace_panels.update(cx, |state, cx| {
                                             state.resize_panel(0, target_width, window, cx);
                                         });
                                     }
-                                }
                             } else {
                                 this.last_sidebar_width = Some(current_first_size);
                             }

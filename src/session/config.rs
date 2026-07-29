@@ -1,6 +1,11 @@
-use std::{fs, path::PathBuf, sync::OnceLock};
+use std::{
+    fs::{self, File},
+    io::Write as _,
+    path::{Path, PathBuf},
+    sync::OnceLock,
+};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use argon2::Argon2;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chacha20poly1305::{
@@ -11,6 +16,8 @@ use directories::BaseDirs;
 use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+use super::config_key::{ConfigKeyProvider, MasterKey, PlatformKeyProvider};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -26,6 +33,10 @@ fn default_protocol() -> String {
 
 fn default_baud_rate() -> u32 {
     115200
+}
+
+fn default_session_proxy_type() -> String {
+    "none".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,7 +57,7 @@ pub struct Session {
     pub passphrase: String,
     #[serde(default)]
     pub last_used: Option<String>,
-    #[serde(default = "default_global_proxy_type")]
+    #[serde(default = "default_session_proxy_type")]
     pub proxy_type: String, // "none", "socks5", "http"
     #[serde(default)]
     pub proxy_host: String,
@@ -434,16 +445,124 @@ impl Default for ConfigFile {
     }
 }
 
+fn atomic_write_config(path: &Path, bytes: &[u8]) -> Result<()> {
+    atomic_write_config_with(path, bytes, |staged, target| {
+        staged
+            .persist(target)
+            .map_err(|err| anyhow::Error::new(err.error))
+    })
+}
+
+fn atomic_write_config_with(
+    path: &Path,
+    bytes: &[u8],
+    persist: impl FnOnce(tempfile::NamedTempFile, &Path) -> Result<File>,
+) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .context("configuration path has no parent directory")?;
+    let mut staged = tempfile::NamedTempFile::new_in(parent).with_context(|| {
+        format!(
+            "failed to create staged configuration in {}",
+            parent.display()
+        )
+    })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        staged
+            .as_file()
+            .set_permissions(fs::Permissions::from_mode(0o600))
+            .with_context(|| {
+                format!(
+                    "failed to set staged configuration permissions for {}",
+                    path.display()
+                )
+            })?;
+    }
+
+    staged.as_file_mut().write_all(bytes).with_context(|| {
+        format!(
+            "failed to write staged configuration for {}",
+            path.display()
+        )
+    })?;
+    staged.as_file_mut().flush().with_context(|| {
+        format!(
+            "failed to flush staged configuration for {}",
+            path.display()
+        )
+    })?;
+    staged
+        .as_file()
+        .sync_all()
+        .with_context(|| format!("failed to sync staged configuration for {}", path.display()))?;
+
+    let persisted = persist(staged, path)
+        .with_context(|| format!("failed to atomically replace {}", path.display()))?;
+    persisted
+        .sync_all()
+        .with_context(|| format!("failed to sync persisted configuration {}", path.display()))?;
+
+    #[cfg(unix)]
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .with_context(|| {
+            format!(
+                "failed to sync configuration directory {}",
+                parent.display()
+            )
+        })?;
+
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct ConfigStore {
     pub(crate) path: PathBuf,
     pub(crate) cache: ConfigFile,
+    master_key: MasterKey,
 }
 
 impl ConfigStore {
     pub fn load() -> Result<Self> {
         let path = Self::config_path()?;
         let legacy_path = Self::legacy_config_path()?;
+        Self::load_with_key_provider(
+            path,
+            legacy_path,
+            &PlatformKeyProvider,
+            &get_hardware_uuid(),
+        )
+    }
+
+    fn load_with_key_provider(
+        path: PathBuf,
+        legacy_path: PathBuf,
+        key_provider: &dyn ConfigKeyProvider,
+        legacy_hardware_id: &str,
+    ) -> Result<Self> {
+        Self::load_with_key_provider_and_persist(
+            path,
+            legacy_path,
+            key_provider,
+            legacy_hardware_id,
+            Self::save,
+        )
+    }
+
+    fn load_with_key_provider_and_persist<F>(
+        path: PathBuf,
+        legacy_path: PathBuf,
+        key_provider: &dyn ConfigKeyProvider,
+        legacy_hardware_id: &str,
+        persist_migration: F,
+    ) -> Result<Self>
+    where
+        F: Fn(&Self) -> Result<()>,
+    {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create config dir {}", parent.display()))?;
@@ -465,54 +584,88 @@ impl ConfigStore {
         let source_path = if path.exists() {
             path.clone()
         } else if legacy_path.exists() {
-            legacy_path
+            legacy_path.clone()
         } else {
             path.clone()
         };
         let migrated_config_location = source_path != path;
 
-        let mut cache = if source_path.exists() {
+        let (mut cache, master_key, migrated_encryption) = if source_path.exists() {
             let raw_bytes = fs::read(&source_path)
                 .with_context(|| format!("failed to read {}", source_path.display()))?;
-            let hardware_uuid = get_hardware_uuid();
-            match decrypt_config(&raw_bytes, &hardware_uuid) {
-                Ok(cache) => cache,
-                Err(decrypt_err) => {
-                    // Fallback to plain text JSON if decryption/parsing failed
-                    match serde_json::from_slice::<ConfigFile>(&raw_bytes) {
-                        Ok(cache) => cache,
-                        Err(json_err) => {
-                            let backup_path = source_path.with_extension("json.bak");
-                            if let Err(backup_err) = fs::write(&backup_path, &raw_bytes) {
-                                tracing::warn!(
-                                    "failed to parse config {} (decrypt err: {decrypt_err:#}, json err: {json_err:#}); backup to {} also failed: {backup_err:#}",
-                                    source_path.display(),
-                                    backup_path.display(),
-                                );
-                            } else {
-                                tracing::warn!(
-                                    "failed to parse config {} (decrypt err: {decrypt_err:#}, json err: {json_err:#}); backed up the original to {} and loaded defaults",
-                                    source_path.display(),
-                                    backup_path.display(),
-                                );
-                            }
-                            ConfigFile::default()
-                        }
-                    }
+            match config_format_version(&raw_bytes) {
+                Ok(2) => {
+                    let key = key_provider
+                        .load_existing()
+                        .context("load existing version 2 configuration master key")?;
+                    let cache = decrypt_config_v2(&raw_bytes, &key)
+                        .with_context(|| format!("failed to decrypt {}", source_path.display()))?;
+                    (cache, key, false)
+                }
+                Ok(1) => {
+                    let cache =
+                        decrypt_config_v1(&raw_bytes, legacy_hardware_id).with_context(|| {
+                            format!("failed to decrypt legacy config {}", source_path.display())
+                        })?;
+                    let key = key_provider
+                        .load_or_create()
+                        .context("initialize configuration master key for version 1 migration")?;
+                    (cache, key, true)
+                }
+                Ok(version) => {
+                    return Err(anyhow::anyhow!(
+                        "unsupported encrypted config version {version} in {}",
+                        source_path.display()
+                    ));
+                }
+                Err(header_error) => {
+                    let cache = parse_legacy_plaintext_config(
+                        &raw_bytes,
+                        source_path == legacy_path,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "failed to recognize config {} (encrypted header error: {header_error:#})",
+                            source_path.display()
+                        )
+                    })?;
+                    let key = key_provider
+                        .load_or_create()
+                        .context("initialize configuration master key for plaintext migration")?;
+                    (cache, key, true)
                 }
             }
         } else {
-            ConfigFile::default()
+            (
+                ConfigFile::default(),
+                key_provider
+                    .load_or_create()
+                    .context("initialize configuration master key")?,
+                false,
+            )
         };
 
         if cache.sync_device_id.is_empty() {
             cache.sync_device_id = Uuid::new_v4().to_string();
         }
         let migrated_font_preferences = migrate_legacy_font_preferences(&mut cache);
-        let store = Self { path, cache };
-        if (migrated_font_preferences || migrated_config_location)
-            && let Err(err) = store.save()
-        {
+        let store = Self {
+            path,
+            cache,
+            master_key,
+        };
+        if migrated_encryption || migrated_config_location {
+            persist_migration(&store)
+                .context("persist security-sensitive configuration migration")?;
+            if migrated_config_location {
+                fs::remove_file(&source_path).with_context(|| {
+                    format!(
+                        "remove migrated legacy configuration {}",
+                        source_path.display()
+                    )
+                })?;
+            }
+        } else if migrated_font_preferences && let Err(err) = persist_migration(&store) {
             tracing::warn!("failed to persist migrated font preferences: {err:#}");
         }
         Ok(store)
@@ -526,7 +679,20 @@ impl ConfigStore {
         Self {
             path: PathBuf::new(),
             cache,
+            master_key: MasterKey::random(),
         }
+    }
+
+    pub fn is_persistent(&self) -> bool {
+        !self.path.as_os_str().is_empty()
+    }
+
+    pub fn default_tmp_dir() -> Result<PathBuf> {
+        let config_path = Self::config_path()?;
+        let config_dir = config_path
+            .parent()
+            .context("configuration path has no parent directory")?;
+        Ok(config_dir.join("tmp"))
     }
 
     fn config_path() -> Result<PathBuf> {
@@ -657,10 +823,6 @@ impl ConfigStore {
     pub fn set_sync_etag(&mut self, etag: Option<String>) {
         self.cache.sync_etag = etag;
         self.cache.sync_etag_backend = self.sync_backend().to_string();
-    }
-
-    pub fn tmp_dir(&self) -> Option<PathBuf> {
-        self.path.parent().map(|p| p.join("tmp"))
     }
 
     pub fn follow_system_theme(&self) -> bool {
@@ -880,6 +1042,22 @@ impl ConfigStore {
         self.cache.global_proxy_password = val;
     }
 
+    pub fn connection_proxy_config(&self) -> ConnectionProxyConfig {
+        ConnectionProxyConfig {
+            read_env_proxy: self.cache.read_env_proxy,
+            use_global_proxy: self.cache.use_proxy,
+            global_proxy: ProxyEndpoint {
+                proxy_type: self.cache.global_proxy_type.clone(),
+                host: self.cache.global_proxy_host.clone(),
+                port: self.cache.global_proxy_port,
+                user: self.cache.global_proxy_user.clone(),
+                password: self.cache.global_proxy_password.clone(),
+            },
+            env_proxy: ENV_PROXY.get_or_init(read_proxy_from_env).clone(),
+            allow_direct: self.is_persistent(),
+        }
+    }
+
     pub fn show_hidden_files(&self) -> bool {
         self.cache.show_hidden_files
     }
@@ -1007,39 +1185,19 @@ impl ConfigStore {
         if self.path.as_os_str().is_empty() {
             return Ok(());
         }
-        let hardware_uuid = get_hardware_uuid();
-        let encrypted_bytes = encrypt_config(&self.cache, &hardware_uuid)?;
-        fs::write(&self.path, encrypted_bytes)
-            .with_context(|| format!("failed to write {}", self.path.display()))?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Ok(mut perms) = fs::metadata(&self.path).map(|m| m.permissions()) {
-                perms.set_mode(0o600);
-                let _ = fs::set_permissions(&self.path, perms);
-            }
-        }
-
-        Ok(())
+        let encrypted_bytes = encrypt_config_v2(&self.cache, &self.master_key)?;
+        atomic_write_config(&self.path, &encrypted_bytes)
     }
 
     pub fn save_merged_preferences(&self, local_config: ConfigFile) -> Result<()> {
         if self.path.as_os_str().is_empty() {
             return Ok(());
         }
-        let hardware_uuid = get_hardware_uuid();
-
         let mut disk_config = if self.path.exists() {
-            if let Ok(raw_bytes) = fs::read(&self.path) {
-                match decrypt_config(&raw_bytes, &hardware_uuid) {
-                    Ok(loaded) => loaded,
-                    Err(_) => serde_json::from_slice::<ConfigFile>(&raw_bytes)
-                        .unwrap_or_else(|_| self.cache.clone()),
-                }
-            } else {
-                self.cache.clone()
-            }
+            let raw_bytes = fs::read(&self.path)
+                .with_context(|| format!("failed to read {}", self.path.display()))?;
+            decrypt_config_v2(&raw_bytes, &self.master_key)
+                .with_context(|| format!("failed to decrypt {}", self.path.display()))?
         } else {
             self.cache.clone()
         };
@@ -1069,20 +1227,8 @@ impl ConfigStore {
         disk_config.sidebar_collapsed = local_config.sidebar_collapsed;
         disk_config.sftp_panel_minimized = local_config.sftp_panel_minimized;
 
-        let encrypted_bytes = encrypt_config(&disk_config, &hardware_uuid)?;
-        fs::write(&self.path, encrypted_bytes)
-            .with_context(|| format!("failed to write {}", self.path.display()))?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Ok(mut perms) = fs::metadata(&self.path).map(|m| m.permissions()) {
-                perms.set_mode(0o600);
-                let _ = fs::set_permissions(&self.path, perms);
-            }
-        }
-
-        Ok(())
+        let encrypted_bytes = encrypt_config_v2(&disk_config, &self.master_key)?;
+        atomic_write_config(&self.path, &encrypted_bytes)
     }
 }
 
@@ -1095,130 +1241,294 @@ impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + Sync + 'st
 {
 }
 
-#[derive(Debug, Clone)]
-pub struct EnvProxy {
-    pub proxy_type: String,
-    pub host: String,
-    pub port: Option<u16>,
-    pub user: String,
-    pub pass: String,
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProxyEndpoint {
+    proxy_type: String,
+    host: String,
+    port: Option<u16>,
+    user: String,
+    password: String,
 }
 
-pub static ENV_PROXY: OnceLock<Option<EnvProxy>> = OnceLock::new();
+#[derive(Debug, Clone)]
+pub struct ConnectionProxyConfig {
+    read_env_proxy: bool,
+    use_global_proxy: bool,
+    global_proxy: ProxyEndpoint,
+    env_proxy: std::result::Result<Option<ProxyEndpoint>, String>,
+    allow_direct: bool,
+}
 
-pub async fn connect_proxy(session: &Session) -> Result<Box<dyn ProxyStream>> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProxyKind {
+    Socks5,
+    Http,
+}
+
+impl ProxyKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Socks5 => "socks5",
+            Self::Http => "http",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedProxy {
+    kind: ProxyKind,
+    host: String,
+    port: u16,
+    user: String,
+    password: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProxyRoute {
+    Direct,
+    Proxy(ResolvedProxy),
+}
+
+static ENV_PROXY: OnceLock<std::result::Result<Option<ProxyEndpoint>, String>> = OnceLock::new();
+
+pub fn initialize_env_proxy() {
+    match ENV_PROXY.get_or_init(read_proxy_from_env) {
+        Ok(Some(proxy)) => tracing::info!(
+            "[proxy] loaded proxy from environment: type={}, host={}, port={:?}, user={}",
+            proxy.proxy_type,
+            proxy.host,
+            proxy.port,
+            proxy.user
+        ),
+        Ok(None) => tracing::debug!("[proxy] no proxy configured in environment"),
+        Err(error) => tracing::warn!("[proxy] invalid environment proxy: {error}"),
+    }
+}
+
+fn read_proxy_from_env() -> std::result::Result<Option<ProxyEndpoint>, String> {
+    const PROXY_VARIABLES: &[&str] = &[
+        "ALL_PROXY",
+        "all_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+    ];
+
+    for variable in PROXY_VARIABLES {
+        let Ok(value) = std::env::var(variable) else {
+            continue;
+        };
+        if value.trim().is_empty() {
+            continue;
+        }
+        return parse_env_proxy(variable, &value).map(Some);
+    }
+
+    Ok(None)
+}
+
+fn parse_env_proxy(variable: &str, value: &str) -> std::result::Result<ProxyEndpoint, String> {
+    let url = reqwest::Url::parse(value)
+        .map_err(|error| format!("{variable} is not a valid proxy URL: {error}"))?;
+    let proxy_type = match url.scheme() {
+        "socks5" | "socks5h" => url.scheme().to_string(),
+        "http" => "http".to_string(),
+        scheme => {
+            return Err(format!(
+                "{variable} uses unsupported proxy scheme '{scheme}'"
+            ));
+        }
+    };
+    let host = url
+        .host_str()
+        .filter(|host| !host.trim().is_empty())
+        .ok_or_else(|| format!("{variable} does not contain a proxy host"))?
+        .to_string();
+    let port = url
+        .port_or_known_default()
+        .filter(|port| *port != 0)
+        .ok_or_else(|| format!("{variable} does not contain a valid proxy port"))?;
+
+    Ok(ProxyEndpoint {
+        proxy_type,
+        host,
+        port: Some(port),
+        user: url.username().to_string(),
+        password: url.password().unwrap_or_default().to_string(),
+    })
+}
+
+fn validate_proxy(endpoint: ProxyEndpoint, source: &str) -> Result<ResolvedProxy> {
+    let kind = match endpoint.proxy_type.trim().to_ascii_lowercase().as_str() {
+        "socks5" | "socks5h" => ProxyKind::Socks5,
+        "http" => ProxyKind::Http,
+        proxy_type => bail!("{source} proxy type '{proxy_type}' is unsupported"),
+    };
+    let host = endpoint.host.trim();
+    if host.is_empty() {
+        bail!("{source} proxy is enabled but its host is empty");
+    }
+    let Some(port) = endpoint.port.filter(|port| *port != 0) else {
+        bail!("{source} proxy is enabled but its port is missing or invalid");
+    };
+
+    Ok(ResolvedProxy {
+        kind,
+        host: host.to_string(),
+        port,
+        user: endpoint.user,
+        password: endpoint.password,
+    })
+}
+
+fn resolve_proxy(session: &Session, config: &ConnectionProxyConfig) -> Result<ProxyRoute> {
+    let session_proxy_type = session.proxy_type.trim();
+    if !session_proxy_type.is_empty() && !session_proxy_type.eq_ignore_ascii_case("none") {
+        return validate_proxy(
+            ProxyEndpoint {
+                proxy_type: session.proxy_type.clone(),
+                host: session.proxy_host.clone(),
+                port: session.proxy_port,
+                user: session.proxy_user.clone(),
+                password: session.proxy_password.clone(),
+            },
+            "session",
+        )
+        .map(ProxyRoute::Proxy);
+    }
+
+    if config.read_env_proxy {
+        match &config.env_proxy {
+            Ok(Some(proxy)) => {
+                return validate_proxy(proxy.clone(), "environment").map(ProxyRoute::Proxy);
+            }
+            Ok(None) => {}
+            Err(error) => bail!("environment proxy configuration is invalid: {error}"),
+        }
+    }
+
+    if config.use_global_proxy {
+        return validate_proxy(config.global_proxy.clone(), "global").map(ProxyRoute::Proxy);
+    }
+
+    if config.allow_direct {
+        Ok(ProxyRoute::Direct)
+    } else {
+        bail!("persistent configuration is unavailable; refusing an unconfirmed direct connection")
+    }
+}
+
+fn format_authority(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+fn validate_http_connect_response(response: &[u8]) -> Result<()> {
+    let mut headers = [httparse::EMPTY_HEADER; 64];
+    let mut parsed = httparse::Response::new(&mut headers);
+    match parsed
+        .parse(response)
+        .context("parse HTTP proxy CONNECT response")?
+    {
+        httparse::Status::Complete(_) => {}
+        httparse::Status::Partial => bail!("HTTP proxy returned an incomplete CONNECT response"),
+    }
+    let status = parsed
+        .code
+        .context("HTTP proxy CONNECT response has no status code")?;
+    if !(200..300).contains(&status) {
+        bail!("HTTP proxy CONNECT failed with status {status}");
+    }
+    Ok(())
+}
+
+pub async fn connect_proxy(
+    session: &Session,
+    config: &ConnectionProxyConfig,
+) -> Result<Box<dyn ProxyStream>> {
+    const MAX_HTTP_CONNECT_RESPONSE_BYTES: usize = 16 * 1024;
+
+    let route = resolve_proxy(session, config)?;
     let target_host = session.host.clone();
     let target_port = session.port;
-    let session = session.clone();
-
     let connect_fut = async move {
-        let target_host = &target_host;
-        let config = ConfigStore::load().unwrap_or_else(|_| ConfigStore::in_memory());
-        let (proxy_type, proxy_host, proxy_port, proxy_user, proxy_password) = {
-            if !session.proxy_type.is_empty() && session.proxy_type != "none" {
-                (
-                    session.proxy_type.clone(),
-                    session.proxy_host.clone(),
-                    session.proxy_port,
-                    session.proxy_user.clone(),
-                    session.proxy_password.clone(),
-                )
-            } else if config.cache.read_env_proxy
-                && ENV_PROXY.get().and_then(|opt| opt.as_ref()).is_some()
-            {
-                let env_p = ENV_PROXY.get().and_then(|opt| opt.as_ref()).unwrap();
-                (
-                    env_p.proxy_type.clone(),
-                    env_p.host.clone(),
-                    env_p.port,
-                    env_p.user.clone(),
-                    env_p.pass.clone(),
-                )
-            } else if config.cache.use_proxy {
-                (
-                    config.cache.global_proxy_type.clone(),
-                    config.cache.global_proxy_host.clone(),
-                    config.cache.global_proxy_port,
-                    config.cache.global_proxy_user.clone(),
-                    config.cache.global_proxy_password.clone(),
-                )
-            } else {
-                (
-                    "none".to_string(),
-                    String::new(),
-                    None,
-                    String::new(),
-                    String::new(),
-                )
-            }
-        };
-
-        if proxy_type != "none" && (proxy_host.is_empty() || proxy_port.is_none()) {
-            let addr = format!("{}:{}", target_host, target_port);
-            let stream = tokio::net::TcpStream::connect(&addr).await?;
-            return Ok(Box::new(stream) as Box<dyn ProxyStream>);
-        }
-
-        match proxy_type.as_str() {
-            "socks5" | "socks5h" => {
-                let proxy_port = proxy_port.unwrap_or(1080);
-                let proxy_addr = format!("{}:{}", proxy_host, proxy_port);
-
-                if !proxy_user.is_empty() {
-                    let stream = tokio_socks::tcp::Socks5Stream::connect_with_password(
-                        proxy_addr.as_str(),
-                        (target_host.as_str(), target_port),
-                        &proxy_user,
-                        &proxy_password,
-                    )
+        match route {
+            ProxyRoute::Direct => {
+                let stream = tokio::net::TcpStream::connect((target_host.as_str(), target_port))
                     .await
-                    .map_err(|e| anyhow::anyhow!("SOCKS5 proxy connection failed: {}", e))?;
-                    Ok(Box::new(stream) as Box<dyn ProxyStream>)
-                } else {
-                    let stream = tokio_socks::tcp::Socks5Stream::connect(
-                        proxy_addr.as_str(),
-                        (target_host.as_str(), target_port),
-                    )
-                    .await
-                    .map_err(|e| anyhow::anyhow!("SOCKS5 proxy connection failed: {}", e))?;
-                    Ok(Box::new(stream) as Box<dyn ProxyStream>)
-                }
-            }
-            "http" => {
-                let proxy_port = proxy_port.unwrap_or(8080);
-                let proxy_addr = format!("{}:{}", proxy_host, proxy_port);
-
-                use tokio::io::AsyncWriteExt;
-                let mut stream = tokio::net::TcpStream::connect(&proxy_addr)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("HTTP proxy connection failed: {}", e))?;
-
-                let mut request = format!(
-                    "CONNECT {}:{} HTTP/1.1\r\nHost: {}:{}\r\n",
-                    target_host, target_port, target_host, target_port
-                );
-                if !proxy_user.is_empty() {
-                    use base64::Engine as _;
-                    let auth = format!("{}:{}", proxy_user, proxy_password);
-                    let encoded = base64::engine::general_purpose::STANDARD.encode(auth);
-                    request.push_str(&format!("Proxy-Authorization: Basic {}\r\n", encoded));
-                }
-                request.push_str("\r\n");
-
-                stream.write_all(request.as_bytes()).await?;
-
-                let mut response = [0u8; 1024];
-                let n = tokio::io::AsyncReadExt::read(&mut stream, &mut response).await?;
-                let resp_str = String::from_utf8_lossy(&response[..n]);
-                if !resp_str.contains("200") && !resp_str.contains("established") {
-                    return Err(anyhow::anyhow!("HTTP proxy CONNECT failed: {}", resp_str));
-                }
-
+                    .with_context(|| {
+                        format!("direct connection to {target_host}:{target_port} failed")
+                    })?;
                 Ok(Box::new(stream) as Box<dyn ProxyStream>)
             }
-            _ => {
-                let addr = format!("{}:{}", target_host, target_port);
-                let stream = tokio::net::TcpStream::connect(&addr).await?;
+            ProxyRoute::Proxy(proxy) if proxy.kind == ProxyKind::Socks5 => {
+                let proxy_address = (proxy.host.as_str(), proxy.port);
+                if proxy.user.is_empty() {
+                    let stream = tokio_socks::tcp::Socks5Stream::connect(
+                        proxy_address,
+                        (target_host.as_str(), target_port),
+                    )
+                    .await
+                    .map_err(|error| anyhow::anyhow!("SOCKS5 proxy connection failed: {error}"))?;
+                    Ok(Box::new(stream) as Box<dyn ProxyStream>)
+                } else {
+                    let stream = tokio_socks::tcp::Socks5Stream::connect_with_password(
+                        proxy_address,
+                        (target_host.as_str(), target_port),
+                        &proxy.user,
+                        &proxy.password,
+                    )
+                    .await
+                    .map_err(|error| anyhow::anyhow!("SOCKS5 proxy connection failed: {error}"))?;
+                    Ok(Box::new(stream) as Box<dyn ProxyStream>)
+                }
+            }
+            ProxyRoute::Proxy(proxy) => {
+                use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+                let stream = tokio::net::TcpStream::connect((proxy.host.as_str(), proxy.port))
+                    .await
+                    .map_err(|error| anyhow::anyhow!("HTTP proxy connection failed: {error}"))?;
+                let mut stream = tokio::io::BufStream::new(stream);
+                let authority = format_authority(&target_host, target_port);
+                let mut request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n");
+                if !proxy.user.is_empty() {
+                    let auth = format!("{}:{}", proxy.user, proxy.password);
+                    request.push_str(&format!(
+                        "Proxy-Authorization: Basic {}\r\n",
+                        STANDARD.encode(auth)
+                    ));
+                }
+                request.push_str("\r\n");
+                stream
+                    .write_all(request.as_bytes())
+                    .await
+                    .context("write HTTP proxy CONNECT request")?;
+                stream
+                    .flush()
+                    .await
+                    .context("flush HTTP proxy CONNECT request")?;
+
+                let mut response = Vec::with_capacity(512);
+                loop {
+                    response.push(
+                        stream
+                            .read_u8()
+                            .await
+                            .context("read HTTP proxy CONNECT response")?,
+                    );
+                    if response.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                    if response.len() >= MAX_HTTP_CONNECT_RESPONSE_BYTES {
+                        bail!("HTTP proxy CONNECT response headers exceed 16 KiB");
+                    }
+                }
+                validate_http_connect_response(&response)?;
                 Ok(Box::new(stream) as Box<dyn ProxyStream>)
             }
         }
@@ -1229,51 +1539,17 @@ pub async fn connect_proxy(session: &Session) -> Result<Box<dyn ProxyStream>> {
         .map_err(|_| anyhow::anyhow!("connection timed out after 16 seconds"))?
 }
 
-pub fn active_proxy(session: &Session) -> Option<(String, String, Option<u16>)> {
-    let config = ConfigStore::load().unwrap_or_else(|_| ConfigStore::in_memory());
-    let (proxy_type, proxy_host, proxy_port, _, _) = {
-        if !session.proxy_type.is_empty() && session.proxy_type != "none" {
-            (
-                session.proxy_type.clone(),
-                session.proxy_host.clone(),
-                session.proxy_port,
-                session.proxy_user.clone(),
-                session.proxy_password.clone(),
-            )
-        } else if config.cache.read_env_proxy
-            && ENV_PROXY.get().and_then(|opt| opt.as_ref()).is_some()
-        {
-            let env_p = ENV_PROXY.get().and_then(|opt| opt.as_ref()).unwrap();
-            (
-                env_p.proxy_type.clone(),
-                env_p.host.clone(),
-                env_p.port,
-                env_p.user.clone(),
-                env_p.pass.clone(),
-            )
-        } else if config.cache.use_proxy {
-            (
-                config.cache.global_proxy_type.clone(),
-                config.cache.global_proxy_host.clone(),
-                config.cache.global_proxy_port,
-                config.cache.global_proxy_user.clone(),
-                config.cache.global_proxy_password.clone(),
-            )
-        } else {
-            (
-                "none".to_string(),
-                String::new(),
-                None,
-                String::new(),
-                String::new(),
-            )
-        }
-    };
-
-    if proxy_type != "none" && !proxy_host.is_empty() && proxy_port.is_some() {
-        Some((proxy_type, proxy_host, proxy_port))
-    } else {
-        None
+pub fn active_proxy(
+    session: &Session,
+    config: &ConnectionProxyConfig,
+) -> Result<Option<(String, String, u16)>> {
+    match resolve_proxy(session, config)? {
+        ProxyRoute::Direct => Ok(None),
+        ProxyRoute::Proxy(proxy) => Ok(Some((
+            proxy.kind.as_str().to_string(),
+            proxy.host,
+            proxy.port,
+        ))),
     }
 }
 
@@ -1285,6 +1561,20 @@ struct EncryptedConfigEnvelope {
     salt: String,
     nonce: String,
     payload: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct EncryptedConfigEnvelopeV2 {
+    format_version: u32,
+    kdf: String,
+    cipher: String,
+    nonce: String,
+    payload: String,
+}
+
+#[derive(Deserialize)]
+struct EncryptedConfigHeader {
+    format_version: u32,
 }
 
 static HARDWARE_UUID_CACHE: OnceLock<String> = OnceLock::new();
@@ -1339,12 +1629,12 @@ pub fn get_hardware_uuid() -> String {
                 use winreg::RegKey;
                 use winreg::enums::HKEY_LOCAL_MACHINE;
                 let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
-                if let Ok(subkey) = hklm.open_subkey("SOFTWARE\\Microsoft\\Cryptography") {
-                    if let Ok(guid) = subkey.get_value::<String, _>("MachineGuid") {
-                        let guid = guid.trim().to_string();
-                        if !guid.is_empty() {
-                            return guid;
-                        }
+                if let Ok(subkey) = hklm.open_subkey("SOFTWARE\\Microsoft\\Cryptography")
+                    && let Ok(guid) = subkey.get_value::<String, _>("MachineGuid")
+                {
+                    let guid = guid.trim().to_string();
+                    if !guid.is_empty() {
+                        return guid;
                     }
                 }
             }
@@ -1354,7 +1644,112 @@ pub fn get_hardware_uuid() -> String {
         .clone()
 }
 
-fn encrypt_config(config: &ConfigFile, password: &str) -> Result<Vec<u8>> {
+fn config_format_version(raw: &[u8]) -> Result<u32> {
+    serde_json::from_slice::<EncryptedConfigHeader>(raw)
+        .map(|header| header.format_version)
+        .context("parse encrypted config header")
+}
+
+fn parse_legacy_plaintext_config(raw: &[u8], from_legacy_path: bool) -> Result<ConfigFile> {
+    let value: serde_json::Value =
+        serde_json::from_slice(raw).context("parse plaintext config JSON")?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("plaintext config must be a JSON object"))?;
+
+    const ENVELOPE_FIELDS: &[&str] = &[
+        "format_version",
+        "kdf",
+        "cipher",
+        "salt",
+        "nonce",
+        "payload",
+    ];
+    if ENVELOPE_FIELDS
+        .iter()
+        .any(|field| object.contains_key(*field))
+    {
+        return Err(anyhow::anyhow!(
+            "encrypted config envelope must not be treated as plaintext"
+        ));
+    }
+
+    const CONFIG_FIELDS: &[&str] = &[
+        "sessions",
+        "session_folders",
+        "font_defaults_version",
+        "terminal_font_family",
+        "ui_font_family",
+        "theme_mode",
+        "window_bounds",
+        "sync_device_id",
+    ];
+    if !from_legacy_path
+        && !CONFIG_FIELDS
+            .iter()
+            .any(|field| object.contains_key(*field))
+    {
+        return Err(anyhow::anyhow!(
+            "JSON object does not contain recognized legacy config fields"
+        ));
+    }
+
+    serde_json::from_value(value).context("parse recognized plaintext config")
+}
+
+fn encrypt_config_v2(config: &ConfigFile, key: &MasterKey) -> Result<Vec<u8>> {
+    let mut nonce = [0u8; 24];
+    OsRng.fill_bytes(&mut nonce);
+
+    let plaintext = serde_json::to_vec(config).context("serialize config")?;
+    let ciphertext = XChaCha20Poly1305::new(key.as_bytes().into())
+        .encrypt(XNonce::from_slice(&nonce), plaintext.as_ref())
+        .map_err(|_| anyhow::anyhow!("encrypt version 2 config payload"))?;
+
+    serde_json::to_vec_pretty(&EncryptedConfigEnvelopeV2 {
+        format_version: 2,
+        kdf: "os-keyring".to_string(),
+        cipher: "xchacha20poly1305".to_string(),
+        nonce: STANDARD.encode(nonce),
+        payload: STANDARD.encode(ciphertext),
+    })
+    .context("serialize version 2 encrypted config envelope")
+}
+
+fn decrypt_config_v2(raw: &[u8], key: &MasterKey) -> Result<ConfigFile> {
+    let envelope: EncryptedConfigEnvelopeV2 =
+        serde_json::from_slice(raw).context("parse version 2 encrypted config envelope")?;
+    if envelope.format_version != 2
+        || envelope.kdf != "os-keyring"
+        || envelope.cipher != "xchacha20poly1305"
+    {
+        return Err(anyhow::anyhow!(
+            "unsupported version 2 encrypted config format"
+        ));
+    }
+
+    let nonce = STANDARD
+        .decode(envelope.nonce)
+        .context("decode version 2 config nonce")?;
+    if nonce.len() != 24 {
+        return Err(anyhow::anyhow!("invalid version 2 config nonce"));
+    }
+    let ciphertext = STANDARD
+        .decode(envelope.payload)
+        .context("decode version 2 encrypted config payload")?;
+    let plaintext = XChaCha20Poly1305::new(key.as_bytes().into())
+        .decrypt(XNonce::from_slice(&nonce), ciphertext.as_ref())
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "cannot decrypt version 2 config; master key mismatch or corrupted data"
+            )
+        })?;
+
+    serde_json::from_slice(&plaintext).context("parse decrypted version 2 config")
+}
+
+#[cfg(test)]
+fn encrypt_config_v1(config: &ConfigFile, password: &str) -> Result<Vec<u8>> {
     let mut salt = [0u8; 16];
     let mut nonce = [0u8; 24];
     OsRng.fill_bytes(&mut salt);
@@ -1381,7 +1776,7 @@ fn encrypt_config(config: &ConfigFile, password: &str) -> Result<Vec<u8>> {
     .context("serialize encrypted config envelope")
 }
 
-fn decrypt_config(raw: &[u8], password: &str) -> Result<ConfigFile> {
+fn decrypt_config_v1(raw: &[u8], password: &str) -> Result<ConfigFile> {
     let envelope: EncryptedConfigEnvelope =
         serde_json::from_slice(raw).context("parse encrypted config envelope")?;
     if envelope.format_version != 1
@@ -1419,7 +1814,36 @@ fn decrypt_config(raw: &[u8], password: &str) -> Result<ConfigFile> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::{Cell, RefCell};
+
     use super::*;
+
+    use crate::session::config_key::{ConfigKeyProvider, MasterKey};
+
+    #[derive(Default)]
+    struct TestKeyProvider {
+        key: RefCell<Option<MasterKey>>,
+        create_calls: Cell<usize>,
+    }
+
+    impl ConfigKeyProvider for TestKeyProvider {
+        fn load_existing(&self) -> Result<MasterKey> {
+            self.key
+                .borrow()
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("test master key is missing"))
+        }
+
+        fn load_or_create(&self) -> Result<MasterKey> {
+            self.create_calls.set(self.create_calls.get() + 1);
+            if let Some(key) = self.key.borrow().clone() {
+                return Ok(key);
+            }
+            let key = MasterKey::from_secret(vec![41; 32])?;
+            self.key.replace(Some(key.clone()));
+            Ok(key)
+        }
+    }
 
     #[test]
     fn default_terminal_font_follows_the_system_monospace_font() {
@@ -1428,6 +1852,151 @@ mod tests {
         assert_eq!(config.terminal_font_family, ".SystemMonospace");
         assert_eq!(config.terminal_font_size, 16.0);
         assert_eq!(config.font_defaults_version, 4);
+    }
+
+    fn direct_proxy_config() -> ConnectionProxyConfig {
+        ConnectionProxyConfig {
+            read_env_proxy: false,
+            use_global_proxy: false,
+            global_proxy: ProxyEndpoint {
+                proxy_type: "socks5".to_string(),
+                host: String::new(),
+                port: None,
+                user: String::new(),
+                password: String::new(),
+            },
+            env_proxy: Ok(None),
+            allow_direct: true,
+        }
+    }
+
+    fn proxy_endpoint(proxy_type: &str, host: &str, port: u16) -> ProxyEndpoint {
+        ProxyEndpoint {
+            proxy_type: proxy_type.to_string(),
+            host: host.to_string(),
+            port: Some(port),
+            user: String::new(),
+            password: String::new(),
+        }
+    }
+
+    #[test]
+    fn legacy_session_without_proxy_type_inherits_proxy_settings() {
+        let session: Session = serde_json::from_str(
+            r#"{"id":"1","name":"legacy","host":"example.test","port":22,"user":"root","auth":"password"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(session.proxy_type, "none");
+    }
+
+    #[test]
+    fn session_proxy_has_priority_over_environment_and_global_proxy() {
+        let mut session = Session::password(
+            "example.test".to_string(),
+            22,
+            "root".to_string(),
+            "secret".to_string(),
+        );
+        session.proxy_type = "http".to_string();
+        session.proxy_host = "session.proxy".to_string();
+        session.proxy_port = Some(8080);
+        let mut config = direct_proxy_config();
+        config.read_env_proxy = true;
+        config.env_proxy = Ok(Some(proxy_endpoint("socks5", "env.proxy", 1080)));
+        config.use_global_proxy = true;
+        config.global_proxy = proxy_endpoint("socks5", "global.proxy", 1080);
+
+        assert_eq!(
+            resolve_proxy(&session, &config).unwrap(),
+            ProxyRoute::Proxy(ResolvedProxy {
+                kind: ProxyKind::Http,
+                host: "session.proxy".to_string(),
+                port: 8080,
+                user: String::new(),
+                password: String::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn environment_proxy_has_priority_over_global_proxy() {
+        let session = Session::password(
+            "example.test".to_string(),
+            22,
+            "root".to_string(),
+            "secret".to_string(),
+        );
+        let mut config = direct_proxy_config();
+        config.read_env_proxy = true;
+        config.env_proxy = Ok(Some(proxy_endpoint("socks5", "env.proxy", 1080)));
+        config.use_global_proxy = true;
+        config.global_proxy = proxy_endpoint("http", "global.proxy", 8080);
+
+        assert!(matches!(
+            resolve_proxy(&session, &config).unwrap(),
+            ProxyRoute::Proxy(ResolvedProxy {
+                kind: ProxyKind::Socks5,
+                ref host,
+                port: 1080,
+                ..
+            }) if host == "env.proxy"
+        ));
+    }
+
+    #[test]
+    fn invalid_selected_proxy_does_not_fall_back_to_direct_connection() {
+        let mut session = Session::password(
+            "example.test".to_string(),
+            22,
+            "root".to_string(),
+            "secret".to_string(),
+        );
+        session.proxy_type = "http".to_string();
+        session.proxy_host = String::new();
+        session.proxy_port = Some(8080);
+
+        let error = resolve_proxy(&session, &direct_proxy_config()).unwrap_err();
+        assert!(error.to_string().contains("host is empty"));
+    }
+
+    #[test]
+    fn unavailable_persistent_configuration_refuses_unconfirmed_direct_connection() {
+        let session = Session::password(
+            "example.test".to_string(),
+            22,
+            "root".to_string(),
+            "secret".to_string(),
+        );
+        let mut config = direct_proxy_config();
+        config.allow_direct = false;
+
+        let error = resolve_proxy(&session, &config).unwrap_err();
+        assert!(error.to_string().contains("refusing"));
+    }
+
+    #[test]
+    fn environment_proxy_parser_rejects_unsupported_schemes() {
+        let error = parse_env_proxy("HTTPS_PROXY", "https://proxy.example:443").unwrap_err();
+        assert!(error.contains("unsupported proxy scheme 'https'"));
+
+        let proxy = parse_env_proxy("HTTP_PROXY", "http://user:pass@proxy.example").unwrap();
+        assert_eq!(proxy.host, "proxy.example");
+        assert_eq!(proxy.port, Some(80));
+        assert_eq!(proxy.user, "user");
+        assert_eq!(proxy.password, "pass");
+    }
+
+    #[test]
+    fn http_connect_validation_requires_a_success_status_code() {
+        validate_http_connect_response(b"HTTP/1.1 200 Connection established\r\n\r\n").unwrap();
+
+        let error = validate_http_connect_response(
+            b"HTTP/1.1 500 Proxy Error\r\nX-Debug: expected 200 later\r\n\r\n",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("status 500"));
+        assert!(validate_http_connect_response(b"HTTP/1.1 200").is_err());
     }
 
     #[test]
@@ -1539,21 +2108,350 @@ mod tests {
     }
 
     #[test]
+    fn config_encryption_v2_roundtrip_rejects_wrong_master_key() {
+        let mut config = ConfigFile::default();
+        config.sessions.push(Session::password(
+            "example.test".to_string(),
+            22,
+            "admin".to_string(),
+            "do-not-store-in-plaintext".to_string(),
+        ));
+        let key = crate::session::config_key::MasterKey::from_secret(vec![17; 32]).unwrap();
+        let wrong_key = crate::session::config_key::MasterKey::from_secret(vec![19; 32]).unwrap();
+
+        let encrypted = encrypt_config_v2(&config, &key).expect("encrypt version 2 config");
+        let envelope: serde_json::Value = serde_json::from_slice(&encrypted).unwrap();
+
+        assert_eq!(config_format_version(&encrypted).unwrap(), 2);
+        assert_eq!(envelope["kdf"], "os-keyring");
+        assert_eq!(envelope["cipher"], "xchacha20poly1305");
+        assert!(envelope.get("salt").is_none());
+        assert!(!String::from_utf8_lossy(&encrypted).contains("do-not-store-in-plaintext"));
+
+        let decrypted = decrypt_config_v2(&encrypted, &key).expect("decrypt version 2 config");
+        assert_eq!(decrypted.sessions[0].password, "do-not-store-in-plaintext");
+        assert!(decrypt_config_v2(&encrypted, &wrong_key).is_err());
+    }
+
+    #[test]
+    fn config_encryption_v1_remains_available_for_migration() {
+        let config = ConfigFile::default();
+        let hardware_id = "legacy-hardware-id";
+
+        let encrypted =
+            encrypt_config_v1(&config, hardware_id).expect("encrypt legacy version 1 config");
+
+        assert_eq!(config_format_version(&encrypted).unwrap(), 1);
+        let decrypted = decrypt_config_v1(&encrypted, hardware_id)
+            .expect("decrypt legacy version 1 config during migration");
+        assert_eq!(decrypted.terminal_font_family, config.terminal_font_family);
+        assert!(decrypt_config_v1(&encrypted, "different-hardware-id").is_err());
+    }
+
+    #[test]
+    fn config_store_encryption_v2_missing_key_preserves_file() {
+        let path = std::env::temp_dir().join(format!(
+            "jshell-config-v2-missing-key-{}.json",
+            Uuid::new_v4()
+        ));
+        let legacy_path = path.with_extension("legacy.json");
+        let encryption_key = MasterKey::from_secret(vec![43; 32]).unwrap();
+        let original = encrypt_config_v2(&ConfigFile::default(), &encryption_key).unwrap();
+        fs::write(&path, &original).unwrap();
+        let provider = TestKeyProvider::default();
+
+        let error = ConfigStore::load_with_key_provider(
+            path.clone(),
+            legacy_path,
+            &provider,
+            "legacy-hardware-id",
+        )
+        .err()
+        .expect("version 2 config without its key must fail closed");
+
+        assert!(format!("{error:#}").contains("missing"));
+        assert_eq!(provider.create_calls.get(), 0);
+        assert_eq!(fs::read(&path).unwrap(), original);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn config_store_encryption_first_run_creates_key_and_saves_v2() {
+        let path =
+            std::env::temp_dir().join(format!("jshell-config-first-run-{}.json", Uuid::new_v4()));
+        let provider = TestKeyProvider::default();
+        let mut store = ConfigStore::load_with_key_provider(
+            path.clone(),
+            path.with_extension("legacy.json"),
+            &provider,
+            "legacy-hardware-id",
+        )
+        .unwrap();
+        store.cache.ui_font_size = 18.0;
+
+        store.save().unwrap();
+
+        assert_eq!(provider.create_calls.get(), 1);
+        let raw = fs::read(&path).unwrap();
+        assert_eq!(config_format_version(&raw).unwrap(), 2);
+        let key = provider.key.borrow().clone().unwrap();
+        assert_eq!(decrypt_config_v2(&raw, &key).unwrap().ui_font_size, 18.0);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn config_store_encryption_v2_reuses_existing_key() {
+        let path = std::env::temp_dir().join(format!(
+            "jshell-config-v2-existing-key-{}.json",
+            Uuid::new_v4()
+        ));
+        let key = MasterKey::from_secret(vec![53; 32]).unwrap();
+        let config = ConfigFile {
+            ui_font_size: 17.0,
+            ..ConfigFile::default()
+        };
+        fs::write(&path, encrypt_config_v2(&config, &key).unwrap()).unwrap();
+        let provider = TestKeyProvider {
+            key: RefCell::new(Some(key)),
+            ..TestKeyProvider::default()
+        };
+
+        let store = ConfigStore::load_with_key_provider(
+            path.clone(),
+            path.with_extension("legacy.json"),
+            &provider,
+            "wrong-legacy-hardware-id",
+        )
+        .unwrap();
+
+        assert_eq!(store.ui_font_size(), 17.0);
+        assert_eq!(provider.create_calls.get(), 0);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn config_store_encryption_v1_migrates_once_and_stops_using_hardware_id() {
+        let path = std::env::temp_dir().join(format!(
+            "jshell-config-v1-migration-{}.json",
+            Uuid::new_v4()
+        ));
+        let mut config = ConfigFile::default();
+        config.sessions.push(Session::password(
+            "migration.example".to_string(),
+            22,
+            "root".to_string(),
+            "legacy-password".to_string(),
+        ));
+        fs::write(
+            &path,
+            encrypt_config_v1(&config, "original-hardware-id").unwrap(),
+        )
+        .unwrap();
+        let provider = TestKeyProvider::default();
+
+        let migrated = ConfigStore::load_with_key_provider(
+            path.clone(),
+            path.with_extension("legacy.json"),
+            &provider,
+            "original-hardware-id",
+        )
+        .unwrap();
+
+        assert_eq!(migrated.sessions()[0].password, "legacy-password");
+        assert_eq!(config_format_version(&fs::read(&path).unwrap()).unwrap(), 2);
+        assert_eq!(provider.create_calls.get(), 1);
+
+        let reopened = ConfigStore::load_with_key_provider(
+            path.clone(),
+            path.with_extension("legacy.json"),
+            &provider,
+            "different-hardware-id",
+        )
+        .unwrap();
+        assert_eq!(reopened.sessions()[0].host, "migration.example");
+        assert_eq!(provider.create_calls.get(), 1);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn config_store_encryption_corrupted_v2_preserves_file() {
+        let path = std::env::temp_dir().join(format!(
+            "jshell-config-v2-corrupted-{}.json",
+            Uuid::new_v4()
+        ));
+        let key = MasterKey::from_secret(vec![59; 32]).unwrap();
+        let mut envelope: serde_json::Value =
+            serde_json::from_slice(&encrypt_config_v2(&ConfigFile::default(), &key).unwrap())
+                .unwrap();
+        envelope["payload"] = serde_json::Value::String("AAAA".to_string());
+        let corrupted = serde_json::to_vec_pretty(&envelope).unwrap();
+        fs::write(&path, &corrupted).unwrap();
+        let provider = TestKeyProvider {
+            key: RefCell::new(Some(key)),
+            ..TestKeyProvider::default()
+        };
+
+        assert!(
+            ConfigStore::load_with_key_provider(
+                path.clone(),
+                path.with_extension("legacy.json"),
+                &provider,
+                "legacy-hardware-id",
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(&path).unwrap(), corrupted);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn config_store_encryption_recognized_plaintext_migrates_but_unknown_json_does_not() {
+        let path = std::env::temp_dir().join(format!(
+            "jshell-config-plaintext-migration-{}.json",
+            Uuid::new_v4()
+        ));
+        fs::write(&path, br#"{"sessions":[],"ui_font_size":18.0}"#).unwrap();
+        let provider = TestKeyProvider::default();
+
+        let migrated = ConfigStore::load_with_key_provider(
+            path.clone(),
+            path.with_extension("legacy.json"),
+            &provider,
+            "legacy-hardware-id",
+        )
+        .unwrap();
+
+        assert_eq!(migrated.ui_font_size(), 18.0);
+        assert_eq!(config_format_version(&fs::read(&path).unwrap()).unwrap(), 2);
+
+        let unknown_path = path.with_extension("unknown.json");
+        let unknown = br#"{"unrecognized":true}"#;
+        fs::write(&unknown_path, unknown).unwrap();
+        let unknown_provider = TestKeyProvider::default();
+        assert!(
+            ConfigStore::load_with_key_provider(
+                unknown_path.clone(),
+                unknown_path.with_extension("legacy.json"),
+                &unknown_provider,
+                "legacy-hardware-id",
+            )
+            .is_err()
+        );
+        assert_eq!(unknown_provider.create_calls.get(), 0);
+        assert_eq!(fs::read(&unknown_path).unwrap(), unknown);
+
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(unknown_path);
+    }
+
+    #[test]
+    fn security_migration_persist_failure_is_returned_and_preserves_source_bytes() {
+        let root = std::env::temp_dir().join(format!(
+            "jshell-security-migration-failure-{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("sessions.json");
+        let original = br#"{"sessions":[],"ui_font_size":18.0}"#;
+        fs::write(&path, original).unwrap();
+        let provider = TestKeyProvider::default();
+
+        let error = ConfigStore::load_with_key_provider_and_persist(
+            path.clone(),
+            root.join("legacy.json"),
+            &provider,
+            "legacy-hardware-id",
+            |_| Err(anyhow::anyhow!("simulated migration persistence failure")),
+        )
+        .err()
+        .expect("security migration persistence failure must abort loading");
+
+        assert!(format!("{error:#}").contains("simulated migration persistence failure"));
+        assert_eq!(fs::read(&path).unwrap(), original);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn successful_legacy_location_migration_removes_the_old_source_file() {
+        let root = std::env::temp_dir().join(format!(
+            "jshell-legacy-location-migration-{}",
+            Uuid::new_v4()
+        ));
+        let new_path = root.join("jshell").join("sessions.json");
+        let legacy_path = root.join("ashell").join("sessions.json");
+        fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+        fs::write(&legacy_path, br#"{"sessions":[],"ui_font_size":17.0}"#).unwrap();
+        let provider = TestKeyProvider::default();
+
+        let store = ConfigStore::load_with_key_provider(
+            new_path.clone(),
+            legacy_path.clone(),
+            &provider,
+            "legacy-hardware-id",
+        )
+        .unwrap();
+
+        assert_eq!(store.ui_font_size(), 17.0);
+        assert_eq!(
+            config_format_version(&fs::read(&new_path).unwrap()).unwrap(),
+            2
+        );
+        assert!(!legacy_path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn atomic_config_write_replaces_existing_file() {
+        let root =
+            std::env::temp_dir().join(format!("jshell-atomic-config-write-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("sessions.json");
+        fs::write(&path, b"previous complete config").unwrap();
+
+        atomic_write_config(&path, b"replacement complete config").unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"replacement complete config");
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn atomic_config_write_keeps_existing_file_when_replace_fails() {
+        let root =
+            std::env::temp_dir().join(format!("jshell-atomic-config-write-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("sessions.json");
+        let original = b"previous complete config";
+        fs::write(&path, original).unwrap();
+
+        let error =
+            atomic_write_config_with(&path, b"replacement complete config", |_staged, _target| {
+                Err(anyhow::anyhow!("simulated atomic replace failure"))
+            })
+            .expect_err("replace failure must be returned");
+
+        assert!(format!("{error:#}").contains("simulated atomic replace failure"));
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn test_config_encryption_roundtrip() {
         let config = ConfigFile::default();
         let password = "test-password-123";
-        let encrypted = encrypt_config(&config, password).unwrap();
+        let encrypted = encrypt_config_v1(&config, password).unwrap();
 
         // Ensure it doesn't contain plain text fields of default config
         let encrypted_str = String::from_utf8_lossy(&encrypted);
         assert!(!encrypted_str.contains("Noto Sans CJK SC"));
         assert!(encrypted_str.contains("argon2id"));
 
-        let decrypted = decrypt_config(&encrypted, password).unwrap();
+        let decrypted = decrypt_config_v1(&encrypted, password).unwrap();
         assert_eq!(decrypted.terminal_font_family, config.terminal_font_family);
 
         // Decrypt with wrong password should fail
-        assert!(decrypt_config(&encrypted, "wrong-password").is_err());
+        assert!(decrypt_config_v1(&encrypted, "wrong-password").is_err());
     }
 
     #[test]
@@ -1563,6 +2461,7 @@ mod tests {
         let mut store = ConfigStore {
             path: path.clone(),
             cache: ConfigFile::default(),
+            master_key: MasterKey::from_secret(vec![47; 32]).unwrap(),
         };
 
         let session = Session {
@@ -1588,15 +2487,17 @@ mod tests {
         store.cache.sessions.push(session.clone());
         store.save().unwrap();
 
-        let mut local_config = ConfigFile::default();
-        local_config.ui_font_size = 18.0;
-        local_config.terminal_font_size = 20.0;
-        local_config.show_hidden_files = true;
+        let local_config = ConfigFile {
+            ui_font_size: 18.0,
+            terminal_font_size: 20.0,
+            show_hidden_files: true,
+            ..ConfigFile::default()
+        };
 
         store.save_merged_preferences(local_config).unwrap();
 
         let loaded_bytes = fs::read(&path).unwrap();
-        let decrypted = decrypt_config(&loaded_bytes, &get_hardware_uuid()).unwrap();
+        let decrypted = decrypt_config_v2(&loaded_bytes, &store.master_key).unwrap();
 
         assert_eq!(decrypted.ui_font_size, 18.0);
         assert_eq!(decrypted.terminal_font_size, 20.0);

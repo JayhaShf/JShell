@@ -19,6 +19,7 @@ use std::{
 };
 
 use crate::app::resizable::ResizableState;
+use crate::app::startup::StartupConfig;
 use gpui::{
     AppContext as _, Bounds, Context, Entity, FocusHandle, Pixels, Point, SharedString, Size,
     UniformListScrollHandle, Window, point, px, size,
@@ -112,10 +113,10 @@ impl PaneLayout {
                 children.retain(|c| !matches!(c, PaneLayout::Single(id) if id.is_empty()));
                 if children.is_empty() {
                     *self = PaneLayout::Single(String::new());
-                } else if children.len() == 1 {
-                    if let Some(replacement) = children.pop() {
-                        *self = replacement;
-                    }
+                } else if children.len() == 1
+                    && let Some(replacement) = children.pop()
+                {
+                    *self = replacement;
                 }
                 true
             }
@@ -305,6 +306,7 @@ pub(crate) struct Ashell {
     pub(crate) prev_monitoring_size: Option<Pixels>,
     pub(crate) status: SharedString,
     pub(crate) config: ConfigStore,
+    pub(crate) startup_config_error: Option<String>,
     pub(crate) cursor_style: crate::session::config::CursorStyle,
     pub(crate) system_sampler: SystemSampler,
     pub(crate) recording_action: Option<String>,
@@ -410,7 +412,15 @@ impl Ashell {
             .unwrap_or_else(|| "Unknown".to_string())
     }
 
-    pub(crate) fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub(crate) fn new(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        startup_config: StartupConfig,
+    ) -> Self {
+        let StartupConfig {
+            config,
+            error: startup_config_error,
+        } = startup_config;
         let host_input = cx.new(|cx| InputState::new(window, cx).placeholder(t!("host")));
         let session_name_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("name (optional)"));
@@ -458,10 +468,6 @@ impl Ashell {
         });
         let command_bar_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder(t!("command_bar_placeholder").to_string())
-        });
-        let config = ConfigStore::load().unwrap_or_else(|err| {
-            tracing::warn!("failed to load config: {err:#}");
-            ConfigStore::in_memory()
         });
         let global_proxy_host_input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -738,6 +744,7 @@ impl Ashell {
             prev_monitoring_size: None,
             status: "ready".into(),
             config,
+            startup_config_error,
             system_sampler,
             recording_action: None,
             active_dialog: None,
@@ -897,7 +904,7 @@ impl Ashell {
         } else if input == &self.search_input {
             if let InputEvent::PressEnter { .. } = event {
                 if self.search_query.is_empty()
-                    || self.search_input.read(cx).text().to_string() != self.search_query
+                    || *self.search_input.read(cx).text() != self.search_query
                 {
                     self.perform_search(window, cx);
                 } else {
@@ -906,12 +913,12 @@ impl Ashell {
                 window.prevent_default();
                 cx.stop_propagation();
             }
-        } else if input == &self.command_bar_input {
-            if let InputEvent::PressEnter { .. } = event {
-                self.execute_command_bar_input(window, cx);
-                window.prevent_default();
-                cx.stop_propagation();
-            }
+        } else if input == &self.command_bar_input
+            && let InputEvent::PressEnter { .. } = event
+        {
+            self.execute_command_bar_input(window, cx);
+            window.prevent_default();
+            cx.stop_propagation();
         }
         cx.notify();
     }
@@ -991,13 +998,13 @@ impl Ashell {
                         tab.backend_initialized = true;
                         tab.status = text.clone();
                     }
-                    if let Some(progress) = self.connection_progress.as_mut() {
-                        if progress.tab_id == tab_id {
-                            progress.lines.push(text.clone().into());
-                            let _idx = progress.lines.len().saturating_sub(1);
-                            self.connection_scroll_handle
-                                .set_offset(gpui::point(px(0.), px(-99999.0)));
-                        }
+                    if let Some(progress) = self.connection_progress.as_mut()
+                        && progress.tab_id == tab_id
+                    {
+                        progress.lines.push(text.clone().into());
+                        let _idx = progress.lines.len().saturating_sub(1);
+                        self.connection_scroll_handle
+                            .set_offset(gpui::point(px(0.), px(-99999.0)));
                     }
                     self.status = text.into();
                 }
@@ -1029,27 +1036,27 @@ impl Ashell {
                     path,
                     entries,
                 } => {
-                    if let Some(group) = self.tab_groups.iter_mut().find(|g| g.id == tab_id) {
-                        if let Some(sftp) = group.sftp.as_mut() {
-                            sftp.current_path = path;
-                            sftp.entries = entries;
-                            self.pending_sftp_path_sync = Some(sftp.current_path.clone());
-                        }
+                    if let Some(group) = self.tab_groups.iter_mut().find(|g| g.id == tab_id)
+                        && let Some(sftp) = group.sftp.as_mut()
+                    {
+                        sftp.current_path = path;
+                        sftp.entries = entries;
+                        self.pending_sftp_path_sync = Some(sftp.current_path.clone());
                     }
                 }
                 BackendEvent::SftpPreview { tab_id, preview } => {
-                    if let Some(group) = self.tab_groups.iter_mut().find(|g| g.id == tab_id) {
-                        if let Some(sftp) = group.sftp.as_mut() {
-                            sftp.selected_path = Some(preview.path.clone());
-                            sftp.preview = Some(preview);
-                        }
+                    if let Some(group) = self.tab_groups.iter_mut().find(|g| g.id == tab_id)
+                        && let Some(sftp) = group.sftp.as_mut()
+                    {
+                        sftp.selected_path = Some(preview.path.clone());
+                        sftp.preview = Some(preview);
                     }
                 }
                 BackendEvent::SftpStatus { tab_id, text } => {
-                    if let Some(group) = self.tab_groups.iter_mut().find(|g| g.id == tab_id) {
-                        if let Some(sftp) = group.sftp.as_mut() {
-                            sftp.status = text.clone();
-                        }
+                    if let Some(group) = self.tab_groups.iter_mut().find(|g| g.id == tab_id)
+                        && let Some(sftp) = group.sftp.as_mut()
+                    {
+                        sftp.status = text.clone();
                     }
                     if self.active_group.as_ref() == Some(&tab_id) {
                         self.status = text.into();
@@ -1124,15 +1131,15 @@ impl Ashell {
                     if self.system_tab_id.as_deref() == Some(tab_id.as_str()) {
                         self.system_status = Some(reason.clone().into());
                     }
-                    if let Some(progress) = self.connection_progress.as_mut() {
-                        if progress.tab_id == tab_id {
-                            progress.lines.push(reason.clone().into());
-                            let _idx = progress.lines.len().saturating_sub(1);
-                            self.connection_scroll_handle
-                                .set_offset(gpui::point(px(0.), px(-99999.0)));
-                            progress.title = t!("connection_failed").into();
-                            progress.failed = true;
-                        }
+                    if let Some(progress) = self.connection_progress.as_mut()
+                        && progress.tab_id == tab_id
+                    {
+                        progress.lines.push(reason.clone().into());
+                        let _idx = progress.lines.len().saturating_sub(1);
+                        self.connection_scroll_handle
+                            .set_offset(gpui::point(px(0.), px(-99999.0)));
+                        progress.title = t!("connection_failed").into();
+                        progress.failed = true;
                     }
                     self.status = reason.into();
                 }
@@ -1171,10 +1178,10 @@ impl Ashell {
                     transfers_changed = true;
                 }
                 BackendEvent::SftpHome { tab_id, home } => {
-                    if let Some(group) = self.tab_groups.iter_mut().find(|g| g.id == tab_id) {
-                        if let Some(sftp) = group.sftp.as_mut() {
-                            sftp.home_dir = home;
-                        }
+                    if let Some(group) = self.tab_groups.iter_mut().find(|g| g.id == tab_id)
+                        && let Some(sftp) = group.sftp.as_mut()
+                    {
+                        sftp.home_dir = home;
                     }
                 }
                 BackendEvent::TerminalTitleChanged { tab_id, title } => {
@@ -1220,16 +1227,15 @@ impl Ashell {
         if self.last_system_sample.elapsed() >= SystemSampler::interval() {
             self.last_system_sample = Instant::now();
             // Use system_tab_id (not active_tab) to decide remote vs local sampling
-            if let Some(ref tab_id) = self.system_tab_id.clone() {
-                if self
+            if let Some(ref tab_id) = self.system_tab_id.clone()
+                && self
                     .tabs
                     .iter()
                     .any(|t| t.id == *tab_id && t.kind == TabKind::Ssh && t.connected)
-                    && self.system_status.is_none()
-                {
-                    self.request_active_system_snapshot();
-                    return false;
-                }
+                && self.system_status.is_none()
+            {
+                self.request_active_system_snapshot();
+                return false;
             }
             let snapshot = self.system_sampler.sample();
             let cpu_usage = snapshot.cpu_percent;
@@ -1324,6 +1330,7 @@ impl Ashell {
         }
 
         for (ix, tab_id, session, tab_kind) in retry_tabs {
+            let proxy_config = self.config.connection_proxy_config();
             // Close old backend
             self.tabs[ix].send_backend(crate::terminal::BackendCommand::Close);
 
@@ -1338,17 +1345,15 @@ impl Ashell {
                     );
                     crate::terminal::BackendTx::Serial(b)
                 }
-                crate::terminal::TabKind::Ssh => {
-                    let b = crate::backend::ssh::spawn_ssh_terminal(
-                        self.runtime.handle(),
-                        tab_id.clone(),
-                        session.clone(),
-                        self.tabs[ix].cols,
-                        self.tabs[ix].rows,
-                        self.events_tx.clone(),
-                    );
-                    b
-                }
+                crate::terminal::TabKind::Ssh => crate::backend::ssh::spawn_ssh_terminal(
+                    self.runtime.handle(),
+                    tab_id.clone(),
+                    session.clone(),
+                    proxy_config.clone(),
+                    self.tabs[ix].cols,
+                    self.tabs[ix].rows,
+                    self.events_tx.clone(),
+                ),
                 _ => continue,
             };
 
@@ -1372,22 +1377,23 @@ impl Ashell {
                     .find(|t| group.pane_root.contains(&t.id) && t.session.is_some())
                     .and_then(|t| t.session.clone());
 
-                if let Some(session) = group_session {
-                    if session.protocol != "serial" {
-                        self.sftp_handles.remove(&group_id);
-                        let sftp_handle = crate::sftp::spawn_sftp(
-                            self.runtime.handle(),
-                            group_id.clone(),
-                            session,
-                            self.events_tx.clone(),
-                        );
-                        self.sftp_handles.insert(group_id.clone(), sftp_handle);
+                if let Some(session) = group_session
+                    && session.protocol != "serial"
+                {
+                    self.sftp_handles.remove(&group_id);
+                    let sftp_handle = crate::sftp::spawn_sftp(
+                        self.runtime.handle(),
+                        group_id.clone(),
+                        session,
+                        proxy_config.clone(),
+                        self.events_tx.clone(),
+                    );
+                    self.sftp_handles.insert(group_id.clone(), sftp_handle);
 
-                        if let Some(group) = self.tab_groups.iter_mut().find(|g| g.id == group_id) {
-                            if let Some(sftp) = group.sftp.as_mut() {
-                                sftp.status = rust_i18n::t!("sftp_connecting").to_string();
-                            }
-                        }
+                    if let Some(group) = self.tab_groups.iter_mut().find(|g| g.id == group_id)
+                        && let Some(sftp) = group.sftp.as_mut()
+                    {
+                        sftp.status = rust_i18n::t!("sftp_connecting").to_string();
                     }
                 }
             }
@@ -1439,19 +1445,17 @@ impl Ashell {
 
             let parsed = Self::parse_path_from_title(&tab.dynamic_title, home_dir);
 
-            if let Some(path) = parsed {
-                if let Some(group) = self
+            if let Some(path) = parsed
+                && let Some(group) = self
                     .tab_groups
                     .iter_mut()
                     .find(|g| g.pane_root.contains(&active_id))
-                {
-                    if let Some(sftp) = group.sftp.as_mut() {
-                        sftp.current_path = path.clone();
-                        self.pending_sftp_path_sync = Some(path.clone());
-                        if let Some(handle) = self.sftp_handles.get(&group.id) {
-                            handle.send(crate::sftp::SftpCommand::ListDir(path));
-                        }
-                    }
+                && let Some(sftp) = group.sftp.as_mut()
+            {
+                sftp.current_path = path.clone();
+                self.pending_sftp_path_sync = Some(path.clone());
+                if let Some(handle) = self.sftp_handles.get(&group.id) {
+                    handle.send(crate::sftp::SftpCommand::ListDir(path));
                 }
             }
         }
@@ -1561,12 +1565,11 @@ impl Ashell {
                 .map(|s| s.into())
                 .collect();
 
-            if self.sftp_panel_minimized {
-                if let Some(prev) = self.prev_monitoring_size {
-                    if body_sizes.len() > 1 {
-                        body_sizes[1] = prev.into();
-                    }
-                }
+            if self.sftp_panel_minimized
+                && let Some(prev) = self.prev_monitoring_size
+                && body_sizes.len() > 1
+            {
+                body_sizes[1] = prev.into();
             }
 
             config.set_layout_state(Some(saved_bounds), Some(workspace_sizes), Some(body_sizes));

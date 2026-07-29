@@ -7,7 +7,6 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
-use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 use directories::BaseDirs;
 use flate2::read::GzDecoder;
@@ -30,7 +29,8 @@ use rust_i18n::t;
 
 use crate::{
     session::{
-        config::{AuthMethod, Session},
+        config::{AuthMethod, ConnectionProxyConfig, Session},
+        host_keys::HostKeyVerifier,
         ssh_keys::{
             authenticate_with_default_keys, normalize_inline_private_key, private_keys_with_algs,
             session_has_explicit_key,
@@ -165,6 +165,30 @@ impl TransferStateFlag {
     }
 }
 
+#[derive(Clone, Copy)]
+struct TransferContext<'a> {
+    flag: &'a TransferStateFlag,
+    events: &'a std::sync::mpsc::Sender<BackendEvent>,
+    tab_id: &'a str,
+    id: &'a str,
+}
+
+impl<'a> TransferContext<'a> {
+    fn new(
+        flag: &'a TransferStateFlag,
+        events: &'a std::sync::mpsc::Sender<BackendEvent>,
+        tab_id: &'a str,
+        id: &'a str,
+    ) -> Self {
+        Self {
+            flag,
+            events,
+            tab_id,
+            id,
+        }
+    }
+}
+
 struct SftpHandleInner {
     commands: UnboundedSender<SftpCommand>,
     #[allow(dead_code)]
@@ -273,6 +297,7 @@ pub fn spawn_sftp(
     runtime: &tokio::runtime::Handle,
     tab_id: String,
     session: Session,
+    proxy_config: ConnectionProxyConfig,
     events: std::sync::mpsc::Sender<BackendEvent>,
 ) -> SftpHandle {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -281,6 +306,7 @@ pub fn spawn_sftp(
         if let Err(err) = run_sftp(
             tab_id.clone(),
             session,
+            proxy_config,
             cmd_rx,
             cmd_tx_clone,
             events.clone(),
@@ -308,6 +334,7 @@ pub fn spawn_sftp(
 async fn run_sftp(
     tab_id: String,
     session: Session,
+    proxy_config: ConnectionProxyConfig,
     mut commands: UnboundedReceiver<SftpCommand>,
     commands_tx: UnboundedSender<SftpCommand>,
     events: std::sync::mpsc::Sender<BackendEvent>,
@@ -317,7 +344,7 @@ async fn run_sftp(
         text: t!("sftp_connecting").to_string(),
     });
 
-    let handle = connect_and_authenticate(&session).await?;
+    let handle = connect_and_authenticate(&session, &proxy_config).await?;
     let channel = handle
         .channel_open_session()
         .await
@@ -480,10 +507,7 @@ async fn run_sftp(
                         &sftp_session,
                         &remote,
                         Path::new(&local_dir),
-                        flag,
-                        &events_clone,
-                        &tab_id_clone,
-                        &id,
+                        TransferContext::new(&flag, &events_clone, &tab_id_clone, &id),
                     )
                     .await
                     {
@@ -638,8 +662,7 @@ async fn run_sftp(
             }
             SftpCommand::EditFile { remote_path } => {
                 let id = uuid::Uuid::new_v4().to_string();
-                let config = crate::session::config::ConfigStore::load().unwrap();
-                let tmp_dir = config.tmp_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+                let tmp_dir = edit_tmp_dir();
                 let base = base_name(&remote_path);
                 let local_path = tmp_dir.join(format!("{}-{}", id, base));
 
@@ -669,10 +692,7 @@ async fn run_sftp(
                         &sftp_session,
                         &remote_path,
                         &local_path,
-                        &flag,
-                        &events_clone,
-                        &tab_id_clone,
-                        "edit-download",
+                        TransferContext::new(&flag, &events_clone, &tab_id_clone, "edit-download"),
                     )
                     .await
                     {
@@ -695,10 +715,10 @@ async fn run_sftp(
                     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
                     let mut watcher = match notify::recommended_watcher(
                         move |res: notify::Result<notify::Event>| {
-                            if let Ok(event) = res {
-                                if event.kind.is_modify() {
-                                    let _ = tx.send(());
-                                }
+                            if let Ok(event) = res
+                                && event.kind.is_modify()
+                            {
+                                let _ = tx.send(());
                             }
                         },
                     ) {
@@ -706,14 +726,16 @@ async fn run_sftp(
                         Err(_) => return,
                     };
 
-                    if let Err(_) = watcher.watch(&local_path, notify::RecursiveMode::NonRecursive)
+                    if watcher
+                        .watch(&local_path, notify::RecursiveMode::NonRecursive)
+                        .is_err()
                     {
                         return;
                     }
 
-                    while let Some(_) = rx.recv().await {
+                    while rx.recv().await.is_some() {
                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                        while let Ok(_) = rx.try_recv() {} // drain pending
+                        while rx.try_recv().is_ok() {} // drain pending
 
                         if commands_tx_clone
                             .send(SftpCommand::UploadEditedFile {
@@ -752,10 +774,7 @@ async fn run_sftp(
                         &sftp_session,
                         Path::new(&local_path),
                         &remote_path,
-                        &flag,
-                        &events_clone,
-                        &tab_id_clone,
-                        "edit-upload",
+                        TransferContext::new(&flag, &events_clone, &tab_id_clone, "edit-upload"),
                         transferred,
                         None,
                     )
@@ -937,6 +956,7 @@ async fn emit_entries(
 
 async fn connect_and_authenticate(
     session: &Session,
+    proxy_config: &ConnectionProxyConfig,
 ) -> Result<Arc<russh::client::Handle<SftpClientHandler>>> {
     let config = Arc::new(client::Config {
         inactivity_timeout: None,
@@ -945,8 +965,9 @@ async fn connect_and_authenticate(
         ..Default::default()
     });
     let addr = format!("{}:{}", session.host, session.port);
-    let stream = crate::session::config::connect_proxy(session).await?;
-    let mut handle = client::connect_stream(config, stream, SftpClientHandler)
+    let stream = crate::session::config::connect_proxy(session, proxy_config).await?;
+    let handler = SftpClientHandler::new(&session.host, session.port)?;
+    let mut handle = client::connect_stream(config, stream, handler)
         .await
         .with_context(|| format!("connect {addr} failed"))?;
 
@@ -954,20 +975,22 @@ async fn connect_and_authenticate(
         AuthMethod::Password => handle
             .authenticate_password(&session.user, &session.password)
             .await
-            .context("password authentication failed")?,
+            .context("password authentication failed")?
+            .success(),
         AuthMethod::Key => {
             let has_explicit_key = session_has_explicit_key(session);
-            let success = if has_explicit_key {
+
+            if has_explicit_key {
                 let keypair = load_session_private_key(session)?;
-                let keys = private_keys_with_algs(keypair).context("invalid private key")?;
+                let keys = private_keys_with_algs(keypair);
                 let mut success = false;
                 for key in keys {
                     match handle.authenticate_publickey(&session.user, key).await {
-                        Ok(true) => {
+                        Ok(result) if result.success() => {
                             success = true;
                             break;
                         }
-                        Ok(false) => {
+                        Ok(_) => {
                             tracing::debug!(
                                 "[sftp] public key auth failed with algorithm, trying next"
                             );
@@ -1002,8 +1025,7 @@ async fn connect_and_authenticate(
                     ));
                 }
                 success
-            };
-            success
+            }
         }
         AuthMethod::Config => {
             // For Config auth, try the identity file from config entry, or default keys
@@ -1012,15 +1034,15 @@ async fn connect_and_authenticate(
 
             if has_explicit_key {
                 let keypair = load_session_private_key(session)?;
-                let keys = private_keys_with_algs(keypair).context("invalid private key")?;
+                let keys = private_keys_with_algs(keypair);
                 let mut success = false;
                 for key in keys {
                     match handle.authenticate_publickey(&session.user, key).await {
-                        Ok(true) => {
+                        Ok(result) if result.success() => {
                             success = true;
                             break;
                         }
-                        Ok(false) => {
+                        Ok(_) => {
                             tracing::debug!(
                                 "[sftp] public key auth failed with algorithm, trying next"
                             );
@@ -1130,6 +1152,40 @@ fn base_name(path: &str) -> String {
         .next()
         .unwrap_or(path)
         .to_string()
+}
+
+fn edit_tmp_dir() -> PathBuf {
+    prepare_edit_tmp_dir(
+        crate::session::config::ConfigStore::default_tmp_dir(),
+        std::env::temp_dir().join("jshell"),
+    )
+}
+
+fn prepare_edit_tmp_dir(preferred: Result<PathBuf>, fallback: PathBuf) -> PathBuf {
+    match preferred {
+        Ok(path) => match fs::create_dir_all(&path) {
+            Ok(()) => return path,
+            Err(err) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "failed to prepare SFTP edit directory"
+                );
+            }
+        },
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to resolve SFTP edit directory");
+        }
+    }
+
+    if let Err(err) = fs::create_dir_all(&fallback) {
+        tracing::warn!(
+            path = %fallback.display(),
+            error = %err,
+            "failed to prepare fallback SFTP edit directory"
+        );
+    }
+    fallback
 }
 
 pub(crate) fn parent_dir(path: &str) -> Option<String> {
@@ -1289,17 +1345,14 @@ async fn download_path_impl(
     sftp: &SftpSession,
     remote: &str,
     local_dir: &Path,
-    flag: TransferStateFlag,
-    events: &std::sync::mpsc::Sender<BackendEvent>,
-    tab_id: &str,
-    id: &str,
+    transfer: TransferContext<'_>,
 ) -> Result<String> {
     tokio::fs::create_dir_all(local_dir)
         .await
         .with_context(|| format!("create {}", local_dir.display()))?;
 
     // Check for cancellation after initial setup
-    let state = flag.0.load(Ordering::SeqCst);
+    let state = transfer.flag.0.load(Ordering::SeqCst);
     if state == 2 {
         return Err(anyhow::anyhow!("transfer cancelled"));
     }
@@ -1319,22 +1372,14 @@ async fn download_path_impl(
             base_name(remote),
             Uuid::new_v4()
         ));
-        let extracted_to = download_remote_directory_archive(
-            handle,
-            sftp,
-            remote,
-            &local_archive,
-            &flag,
-            events,
-            tab_id,
-            id,
-        )
-        .await?;
+        let extracted_to =
+            download_remote_directory_archive(handle, sftp, remote, &local_archive, transfer)
+                .await?;
         return Ok(t!("downloaded_folder", path = extracted_to.display()).to_string());
     }
 
     let local_path = local_dir.join(base_name(remote));
-    download_file_impl(sftp, remote, &local_path, &flag, events, tab_id, id).await?;
+    download_file_impl(sftp, remote, &local_path, transfer).await?;
     Ok(t!("downloaded_file", path = local_path.display()).to_string())
 }
 
@@ -1343,10 +1388,7 @@ async fn download_dir_recursive(
     sftp: &SftpSession,
     remote_dir: &str,
     local_dir: &Path,
-    flag: &TransferStateFlag,
-    events: &std::sync::mpsc::Sender<BackendEvent>,
-    tab_id: &str,
-    id: &str,
+    transfer: TransferContext<'_>,
 ) -> Result<()> {
     tokio::fs::create_dir_all(local_dir)
         .await
@@ -1359,23 +1401,11 @@ async fn download_dir_recursive(
                 sftp,
                 &entry.full_path,
                 &local_path,
-                flag,
-                events,
-                tab_id,
-                id,
+                transfer,
             ))
             .await?;
         } else {
-            download_file_impl(
-                sftp,
-                &entry.full_path,
-                &local_path,
-                flag,
-                events,
-                tab_id,
-                id,
-            )
-            .await?;
+            download_file_impl(sftp, &entry.full_path, &local_path, transfer).await?;
             let _ = maybe_extract_archive(&local_path).await;
         }
     }
@@ -1387,10 +1417,7 @@ async fn download_remote_directory_archive(
     sftp: &SftpSession,
     remote_dir: &str,
     local_archive: &Path,
-    flag: &TransferStateFlag,
-    events: &std::sync::mpsc::Sender<BackendEvent>,
-    tab_id: &str,
-    id: &str,
+    transfer: TransferContext<'_>,
 ) -> Result<PathBuf> {
     let remote_archive = format!(
         "/tmp/ashell-{}-{}.tar.gz",
@@ -1399,7 +1426,7 @@ async fn download_remote_directory_archive(
     );
 
     // Check for cancellation before creating remote archive
-    let state = flag.0.load(Ordering::SeqCst);
+    let state = transfer.flag.0.load(Ordering::SeqCst);
     if state == 2 {
         return Err(anyhow::anyhow!("transfer cancelled"));
     }
@@ -1412,16 +1439,7 @@ async fn download_remote_directory_archive(
         .join(base_name(remote_dir));
 
     let archive_download = async {
-        download_file_impl(
-            sftp,
-            &remote_archive,
-            local_archive,
-            flag,
-            events,
-            tab_id,
-            id,
-        )
-        .await?;
+        download_file_impl(sftp, &remote_archive, local_archive, transfer).await?;
         extract_archive_to(
             local_archive,
             local_archive.parent().unwrap_or_else(|| Path::new(".")),
@@ -1448,10 +1466,7 @@ async fn download_file_impl(
     sftp: &SftpSession,
     remote: &str,
     local: &Path,
-    flag: &TransferStateFlag,
-    events: &std::sync::mpsc::Sender<BackendEvent>,
-    tab_id: &str,
-    id: &str,
+    transfer: TransferContext<'_>,
 ) -> Result<()> {
     let mut remote_file = sftp
         .open(remote)
@@ -1466,7 +1481,15 @@ async fn download_file_impl(
 
     let mut buffer = vec![0u8; 128 * 1024];
     loop {
-        flag.yield_if_paused(events, tab_id, id, transferred, total)
+        transfer
+            .flag
+            .yield_if_paused(
+                transfer.events,
+                transfer.tab_id,
+                transfer.id,
+                transferred,
+                total,
+            )
             .await?;
         let read = remote_file
             .read(&mut buffer)
@@ -1481,9 +1504,9 @@ async fn download_file_impl(
             .with_context(|| format!("write {}", local.display()))?;
 
         transferred += read as u64;
-        let _ = events.send(BackendEvent::TransferProgress {
-            tab_id: tab_id.to_string(),
-            id: id.to_string(),
+        let _ = transfer.events.send(BackendEvent::TransferProgress {
+            tab_id: transfer.tab_id.to_string(),
+            id: transfer.id.to_string(),
             transferred,
             total,
             state: crate::terminal::TransferState::Running,
@@ -1491,9 +1514,9 @@ async fn download_file_impl(
     }
     local_file.flush().await.context("flush local file")?;
 
-    let _ = events.send(BackendEvent::TransferProgress {
-        tab_id: tab_id.to_string(),
-        id: id.to_string(),
+    let _ = transfer.events.send(BackendEvent::TransferProgress {
+        tab_id: transfer.tab_id.to_string(),
+        id: transfer.id.to_string(),
         transferred,
         total,
         state: crate::terminal::TransferState::Completed,
@@ -1600,10 +1623,7 @@ async fn upload_paths_impl(
                 sftp,
                 &local_path,
                 &remote_path,
-                &flag_clone,
-                &events_clone,
-                &tab_id_clone,
-                &id_clone,
+                TransferContext::new(&flag_clone, &events_clone, &tab_id_clone, &id_clone),
                 transferred_clone,
                 Some(total_bytes),
             )
@@ -1648,10 +1668,7 @@ async fn upload_file_impl(
     sftp: &SftpSession,
     local_file: &Path,
     remote_path: &str,
-    flag: &TransferStateFlag,
-    events: &std::sync::mpsc::Sender<BackendEvent>,
-    tab_id: &str,
-    id: &str,
+    transfer: TransferContext<'_>,
     transferred: Arc<AtomicU64>,
     total: Option<u64>,
 ) -> Result<()> {
@@ -1666,7 +1683,10 @@ async fn upload_file_impl(
     let mut buffer = vec![0u8; 128 * 1024];
     loop {
         let cur = transferred.load(Ordering::Relaxed);
-        flag.yield_if_paused(events, tab_id, id, cur, total).await?;
+        transfer
+            .flag
+            .yield_if_paused(transfer.events, transfer.tab_id, transfer.id, cur, total)
+            .await?;
         let read = local.read(&mut buffer).await.context("read local file")?;
         if read == 0 {
             break;
@@ -1677,9 +1697,9 @@ async fn upload_file_impl(
             .with_context(|| format!("write remote {remote_path}"))?;
 
         let new_cur = transferred.fetch_add(read as u64, Ordering::Relaxed) + read as u64;
-        let _ = events.send(BackendEvent::TransferProgress {
-            tab_id: tab_id.to_string(),
-            id: id.to_string(),
+        let _ = transfer.events.send(BackendEvent::TransferProgress {
+            tab_id: transfer.tab_id.to_string(),
+            id: transfer.id.to_string(),
             transferred: new_cur,
             total,
             state: crate::terminal::TransferState::Running,
@@ -1938,16 +1958,33 @@ async fn extract_archive_to(path: &Path, target_dir: &Path) -> Result<()> {
 }
 
 #[derive(Clone)]
-struct SftpClientHandler;
+struct SftpClientHandler {
+    host_keys: HostKeyVerifier,
+}
 
-#[async_trait]
+impl SftpClientHandler {
+    fn new(host: &str, port: u16) -> Result<Self> {
+        Ok(Self {
+            host_keys: HostKeyVerifier::new(host, port)?,
+        })
+    }
+
+    #[cfg(test)]
+    fn with_known_hosts_path(host: &str, port: u16, path: PathBuf) -> Self {
+        Self {
+            host_keys: HostKeyVerifier::with_known_hosts_path(host, port, path),
+        }
+    }
+}
+
 impl Handler for SftpClientHandler {
     type Error = anyhow::Error;
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &russh::keys::ssh_key::PublicKey,
+        server_public_key: &russh::keys::ssh_key::PublicKey,
     ) -> Result<bool, Self::Error> {
+        self.host_keys.verify(server_public_key)?;
         Ok(true)
     }
 }
@@ -2058,6 +2095,53 @@ async fn document_write_atomic_impl(
 #[cfg(test)]
 mod handle_tests {
     use super::*;
+
+    const TEST_HOST_KEY: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ";
+
+    #[tokio::test]
+    async fn sftp_handler_rejects_unknown_host_key() {
+        let path =
+            std::env::temp_dir().join(format!("jshell-missing-known-hosts-{}", Uuid::new_v4()));
+        let mut handler =
+            SftpClientHandler::with_known_hosts_path("files.example.test", 2222, path);
+        let key = russh::keys::ssh_key::PublicKey::from_openssh(TEST_HOST_KEY)
+            .expect("parse test public key");
+
+        assert!(
+            russh::client::Handler::check_server_key(&mut handler, &key)
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn edit_tmp_dir_creates_and_uses_preferred_directory() {
+        let root = std::env::temp_dir().join(format!("jshell-edit-tmp-{}", Uuid::new_v4()));
+        let preferred = root.join("preferred");
+        let fallback = root.join("fallback");
+
+        let actual = prepare_edit_tmp_dir(Ok(preferred.clone()), fallback);
+
+        assert_eq!(actual, preferred);
+        assert!(actual.is_dir());
+        fs::remove_dir_all(root).expect("remove temporary test directory");
+    }
+
+    #[test]
+    fn edit_tmp_dir_falls_back_when_preferred_directory_is_unavailable() {
+        let root = std::env::temp_dir().join(format!("jshell-edit-tmp-{}", Uuid::new_v4()));
+        let fallback = root.join("fallback");
+
+        let actual = prepare_edit_tmp_dir(
+            Err(anyhow!("config directory unavailable")),
+            fallback.clone(),
+        );
+
+        assert_eq!(actual, fallback);
+        assert!(actual.is_dir());
+        fs::remove_dir_all(root).expect("remove temporary test directory");
+    }
 
     #[test]
     fn cloned_handle_only_closes_after_last_owner_drops() {

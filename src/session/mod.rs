@@ -1,4 +1,6 @@
 pub mod config;
+pub mod config_key;
+pub mod host_keys;
 pub mod ssh_config;
 pub mod ssh_keys;
 
@@ -359,9 +361,9 @@ impl Ashell {
             .set_directory(start_dir)
             .pick_file();
 
-        cx.spawn_in(window, async move |this, mut cx| {
+        cx.spawn_in(window, async move |this, cx| {
             if let Some(file) = file_dialog.await {
-                let _ = gpui::AsyncWindowContext::update(&mut cx, |window, cx| {
+                let _ = gpui::AsyncWindowContext::update(cx, |window, cx| {
                     let _ = this.update(cx, |this, cx| {
                         Self::set_input_value(
                             &this.key_path_input,
@@ -872,10 +874,12 @@ impl Ashell {
             session.host
         );
         let id = Uuid::new_v4().to_string();
+        let proxy_config = self.config.connection_proxy_config();
         let backend = ssh::spawn_ssh_terminal(
             self.runtime.handle(),
             id.clone(),
             session.clone(),
+            proxy_config.clone(),
             DEFAULT_COLS,
             DEFAULT_ROWS,
             self.events_tx.clone(),
@@ -913,21 +917,21 @@ impl Ashell {
         self.active_group = Some(group_id.clone());
         self.register_session_workspace(group_id.clone());
         self.tabs_scroll_handle.scroll_to_item(self.tabs.len() - 1);
-        if let Some(session_id) = self.active_session_id() {
-            if let Some(index) = self
+        if let Some(session_id) = self.active_session_id()
+            && let Some(index) = self
                 .config
                 .sessions()
                 .iter()
                 .position(|s| s.id == session_id)
-            {
-                self.saved_scroll_handle.scroll_to_item(index);
-            }
+        {
+            self.saved_scroll_handle.scroll_to_item(index);
         }
         cx.notify();
         let sftp_handle = crate::sftp::spawn_sftp(
             self.runtime.handle(),
             group_id.clone(),
             session,
+            proxy_config,
             self.events_tx.clone(),
         );
         self.sftp_handles.insert(group_id.clone(), sftp_handle);
@@ -975,15 +979,14 @@ impl Ashell {
         self.active_group = Some(group_id.clone());
         self.register_session_workspace(group_id.clone());
         self.tabs_scroll_handle.scroll_to_item(self.tabs.len() - 1);
-        if let Some(session_id) = self.active_session_id() {
-            if let Some(index) = self
+        if let Some(session_id) = self.active_session_id()
+            && let Some(index) = self
                 .config
                 .sessions()
                 .iter()
                 .position(|s| s.id == session_id)
-            {
-                self.saved_scroll_handle.scroll_to_item(index);
-            }
+        {
+            self.saved_scroll_handle.scroll_to_item(index);
         }
         self.status = "serial tab opened".into();
         cx.notify();
@@ -1022,6 +1025,7 @@ impl Ashell {
         self.tabs[ix].send_backend(BackendCommand::Close);
 
         if let Some(session) = session {
+            let proxy_config = self.config.connection_proxy_config();
             let tab_kind = self.tabs[ix].kind;
             match tab_kind {
                 crate::terminal::TabKind::Serial => {
@@ -1038,6 +1042,7 @@ impl Ashell {
                         self.runtime.handle(),
                         tab_id.to_string(),
                         session.clone(),
+                        proxy_config.clone(),
                         cols,
                         rows,
                         self.events_tx.clone(),
@@ -1065,22 +1070,23 @@ impl Ashell {
                     .find(|t| group.pane_root.contains(&t.id) && t.session.is_some())
                     .and_then(|t| t.session.clone());
 
-                if let Some(session) = group_session {
-                    if session.protocol != "serial" {
-                        self.sftp_handles.remove(&group_id);
-                        let sftp_handle = crate::sftp::spawn_sftp(
-                            self.runtime.handle(),
-                            group_id.clone(),
-                            session,
-                            self.events_tx.clone(),
-                        );
-                        self.sftp_handles.insert(group_id.clone(), sftp_handle);
+                if let Some(session) = group_session
+                    && session.protocol != "serial"
+                {
+                    self.sftp_handles.remove(&group_id);
+                    let sftp_handle = crate::sftp::spawn_sftp(
+                        self.runtime.handle(),
+                        group_id.clone(),
+                        session,
+                        proxy_config.clone(),
+                        self.events_tx.clone(),
+                    );
+                    self.sftp_handles.insert(group_id.clone(), sftp_handle);
 
-                        if let Some(group) = self.tab_groups.iter_mut().find(|g| g.id == group_id) {
-                            if let Some(sftp) = group.sftp.as_mut() {
-                                sftp.status = rust_i18n::t!("sftp_connecting").to_string();
-                            }
-                        }
+                    if let Some(group) = self.tab_groups.iter_mut().find(|g| g.id == group_id)
+                        && let Some(sftp) = group.sftp.as_mut()
+                    {
+                        sftp.status = rust_i18n::t!("sftp_connecting").to_string();
                     }
                 }
             }
@@ -1123,10 +1129,10 @@ impl Ashell {
     #[allow(dead_code)]
     pub(crate) fn activate_tab(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
         // Save current group state
-        if let Some(group_id) = self.active_group.clone() {
-            if let Some(group) = self.tab_groups.iter_mut().find(|g| g.id == group_id) {
-                group.pane_root = self.pane_root.clone();
-            }
+        if let Some(group_id) = self.active_group.clone()
+            && let Some(group) = self.tab_groups.iter_mut().find(|g| g.id == group_id)
+        {
+            group.pane_root = self.pane_root.clone();
         }
         self.active_tab = Some(id.clone());
         // Find which group this tab belongs to and restore its pane_root
@@ -1146,17 +1152,15 @@ impl Ashell {
         if let Some(index) = self.tabs.iter().position(|t| t.id == id) {
             self.tabs_scroll_handle.scroll_to_item(index);
         }
-        if self.tabs.iter().any(|t| t.id == id) {
-            if let Some(session_id) = self.active_session_id() {
-                if let Some(index) = self
-                    .config
-                    .sessions()
-                    .iter()
-                    .position(|s| s.id == session_id)
-                {
-                    self.saved_scroll_handle.scroll_to_item(index);
-                }
-            }
+        if self.tabs.iter().any(|t| t.id == id)
+            && let Some(session_id) = self.active_session_id()
+            && let Some(index) = self
+                .config
+                .sessions()
+                .iter()
+                .position(|s| s.id == session_id)
+        {
+            self.saved_scroll_handle.scroll_to_item(index);
         }
         self.focus_handle.focus(window, cx);
         self.sync_system_tab_to_active_group();
@@ -1177,7 +1181,7 @@ impl Ashell {
         if self
             .connection_progress
             .as_ref()
-            .map_or(false, |p| p.tab_id == id)
+            .is_some_and(|p| p.tab_id == id)
         {
             self.connection_progress = None;
         }
@@ -1199,7 +1203,7 @@ impl Ashell {
         };
 
         let pane_ids = group.pane_root.tab_ids();
-        let pane_ids_str: Vec<&str> = pane_ids.iter().map(|s| *s).collect();
+        let pane_ids_str: Vec<&str> = pane_ids.to_vec();
         let is_group_close = pane_ids.len() <= 1;
         tracing::info!(
             "[handle_tab_close] id='{}' group_panes={:?} is_group_close={}",
@@ -1347,12 +1351,11 @@ impl Ashell {
     ) {
         // If the search bar is visible and the click is inside it, let the
         // search bar handle the event instead of switching pane focus.
-        if self.search_active {
-            if let Some(bounds) = self.search_bar_bounds {
-                if bounds.contains(&event.position) {
-                    return;
-                }
-            }
+        if self.search_active
+            && let Some(bounds) = self.search_bar_bounds
+            && bounds.contains(&event.position)
+        {
+            return;
         }
         self.focus_handle.focus(window, cx);
         // Check if click is in a different pane and focus it
@@ -1365,42 +1368,38 @@ impl Ashell {
                 None
             }
         });
-        if let Some(tab_id) = clicked_tab_id {
-            if current_active.as_deref() != Some(tab_id.as_str()) {
-                self.focus_pane_with_id(tab_id.clone());
-                cx.notify();
-            }
+        if let Some(tab_id) = clicked_tab_id
+            && current_active.as_deref() != Some(tab_id.as_str())
+        {
+            self.focus_pane_with_id(tab_id.clone());
+            cx.notify();
         }
         if event.button == MouseButton::Left {
-            if should_open_terminal_url(event.button, event.modifiers.control) {
-                if let Some((row, col, _side)) = self.terminal_grid_point_and_side(event.position) {
-                    if let Some(snapshot) = self.active_snapshot() {
-                        if let Some((url, _)) = crate::terminal::highlight::find_url_at_cell(
-                            &snapshot.cells,
-                            snapshot.rows,
-                            row,
-                            col,
-                        ) {
-                            open_terminal_url(&url);
-                            window.prevent_default();
-                            cx.stop_propagation();
-                            self.terminal_selecting = false;
-                            return;
-                        }
-                    }
-                }
+            if should_open_terminal_url(event.button, event.modifiers.control)
+                && let Some((row, col, _side)) = self.terminal_grid_point_and_side(event.position)
+                && let Some(snapshot) = self.active_snapshot()
+                && let Some((url, _)) = crate::terminal::highlight::find_url_at_cell(
+                    &snapshot.cells,
+                    snapshot.rows,
+                    row,
+                    col,
+                )
+            {
+                open_terminal_url(&url);
+                window.prevent_default();
+                cx.stop_propagation();
+                self.terminal_selecting = false;
+                return;
             }
-            if self.config.right_click_copy_paste() {
-                if let Some(text) = self.active_terminal_selection_text() {
-                    if !text.is_empty() {
-                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
-                        if let Some(active_id) = &self.active_tab {
-                            if let Some(tab) = self.tabs.iter_mut().find(|tab| &tab.id == active_id)
-                            {
-                                tab.clear_selection();
-                            }
-                        }
-                    }
+            if self.config.right_click_copy_paste()
+                && let Some(text) = self.active_terminal_selection_text()
+                && !text.is_empty()
+            {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+                if let Some(active_id) = &self.active_tab
+                    && let Some(tab) = self.tabs.iter_mut().find(|tab| &tab.id == active_id)
+                {
+                    tab.clear_selection();
                 }
             }
             self.begin_terminal_selection(event, cx);
@@ -1477,10 +1476,12 @@ impl Ashell {
                     cx.notify();
                     return;
                 };
+                let proxy_config = self.config.connection_proxy_config();
                 let backend = ssh::spawn_ssh_terminal(
                     self.runtime.handle(),
                     new_id.clone(),
                     session.clone(),
+                    proxy_config.clone(),
                     DEFAULT_COLS,
                     DEFAULT_ROWS,
                     self.events_tx.clone(),
@@ -1489,6 +1490,7 @@ impl Ashell {
                     self.runtime.handle(),
                     new_id.clone(),
                     session.clone(),
+                    proxy_config,
                     self.events_tx.clone(),
                 );
                 self.sftp_handles.insert(new_id.clone(), sftp_handle);
@@ -1696,14 +1698,13 @@ impl Ashell {
         cx: &mut Context<Self>,
     ) {
         // Save current group state
-        if let Some(current_group_id) = self.active_group.clone() {
-            if let Some(group) = self
+        if let Some(current_group_id) = self.active_group.clone()
+            && let Some(group) = self
                 .tab_groups
                 .iter_mut()
                 .find(|g| g.id == current_group_id)
-            {
-                group.pane_root = self.pane_root.clone();
-            }
+        {
+            group.pane_root = self.pane_root.clone();
         }
         // Load new group state
         if let Some(group) = self.tab_groups.iter().find(|g| g.id == group_id) {
@@ -1747,24 +1748,25 @@ impl Ashell {
     }
 
     pub(crate) fn sync_pane_root_to_group(&mut self) {
-        if let Some(group_id) = self.active_group.clone() {
-            if let Some(group) = self.tab_groups.iter_mut().find(|g| g.id == group_id) {
-                group.pane_root = self.pane_root.clone();
-            }
+        if let Some(group_id) = self.active_group.clone()
+            && let Some(group) = self.tab_groups.iter_mut().find(|g| g.id == group_id)
+        {
+            group.pane_root = self.pane_root.clone();
         }
     }
 
     pub(crate) fn sync_system_tab_to_active_group(&mut self) {
         let mut group_ssh_tabs = vec![];
-        if let Some(group_id) = &self.active_group {
-            if let Some(group) = self.tab_groups.iter().find(|g| g.id == *group_id) {
-                let ids = group.pane_root.tab_ids();
-                for id in ids {
-                    if let Some(tab) = self.tabs.iter().find(|t| t.id == *id) {
-                        if tab.kind == TabKind::Ssh && tab.connected {
-                            group_ssh_tabs.push(tab.id.clone());
-                        }
-                    }
+        if let Some(group_id) = &self.active_group
+            && let Some(group) = self.tab_groups.iter().find(|g| g.id == *group_id)
+        {
+            let ids = group.pane_root.tab_ids();
+            for id in ids {
+                if let Some(tab) = self.tabs.iter().find(|t| t.id == *id)
+                    && tab.kind == TabKind::Ssh
+                    && tab.connected
+                {
+                    group_ssh_tabs.push(tab.id.clone());
                 }
             }
         }
@@ -1773,7 +1775,7 @@ impl Ashell {
         let is_current_valid = self
             .system_tab_id
             .as_ref()
-            .map_or(false, |id| group_ssh_tabs.contains(id));
+            .is_some_and(|id| group_ssh_tabs.contains(id));
 
         if !is_current_valid {
             let new_id = group_ssh_tabs.into_iter().next();
@@ -1852,7 +1854,7 @@ impl Ashell {
                 [first, rest @ ..],
             ) => children
                 .get(*first)
-                .map_or(false, |c| Self::is_layout_horizontal_at(c, rest)),
+                .is_some_and(|c| Self::is_layout_horizontal_at(c, rest)),
             _ => false,
         }
     }

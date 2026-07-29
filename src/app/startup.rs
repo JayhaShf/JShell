@@ -4,9 +4,38 @@ use gpui_component::Root;
 use crate::Ashell;
 use crate::session::config::ConfigStore;
 
-pub(crate) fn bind_workspace_keys(cx: &mut gpui::App) {
-    let config = ConfigStore::load().unwrap_or_else(|_| ConfigStore::in_memory());
-    crate::app::keybinding_recorder::bind_workspace_keys_from_config(cx, &config);
+pub(crate) struct StartupConfig {
+    pub(crate) config: ConfigStore,
+    pub(crate) error: Option<String>,
+}
+
+impl StartupConfig {
+    pub(crate) fn load() -> Self {
+        Self::from_result(ConfigStore::load())
+    }
+
+    fn from_result(result: anyhow::Result<ConfigStore>) -> Self {
+        match result {
+            Ok(config) => Self {
+                config,
+                error: None,
+            },
+            Err(err) => {
+                let error = format!("{err:#}");
+                tracing::error!(error = %error, "failed to load persistent configuration");
+                Self {
+                    config: ConfigStore::in_memory(),
+                    error: Some(error),
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn load_startup_config_and_bind_workspace_keys(cx: &mut gpui::App) -> StartupConfig {
+    let startup_config = StartupConfig::load();
+    crate::app::keybinding_recorder::bind_workspace_keys_from_config(cx, &startup_config.config);
+    startup_config
 }
 
 struct LocalMinutelyRoller {
@@ -178,70 +207,27 @@ pub(crate) fn sync_macos_launch_environment() {
     }
 }
 
-fn read_proxy_from_env() -> Option<(String, String, Option<u16>, String, String)> {
-    let vars = [
-        "ALL_PROXY",
-        "all_proxy",
-        "HTTPS_PROXY",
-        "https_proxy",
-        "HTTP_PROXY",
-        "http_proxy",
-    ];
-    for var in vars {
-        if let Ok(val) = std::env::var(var) {
-            if val.is_empty() {
-                continue;
-            }
-            if let Ok(url) = reqwest::Url::parse(&val) {
-                let scheme = url.scheme();
-                let proxy_type = match scheme {
-                    "socks5" | "socks5h" => "socks5".to_string(),
-                    "http" | "https" => "http".to_string(),
-                    _ => "socks5".to_string(),
-                };
-                let host = url.host_str().unwrap_or("").to_string();
-                let port = url.port();
-                let user = url.username().to_string();
-                let password = url.password().unwrap_or("").to_string();
-                return Some((proxy_type, host, port, user, password));
-            }
-        }
-    }
-    None
-}
-
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn sync_macos_launch_environment() {}
 
 pub(crate) fn open_main_window(cx: &mut App) {
-    let config = ConfigStore::load().unwrap_or_else(|_| ConfigStore::in_memory());
+    let startup_config = StartupConfig::load();
+    open_main_window_with_config(cx, startup_config);
+}
 
-    let _ = crate::session::config::ENV_PROXY.get_or_init(|| {
-        read_proxy_from_env().map(|(proxy_type, host, port, user, password)| {
-            tracing::info!(
-                "[proxy] Loaded proxy configuration from environment: type={}, host={}, port={:?}, user={}",
-                proxy_type,
-                host,
-                port,
-                user
-            );
-            crate::session::config::EnvProxy {
-                proxy_type,
-                host,
-                port,
-                user,
-                pass: password,
-            }
-        })
-    });
+pub(crate) fn open_main_window_with_config(cx: &mut App, startup_config: StartupConfig) {
+    let config = &startup_config.config;
 
-    let mut window_options = WindowOptions::default();
+    crate::session::config::initialize_env_proxy();
 
-    window_options.titlebar = Some(gpui::TitlebarOptions {
-        title: None,
-        appears_transparent: true,
-        traffic_light_position: Some(gpui::point(px(9.0), px(9.0))),
-    });
+    let mut window_options = WindowOptions {
+        titlebar: Some(gpui::TitlebarOptions {
+            title: None,
+            appears_transparent: true,
+            traffic_light_position: Some(gpui::point(px(9.0), px(9.0))),
+        }),
+        ..WindowOptions::default()
+    };
 
     #[cfg(not(target_os = "macos"))]
     if let Ok(img) = image::load_from_memory(include_bytes!("../../assets/icons/ashell.png")) {
@@ -296,11 +282,11 @@ pub(crate) fn open_main_window(cx: &mut App) {
         )));
     }
 
-    cx.open_window(window_options, |window, cx| {
+    cx.open_window(window_options, move |window, cx| {
         window.activate_window();
         window.set_window_title("JShell");
         gpui_component::Theme::sync_system_appearance(Some(window), cx);
-        let view = cx.new(|cx| Ashell::new(window, cx));
+        let view = cx.new(|cx| Ashell::new(window, cx, startup_config));
 
         tracing::info!("[ui] main application window opened");
         let focus_handle = view.read(cx).focus_handle.clone();
@@ -332,4 +318,32 @@ pub(crate) fn open_main_window(cx: &mut App) {
         cx.new(|cx| Root::new(view, window, cx))
     })
     .expect("failed to open window");
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::anyhow;
+
+    use super::StartupConfig;
+    use crate::session::config::ConfigStore;
+
+    #[test]
+    fn startup_config_failure_uses_non_persistent_mode_and_keeps_error() {
+        let startup = StartupConfig::from_result(Err(anyhow!("system secure storage is locked")));
+
+        assert!(!startup.config.is_persistent());
+        assert!(
+            startup
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("locked"))
+        );
+    }
+
+    #[test]
+    fn startup_config_default_tmp_dir_does_not_require_loading_encrypted_config() {
+        let path = ConfigStore::default_tmp_dir().expect("resolve default temporary directory");
+
+        assert!(path.ends_with(std::path::Path::new("jshell").join("tmp")));
+    }
 }

@@ -761,41 +761,41 @@ impl Ashell {
                     Ok(SaveOutcome::Conflict(pending)) => {
                         let is_window_close_save =
                             this.window_close_save_current.as_deref() == Some(document_id.as_str());
-                        if let Some(document) = this.documents.get_mut(&document_id) {
-                            if document.operation_id == operation_id {
-                                document.save_state = SaveState::Conflict;
-                                document.pending_save = Some(pending);
-                                document.connection_state = DocumentConnectionState::Online;
-                                if is_window_close_save {
-                                    this.cancel_window_close_save();
-                                }
-                                this.show_document_conflict_dialog(
-                                    document_id.clone(),
-                                    false,
-                                    window,
-                                    cx,
-                                );
+                        if let Some(document) = this.documents.get_mut(&document_id)
+                            && document.operation_id == operation_id
+                        {
+                            document.save_state = SaveState::Conflict;
+                            document.pending_save = Some(pending);
+                            document.connection_state = DocumentConnectionState::Online;
+                            if is_window_close_save {
+                                this.cancel_window_close_save();
                             }
+                            this.show_document_conflict_dialog(
+                                document_id.clone(),
+                                false,
+                                window,
+                                cx,
+                            );
                         }
                     }
                     Ok(SaveOutcome::RemoteDeleted(pending)) => {
                         let is_window_close_save =
                             this.window_close_save_current.as_deref() == Some(document_id.as_str());
-                        if let Some(document) = this.documents.get_mut(&document_id) {
-                            if document.operation_id == operation_id {
-                                document.save_state = SaveState::Conflict;
-                                document.pending_save = Some(pending);
-                                document.connection_state = DocumentConnectionState::Online;
-                                if is_window_close_save {
-                                    this.cancel_window_close_save();
-                                }
-                                this.show_document_conflict_dialog(
-                                    document_id.clone(),
-                                    true,
-                                    window,
-                                    cx,
-                                );
+                        if let Some(document) = this.documents.get_mut(&document_id)
+                            && document.operation_id == operation_id
+                        {
+                            document.save_state = SaveState::Conflict;
+                            document.pending_save = Some(pending);
+                            document.connection_state = DocumentConnectionState::Online;
+                            if is_window_close_save {
+                                this.cancel_window_close_save();
                             }
+                            this.show_document_conflict_dialog(
+                                document_id.clone(),
+                                true,
+                                window,
+                                cx,
+                            );
                         }
                     }
                     Err(error) => {
@@ -1075,10 +1075,12 @@ impl Ashell {
         else {
             return;
         };
+        let proxy_config = self.config.connection_proxy_config();
         let handle = crate::sftp::spawn_sftp(
             self.runtime.handle(),
             format!("document-{document_id}"),
             session,
+            proxy_config,
             self.events_tx.clone(),
         );
         let Some(document) = self.documents.get_mut(&document_id) else {

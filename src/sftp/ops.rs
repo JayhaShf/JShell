@@ -66,10 +66,10 @@ impl Ashell {
             return;
         }
         self.mark_sftp_entry_selected(&entry.full_path, cx);
-        if let Some(sftp) = self.active_sftp_mut() {
-            if !sftp.selected_entries.remove(&entry.full_path) {
-                sftp.selected_entries.insert(entry.full_path);
-            }
+        if let Some(sftp) = self.active_sftp_mut()
+            && !sftp.selected_entries.remove(&entry.full_path)
+        {
+            sftp.selected_entries.insert(entry.full_path);
         }
     }
 
@@ -365,29 +365,29 @@ impl Ashell {
         });
 
         cx.spawn_in(window, async move |this, cx| {
-            if let Ok(Ok(Some(mut paths))) = path_prompt.await {
-                if let Some(folder) = paths.pop() {
-                    let local_dir = folder.to_string_lossy().to_string();
-                    tracing::info!(
-                        "[sftp] initiating batch download of {} entries to '{}'",
-                        selected.len(),
-                        local_dir
-                    );
-                    for remote in selected {
-                        handle.send(crate::sftp::SftpCommand::Download {
-                            remote,
-                            local_dir: local_dir.clone(),
-                        });
-                    }
-
-                    let _ = this.update(cx, |this, cx| {
-                        if let Some(sftp_mut) = this.active_sftp_mut() {
-                            sftp_mut.selected_entries.clear();
-                        }
-                        this.show_transfers_dialog = true;
-                        cx.notify();
+            if let Ok(Ok(Some(mut paths))) = path_prompt.await
+                && let Some(folder) = paths.pop()
+            {
+                let local_dir = folder.to_string_lossy().to_string();
+                tracing::info!(
+                    "[sftp] initiating batch download of {} entries to '{}'",
+                    selected.len(),
+                    local_dir
+                );
+                for remote in selected {
+                    handle.send(crate::sftp::SftpCommand::Download {
+                        remote,
+                        local_dir: local_dir.clone(),
                     });
                 }
+
+                let _ = this.update(cx, |this, cx| {
+                    if let Some(sftp_mut) = this.active_sftp_mut() {
+                        sftp_mut.selected_entries.clear();
+                    }
+                    this.show_transfers_dialog = true;
+                    cx.notify();
+                });
             }
             Ok::<(), anyhow::Error>(())
         })
@@ -398,20 +398,20 @@ impl Ashell {
         if paths.is_empty() {
             return;
         }
-        if let Some(sftp) = self.active_sftp() {
-            if let Some(handle) = self.active_sftp_handle() {
-                tracing::info!(
-                    "[sftp] initiating batch upload of {} files to '{}'",
-                    paths.len(),
-                    sftp.current_path
-                );
-                handle.send(crate::sftp::SftpCommand::UploadPaths {
-                    locals: paths,
-                    remote_dir: sftp.current_path.clone(),
-                });
-                self.show_transfers_dialog = true;
-                cx.notify();
-            }
+        if let Some(sftp) = self.active_sftp()
+            && let Some(handle) = self.active_sftp_handle()
+        {
+            tracing::info!(
+                "[sftp] initiating batch upload of {} files to '{}'",
+                paths.len(),
+                sftp.current_path
+            );
+            handle.send(crate::sftp::SftpCommand::UploadPaths {
+                locals: paths,
+                remote_dir: sftp.current_path.clone(),
+            });
+            self.show_transfers_dialog = true;
+            cx.notify();
         }
     }
 }

@@ -13,7 +13,7 @@ use crate::{
 };
 
 thread_local! {
-    static LAST_DRAG_SCROLL: std::cell::Cell<Option<std::time::Instant>> = std::cell::Cell::new(None);
+    static LAST_DRAG_SCROLL: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
 }
 
 impl Ashell {
@@ -52,13 +52,13 @@ impl Ashell {
             && !event.keystroke.modifiers.alt
             && !event.keystroke.modifiers.platform
         {
-            if let Some(progress) = &self.connection_progress {
-                if progress.failed {
-                    self.retry_connection_progress(cx);
-                    window.prevent_default();
-                    cx.stop_propagation();
-                    return;
-                }
+            if let Some(progress) = &self.connection_progress
+                && progress.failed
+            {
+                self.retry_connection_progress(cx);
+                window.prevent_default();
+                cx.stop_propagation();
+                return;
             }
 
             let active_id = self.active_tab.clone();
@@ -78,14 +78,13 @@ impl Ashell {
         }
 
         if event.prefer_character_input {
-            if let Some(text) = event.keystroke.key_char.as_deref() {
-                if !text.is_empty()
-                    && !event.keystroke.modifiers.control
-                    && !event.keystroke.modifiers.function
-                    && !event.keystroke.modifiers.platform
-                {
-                    self.send_terminal_input(text.as_bytes().to_vec(), window, cx);
-                }
+            if let Some(text) = event.keystroke.key_char.as_deref()
+                && !text.is_empty()
+                && !event.keystroke.modifiers.control
+                && !event.keystroke.modifiers.function
+                && !event.keystroke.modifiers.platform
+            {
+                self.send_terminal_input(text.as_bytes().to_vec(), window, cx);
             }
             return;
         }
@@ -261,29 +260,27 @@ impl Ashell {
         }
 
         let mut handled = false;
-        if let Some(text) = self.active_terminal_selection_text() {
-            if !text.is_empty() {
-                cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        if let Some(text) = self.active_terminal_selection_text()
+            && !text.is_empty()
+        {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
 
-                let active_id = self.active_tab.clone();
-                if let Some(active_id) = active_id {
-                    if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == active_id) {
-                        tab.clear_selection();
-                    }
-                }
-                cx.notify();
-                handled = true;
+            let active_id = self.active_tab.clone();
+            if let Some(active_id) = active_id
+                && let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == active_id)
+            {
+                tab.clear_selection();
             }
+            cx.notify();
+            handled = true;
         }
 
-        if !handled {
-            if let Some(clipboard_item) = cx.read_from_clipboard() {
-                if let Some(text) = clipboard_item.text() {
-                    if !text.is_empty() {
-                        self.paste_into_terminal(&text, window, cx);
-                    }
-                }
-            }
+        if !handled
+            && let Some(clipboard_item) = cx.read_from_clipboard()
+            && let Some(text) = clipboard_item.text()
+            && !text.is_empty()
+        {
+            self.paste_into_terminal(&text, window, cx);
         }
     }
 
@@ -333,23 +330,21 @@ impl Ashell {
         // Track URL hover
         let mut hovered_url = None;
         let ctrl_pressed = event.modifiers.control;
-        if let Some((row, col, _side)) = self.terminal_grid_point_and_side(event.position) {
-            if let Some(snapshot) = self.active_snapshot() {
-                if let Some(active_id) = &self.active_tab {
-                    if let Some((url, url_cells)) = crate::terminal::highlight::find_url_at_cell(
-                        &snapshot.cells,
-                        snapshot.rows,
-                        row,
-                        col,
-                    ) {
-                        hovered_url = Some(crate::app::HoveredUrl {
-                            url,
-                            tab_id: active_id.clone(),
-                            cells: url_cells,
-                        });
-                    }
-                }
-            }
+        if let Some((row, col, _side)) = self.terminal_grid_point_and_side(event.position)
+            && let Some(snapshot) = self.active_snapshot()
+            && let Some(active_id) = &self.active_tab
+            && let Some((url, url_cells)) = crate::terminal::highlight::find_url_at_cell(
+                &snapshot.cells,
+                snapshot.rows,
+                row,
+                col,
+            )
+        {
+            hovered_url = Some(crate::app::HoveredUrl {
+                url,
+                tab_id: active_id.clone(),
+                cells: url_cells,
+            });
         }
 
         if self.hovered_url != hovered_url || self.terminal_link_ctrl_pressed != ctrl_pressed {
@@ -394,15 +389,11 @@ impl Ashell {
                 if should_scroll {
                     if row == 0 {
                         scroll_delta = 2;
-                    } else if row == 1 {
-                        scroll_delta = 1;
-                    } else if row == 2 {
+                    } else if row == 1 || row == 2 {
                         scroll_delta = 1;
                     } else if row == max_row {
                         scroll_delta = -2;
-                    } else if row == max_row.saturating_sub(1) {
-                        scroll_delta = -1;
-                    } else if row == max_row.saturating_sub(2) {
+                    } else if row == max_row.saturating_sub(1) || row == max_row.saturating_sub(2) {
                         scroll_delta = -1;
                     }
                 }
@@ -441,7 +432,7 @@ impl Ashell {
         let bounds = self.terminal_bounds.get(active_id)?;
         if !bounds.contains(&position) {
             // Try other pane bounds
-            for (_, b) in &self.terminal_bounds {
+            for b in self.terminal_bounds.values() {
                 if b.contains(&position) {
                     // Found a different pane - focus it
                     // (this path is for click-to-focus; handled via focus_terminal)
@@ -477,7 +468,7 @@ impl Ashell {
         // Platform modifier (Cmd on macOS, Ctrl on Windows/Linux) + scroll → zoom terminal font size
         if event.modifiers.platform {
             let delta = match event.delta {
-                ScrollDelta::Lines(point) => point.y as f32 * 20.0,
+                ScrollDelta::Lines(point) => point.y * 20.0,
                 ScrollDelta::Pixels(point) => point.y.as_f32(),
             };
             self.terminal_zoom_accumulator += delta;
