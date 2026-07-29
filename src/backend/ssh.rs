@@ -300,18 +300,13 @@ async fn connect_and_authenticate(
         addr,
         session.user
     );
-    let status_text = if let Some((ptype, phost, pport)) =
-        crate::session::config::active_proxy(session, proxy_config)?
-    {
-        format!(
-            "connecting to {addr} via {} proxy {}:{}",
-            ptype.to_uppercase(),
-            phost,
-            pport
-        )
-    } else {
-        format!("opening tcp connection to {addr}")
-    };
+    let active_proxy = crate::session::config::active_proxy(session, proxy_config)?;
+    let status_text = proxy_connection_status(
+        &addr,
+        active_proxy
+            .as_ref()
+            .map(|(proxy_type, host, port)| (proxy_type.as_str(), host.as_str(), *port)),
+    );
     let _ = events.send(BackendEvent::Status {
         tab_id: tab_id.to_string(),
         text: status_text,
@@ -539,6 +534,16 @@ async fn connect_and_authenticate(
     });
 
     Ok(handle)
+}
+
+fn proxy_connection_status(target: &str, proxy: Option<(&str, &str, u16)>) -> String {
+    match proxy {
+        Some((proxy_type, host, port)) => format!(
+            "connecting to {target} via {} proxy {host}:{port}",
+            proxy_type.to_ascii_uppercase()
+        ),
+        None => format!("connecting to {target} via DIRECT"),
+    }
 }
 
 fn load_session_private_key(session: &Session) -> Result<PrivateKey> {
@@ -849,5 +854,25 @@ mod command_history_tests {
     fn ignores_missing_format_marker_and_blank_commands() {
         assert!(parse_remote_command_history("ls\npwd\n").is_empty());
         assert!(parse_remote_command_history("__ASHELL_HISTORY_FORMAT__:bash\n\n  \n").is_empty());
+    }
+
+    #[test]
+    fn proxy_connection_status_reports_route_without_credentials() {
+        let direct = super::proxy_connection_status("host:22", None);
+        assert!(direct.contains("DIRECT"));
+        assert!(!direct.contains("secret"));
+        assert!(!direct.contains("Basic"));
+        assert!(!direct.contains("Proxy-Authorization"));
+
+        for (proxy_type, expected) in [("socks5", "SOCKS5"), ("http", "HTTP"), ("https", "HTTPS")] {
+            let status = super::proxy_connection_status(
+                "host:22",
+                Some((proxy_type, "proxy.example", 1080)),
+            );
+            assert!(status.contains(expected));
+            assert!(!status.contains("secret"));
+            assert!(!status.contains("Basic"));
+            assert!(!status.contains("Proxy-Authorization"));
+        }
     }
 }
