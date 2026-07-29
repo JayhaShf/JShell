@@ -2,7 +2,7 @@ use std::{
     fs::{self, File},
     io::Write as _,
     path::{Path, PathBuf},
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
 };
 
 use anyhow::{Context, Result, bail};
@@ -1433,6 +1433,8 @@ fn format_authority(host: &str, port: u16) -> String {
     }
 }
 
+const MAX_HTTP_CONNECT_RESPONSE_BYTES: usize = 16 * 1024;
+
 fn validate_http_connect_response(response: &[u8]) -> Result<()> {
     let mut headers = [httparse::EMPTY_HEADER; 64];
     let mut parsed = httparse::Response::new(&mut headers);
@@ -1452,12 +1454,102 @@ fn validate_http_connect_response(response: &[u8]) -> Result<()> {
     Ok(())
 }
 
-pub async fn connect_proxy(
+async fn establish_http_connect<S>(
+    stream: S,
+    proxy: &ResolvedProxy,
+    target_host: &str,
+    target_port: u16,
+) -> Result<tokio::io::BufStream<S>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let mut stream = tokio::io::BufStream::new(stream);
+    let authority = format_authority(target_host, target_port);
+    let mut request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n");
+    if !proxy.user.is_empty() {
+        let auth = format!("{}:{}", proxy.user, proxy.password);
+        request.push_str(&format!(
+            "Proxy-Authorization: Basic {}\r\n",
+            STANDARD.encode(auth)
+        ));
+    }
+    request.push_str("\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .context("write HTTP proxy CONNECT request")?;
+    stream
+        .flush()
+        .await
+        .context("flush HTTP proxy CONNECT request")?;
+
+    let mut response = Vec::with_capacity(512);
+    loop {
+        response.push(
+            stream
+                .read_u8()
+                .await
+                .context("read HTTP proxy CONNECT response")?,
+        );
+        if response.ends_with(b"\r\n\r\n") {
+            break;
+        }
+        if response.len() >= MAX_HTTP_CONNECT_RESPONSE_BYTES {
+            bail!("HTTP proxy CONNECT response headers exceed 16 KiB");
+        }
+    }
+    validate_http_connect_response(&response)?;
+    Ok(stream)
+}
+
+fn native_https_client_config() -> Result<Arc<rustls::ClientConfig>> {
+    let native = rustls_native_certs::load_native_certs();
+    for error in &native.errors {
+        tracing::warn!(%error, "[proxy] failed to load one system root certificate");
+    }
+    let mut roots = rustls::RootCertStore::empty();
+    let (accepted, rejected) = roots.add_parsable_certificates(native.certs);
+    if rejected > 0 {
+        tracing::warn!(rejected, "[proxy] ignored invalid system root certificates");
+    }
+    if accepted == 0 {
+        bail!("load HTTPS proxy system root certificates failed: no usable roots");
+    }
+    Ok(Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    ))
+}
+
+async fn connect_https_proxy_with_config(
+    proxy: &ResolvedProxy,
+    target_host: &str,
+    target_port: u16,
+    tls_config: Arc<rustls::ClientConfig>,
+) -> Result<Box<dyn ProxyStream>> {
+    let tcp = tokio::net::TcpStream::connect((proxy.host.as_str(), proxy.port))
+        .await
+        .context("connect TCP socket to HTTPS proxy")?;
+    let server_name = rustls::pki_types::ServerName::try_from(proxy.host.clone())
+        .context("HTTPS proxy host is not a valid TLS server name")?;
+    let tls = tokio_rustls::TlsConnector::from(tls_config)
+        .connect(server_name, tcp)
+        .await
+        .context("perform HTTPS proxy TLS handshake and certificate validation")?;
+    let tunnel = establish_http_connect(tls, proxy, target_host, target_port)
+        .await
+        .context("establish CONNECT tunnel through HTTPS proxy")?;
+    Ok(Box::new(tunnel))
+}
+
+async fn connect_proxy_with_tls_config(
     session: &Session,
     config: &ConnectionProxyConfig,
+    test_tls_config: Option<Arc<rustls::ClientConfig>>,
 ) -> Result<Box<dyn ProxyStream>> {
-    const MAX_HTTP_CONNECT_RESPONSE_BYTES: usize = 16 * 1024;
-
     let route = resolve_proxy(session, config)?;
     let target_host = session.host.clone();
     let target_port = session.port;
@@ -1504,59 +1596,38 @@ pub async fn connect_proxy(
                     ..
                 },
             ) => {
-                use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-
                 let stream = tokio::net::TcpStream::connect((proxy.host.as_str(), proxy.port))
                     .await
                     .map_err(|error| anyhow::anyhow!("HTTP proxy connection failed: {error}"))?;
-                let mut stream = tokio::io::BufStream::new(stream);
-                let authority = format_authority(&target_host, target_port);
-                let mut request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n");
-                if !proxy.user.is_empty() {
-                    let auth = format!("{}:{}", proxy.user, proxy.password);
-                    request.push_str(&format!(
-                        "Proxy-Authorization: Basic {}\r\n",
-                        STANDARD.encode(auth)
-                    ));
-                }
-                request.push_str("\r\n");
-                stream
-                    .write_all(request.as_bytes())
-                    .await
-                    .context("write HTTP proxy CONNECT request")?;
-                stream
-                    .flush()
-                    .await
-                    .context("flush HTTP proxy CONNECT request")?;
-
-                let mut response = Vec::with_capacity(512);
-                loop {
-                    response.push(
-                        stream
-                            .read_u8()
-                            .await
-                            .context("read HTTP proxy CONNECT response")?,
-                    );
-                    if response.ends_with(b"\r\n\r\n") {
-                        break;
-                    }
-                    if response.len() >= MAX_HTTP_CONNECT_RESPONSE_BYTES {
-                        bail!("HTTP proxy CONNECT response headers exceed 16 KiB");
-                    }
-                }
-                validate_http_connect_response(&response)?;
-                Ok(Box::new(stream) as Box<dyn ProxyStream>)
+                let tunnel =
+                    establish_http_connect(stream, &proxy, &target_host, target_port).await?;
+                Ok(Box::new(tunnel) as Box<dyn ProxyStream>)
             }
-            ProxyRoute::Proxy(ResolvedProxy {
-                kind: ProxyKind::Https,
-                ..
-            }) => bail!("HTTPS proxy TLS transport is not established"),
+            ProxyRoute::Proxy(
+                proxy @ ResolvedProxy {
+                    kind: ProxyKind::Https,
+                    ..
+                },
+            ) => {
+                let tls_config = match test_tls_config {
+                    Some(config) => config,
+                    None => native_https_client_config()?,
+                };
+                connect_https_proxy_with_config(&proxy, &target_host, target_port, tls_config).await
+            }
         }
     };
 
     tokio::time::timeout(std::time::Duration::from_secs(16), connect_fut)
         .await
         .map_err(|_| anyhow::anyhow!("connection timed out after 16 seconds"))?
+}
+
+pub async fn connect_proxy(
+    session: &Session,
+    config: &ConnectionProxyConfig,
+) -> Result<Box<dyn ProxyStream>> {
+    connect_proxy_with_tls_config(session, config, None).await
 }
 
 pub fn active_proxy(
@@ -1836,12 +1907,14 @@ fn decrypt_config_v1(raw: &[u8], password: &str) -> Result<ConfigFile> {
 mod tests {
     use std::{
         cell::{Cell, RefCell},
+        sync::Arc,
         time::Duration,
     };
 
     use super::*;
 
     use crate::session::config_key::{ConfigKeyProvider, MasterKey};
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     #[derive(Default)]
     struct TestKeyProvider {
@@ -1898,6 +1971,138 @@ mod tests {
             proxy_type: proxy_type.to_string(),
             host: host.to_string(),
             port: Some(port),
+            user: String::new(),
+            password: String::new(),
+        }
+    }
+
+    fn test_tls_configs(names: &[&str]) -> (Arc<rustls::ServerConfig>, Arc<rustls::ClientConfig>) {
+        use rcgen::{
+            BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
+            KeyUsagePurpose,
+        };
+        use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::new(vec!["ashell-test-ca".to_string()]).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::CrlSign,
+        ];
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let leaf_key = KeyPair::generate().unwrap();
+        let mut leaf_params = CertificateParams::new(
+            names
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_cert, &ca_key).unwrap();
+
+        let server = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![leaf_cert.der().clone()],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der())),
+            )
+            .unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca_cert.der().clone()).unwrap();
+        let client = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        (Arc::new(server), Arc::new(client))
+    }
+
+    const TEST_PROXY_TASK_TIMEOUT: Duration = Duration::from_secs(2);
+
+    async fn abort_and_join_test_proxy_task(
+        task: tokio::task::JoinHandle<Result<()>>,
+    ) -> Result<()> {
+        task.abort();
+        match task.await {
+            Ok(result) => result,
+            Err(error) if error.is_cancelled() => Ok(()),
+            Err(error) => {
+                Err(anyhow::Error::new(error).context("join test proxy server task after abort"))
+            }
+        }
+    }
+
+    async fn join_test_proxy_task(
+        mut task: tokio::task::JoinHandle<Result<()>>,
+    ) -> Result<Result<()>> {
+        match tokio::time::timeout(TEST_PROXY_TASK_TIMEOUT, &mut task).await {
+            Ok(result) => Ok(result.context("join test proxy server task")?),
+            Err(_) => {
+                abort_and_join_test_proxy_task(task).await?;
+                bail!("test proxy server task timed out");
+            }
+        }
+    }
+
+    async fn assert_test_proxy_succeeded(task: tokio::task::JoinHandle<Result<()>>) {
+        join_test_proxy_task(task)
+            .await
+            .expect("test proxy server task must not time out or panic")
+            .expect("test proxy server task must succeed");
+    }
+
+    async fn assert_tls_handshake_rejected(task: tokio::task::JoinHandle<Result<()>>) {
+        let result = join_test_proxy_task(task)
+            .await
+            .expect("test TLS proxy task must not time out or panic");
+        let error = result.expect_err("test TLS proxy handshake must be rejected");
+        assert!(
+            format!("{error:#}").contains("accept test TLS connection"),
+            "unexpected test TLS proxy error: {error:#}"
+        );
+    }
+
+    async fn spawn_tls_proxy(
+        server_config: Arc<rustls::ServerConfig>,
+        response: Vec<u8>,
+    ) -> (u16, tokio::task::JoinHandle<Result<()>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let task = tokio::spawn(async move {
+            let (tcp, _) = listener
+                .accept()
+                .await
+                .context("accept test TLS proxy TCP connection")?;
+            let mut tls = tokio_rustls::TlsAcceptor::from(server_config)
+                .accept(tcp)
+                .await
+                .context("accept test TLS connection")?;
+            let mut request = Vec::new();
+            loop {
+                request.push(tls.read_u8().await.context("read test CONNECT request")?);
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+                if request.len() >= 16 * 1024 {
+                    bail!("test CONNECT request exceeded 16 KiB");
+                }
+            }
+            tls.write_all(&response)
+                .await
+                .context("write test TLS proxy response")?;
+            tls.flush().await.context("flush test TLS proxy response")?;
+            Ok(())
+        });
+        (port, task)
+    }
+
+    fn resolved_https_proxy(port: u16) -> ResolvedProxy {
+        ResolvedProxy {
+            kind: ProxyKind::Https,
+            host: "localhost".to_string(),
+            port,
             user: String::new(),
             password: String::new(),
         }
@@ -2032,47 +2237,135 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn https_proxy_route_fails_closed_before_tls_is_established() {
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .unwrap();
-        let proxy_port = listener.local_addr().unwrap().port();
-        let mut session = Session::password(
-            "example.test".to_string(),
+    async fn trusted_https_proxy_completes_tls_connect_and_preserves_tunnel_bytes() {
+        let (server_config, client_config) = test_tls_configs(&["localhost"]);
+        let (port, server) = spawn_tls_proxy(
+            server_config,
+            b"HTTP/1.1 200 Connection established\r\n\r\nSSH-2.0-test\r\n".to_vec(),
+        )
+        .await;
+        let mut stream = connect_https_proxy_with_config(
+            &resolved_https_proxy(port),
+            "target.example",
             22,
+            client_config,
+        )
+        .await
+        .expect("trusted HTTPS proxy should establish a CONNECT tunnel");
+        let mut banner = [0_u8; 14];
+        stream.read_exact(&mut banner).await.unwrap();
+        assert_eq!(&banner, b"SSH-2.0-test\r\n");
+        assert_test_proxy_succeeded(server).await;
+    }
+
+    #[tokio::test]
+    async fn https_proxy_rejects_an_untrusted_certificate() {
+        let (server_config, _) = test_tls_configs(&["localhost"]);
+        let (port, server) =
+            spawn_tls_proxy(server_config, b"HTTP/1.1 200 OK\r\n\r\n".to_vec()).await;
+        let client = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth(),
+        );
+        let error = connect_https_proxy_with_config(
+            &resolved_https_proxy(port),
+            "target.example",
+            22,
+            client,
+        )
+        .await
+        .err()
+        .expect("an untrusted HTTPS proxy certificate must be rejected");
+        assert!(format!("{error:#}").contains("certificate validation"));
+        assert_tls_handshake_rejected(server).await;
+    }
+
+    #[tokio::test]
+    async fn https_proxy_rejects_a_mismatched_server_name() {
+        let (server_config, client_config) = test_tls_configs(&["wrong.example"]);
+        let (port, server) =
+            spawn_tls_proxy(server_config, b"HTTP/1.1 200 OK\r\n\r\n".to_vec()).await;
+        let error = connect_https_proxy_with_config(
+            &resolved_https_proxy(port),
+            "target.example",
+            22,
+            client_config,
+        )
+        .await
+        .err()
+        .expect("a mismatched HTTPS proxy server name must be rejected");
+        assert!(format!("{error:#}").contains("certificate validation"));
+        assert_tls_handshake_rejected(server).await;
+    }
+
+    #[tokio::test]
+    async fn https_proxy_surfaces_non_success_connect_status() {
+        let (server_config, client_config) = test_tls_configs(&["localhost"]);
+        let (port, server) = spawn_tls_proxy(
+            server_config,
+            b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n".to_vec(),
+        )
+        .await;
+        let error = connect_https_proxy_with_config(
+            &resolved_https_proxy(port),
+            "target.example",
+            22,
+            client_config,
+        )
+        .await
+        .err()
+        .expect("a non-success HTTPS CONNECT status must be returned");
+        assert!(format!("{error:#}").contains("status 407"));
+        assert_test_proxy_succeeded(server).await;
+    }
+
+    #[tokio::test]
+    async fn https_tls_failure_does_not_fall_back_to_direct() {
+        let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_port = target_listener.local_addr().unwrap().port();
+        let (server_config, _) = test_tls_configs(&["localhost"]);
+        let (proxy_port, proxy_server) =
+            spawn_tls_proxy(server_config, b"HTTP/1.1 200 OK\r\n\r\n".to_vec()).await;
+        let untrusted_client = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth(),
+        );
+        let mut session = Session::password(
+            "127.0.0.1".to_string(),
+            target_port,
             "root".to_string(),
             "secret".to_string(),
         );
         session.proxy_type = "https".to_string();
-        session.proxy_host = "127.0.0.1".to_string();
+        session.proxy_host = "localhost".to_string();
         session.proxy_port = Some(proxy_port);
         session.proxy_user = "https-proxy-user-must-not-leak".to_string();
         session.proxy_password = "https-proxy-password-must-not-leak".to_string();
         let config = direct_proxy_config();
+        let connect = connect_proxy_with_tls_config(&session, &config, Some(untrusted_client));
 
-        let result = tokio::time::timeout(Duration::from_secs(1), async {
+        let error = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::pin!(connect);
             tokio::select! {
                 biased;
-                accepted = listener.accept() => match accepted {
+                accepted = target_listener.accept() => match accepted {
                     Ok((_, peer_address)) => panic!(
-                        "HTTPS proxy route opened a TCP connection to {peer_address} before TLS was established"
+                        "HTTPS TLS failure fell back to direct target {peer_address}"
                     ),
-                    Err(error) => panic!("accept HTTPS proxy connection: {error}"),
+                    Err(error) => panic!("accept direct target connection: {error}"),
                 },
-                result = connect_proxy(&session, &config) => result,
+                result = &mut connect => match result {
+                    Ok(_) => panic!("HTTPS TLS failure unexpectedly returned a stream"),
+                    Err(error) => error,
+                },
             }
         })
         .await
-        .expect("HTTPS proxy route did not fail closed within the overall timeout");
-        let error = result
-            .err()
-            .expect("HTTPS proxy route must fail until TLS is established");
-
-        assert!(
-            format!("{error:#}").contains("HTTPS proxy TLS transport is not established"),
-            "unexpected HTTPS proxy error: {error:#}"
-        );
+        .expect("HTTPS TLS failure did not finish within the overall timeout");
         let error_chain = format!("{error:#}");
+        assert!(error_chain.contains("certificate validation"));
         for sensitive_value in [
             session.proxy_user.as_str(),
             session.proxy_password.as_str(),
@@ -2081,9 +2374,68 @@ mod tests {
         ] {
             assert!(
                 !error_chain.contains(sensitive_value),
-                "HTTPS proxy error leaked '{sensitive_value}': {error_chain}"
+                "HTTPS proxy error leaked sensitive authentication data"
             );
         }
+        assert_tls_handshake_rejected(proxy_server).await;
+    }
+
+    #[tokio::test]
+    async fn https_connect_failure_does_not_fall_back_to_direct() {
+        let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_port = target_listener.local_addr().unwrap().port();
+        let (server_config, client_config) = test_tls_configs(&["localhost"]);
+        let (proxy_port, proxy_server) = spawn_tls_proxy(
+            server_config,
+            b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n".to_vec(),
+        )
+        .await;
+        let mut session = Session::password(
+            "127.0.0.1".to_string(),
+            target_port,
+            "root".to_string(),
+            "secret".to_string(),
+        );
+        session.proxy_type = "https".to_string();
+        session.proxy_host = "localhost".to_string();
+        session.proxy_port = Some(proxy_port);
+        session.proxy_user = "connect-proxy-user-must-not-leak".to_string();
+        session.proxy_password = "connect-proxy-password-must-not-leak".to_string();
+        let config = direct_proxy_config();
+        let connect = connect_proxy_with_tls_config(&session, &config, Some(client_config));
+
+        let error = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::pin!(connect);
+            tokio::select! {
+                biased;
+                accepted = target_listener.accept() => match accepted {
+                    Ok((_, peer_address)) => panic!(
+                        "HTTPS CONNECT failure fell back to direct target {peer_address}"
+                    ),
+                    Err(error) => panic!("accept direct target connection: {error}"),
+                },
+                result = &mut connect => match result {
+                    Ok(_) => panic!("HTTPS CONNECT failure unexpectedly returned a stream"),
+                    Err(error) => error,
+                },
+            }
+        })
+        .await
+        .expect("HTTPS CONNECT failure did not finish within the overall timeout");
+        let error_chain = format!("{error:#}");
+        assert!(error_chain.contains("status 407"));
+        for sensitive_value in [
+            session.proxy_user.as_str(),
+            session.proxy_password.as_str(),
+            "Basic",
+            "Proxy-Authorization",
+        ] {
+            assert!(
+                !error_chain.contains(sensitive_value),
+                "HTTPS proxy error leaked sensitive authentication data"
+            );
+        }
+        assert_test_proxy_succeeded(proxy_server).await;
     }
 
     #[test]
@@ -2219,6 +2571,108 @@ mod tests {
         assert_eq!(proxy.port, Some(80));
         assert_eq!(proxy.user, "user");
         assert_eq!(proxy.password, "pass");
+    }
+
+    async fn connect_over_duplex(
+        response: Vec<u8>,
+    ) -> Result<tokio::io::BufStream<tokio::io::DuplexStream>> {
+        let (client, mut server) = tokio::io::duplex(64 * 1024);
+        let server_task = tokio::spawn(async move {
+            let mut request = Vec::new();
+            loop {
+                request.push(
+                    server
+                        .read_u8()
+                        .await
+                        .context("read HTTP CONNECT test request")?,
+                );
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+                if request.len() >= MAX_HTTP_CONNECT_RESPONSE_BYTES {
+                    bail!("HTTP CONNECT test request exceeded 16 KiB");
+                }
+            }
+            let request =
+                String::from_utf8(request).context("decode HTTP CONNECT test request as UTF-8")?;
+            if !request
+                .starts_with("CONNECT target.example:22 HTTP/1.1\r\nHost: target.example:22\r\n")
+            {
+                bail!("HTTP CONNECT test request has an unexpected authority or Host header");
+            }
+            server
+                .write_all(&response)
+                .await
+                .context("write HTTP CONNECT test response")?;
+            server
+                .flush()
+                .await
+                .context("flush HTTP CONNECT test response")?;
+            Ok(())
+        });
+        let connect_result = match tokio::time::timeout(
+            TEST_PROXY_TASK_TIMEOUT,
+            establish_http_connect(
+                client,
+                &ResolvedProxy {
+                    kind: ProxyKind::Http,
+                    host: "proxy.example".to_string(),
+                    port: 8080,
+                    user: String::new(),
+                    password: String::new(),
+                },
+                "target.example",
+                22,
+            ),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                abort_and_join_test_proxy_task(server_task).await?;
+                bail!("establish HTTP CONNECT over duplex timed out");
+            }
+        };
+        join_test_proxy_task(server_task).await??;
+        connect_result
+    }
+
+    #[test]
+    fn http_connect_validation_accepts_only_real_2xx_statuses() {
+        for status in [200, 204, 299] {
+            let response = format!("HTTP/1.1 {status} Result\r\n\r\n");
+            validate_http_connect_response(response.as_bytes()).unwrap();
+        }
+        let error = validate_http_connect_response(b"HTTP/1.1 300 Redirect\r\n\r\n").unwrap_err();
+        assert!(error.to_string().contains("status 300"));
+    }
+
+    #[tokio::test]
+    async fn http_connect_rejects_headers_larger_than_16_kib() {
+        let mut response = b"HTTP/1.1 200 OK\r\nX-Fill: ".to_vec();
+        response.extend(vec![b'a'; 16 * 1024]);
+        let error = connect_over_duplex(response).await.unwrap_err();
+        assert!(error.to_string().contains("exceed 16 KiB"));
+    }
+
+    #[tokio::test]
+    async fn http_connect_rejects_an_incomplete_response() {
+        let error = connect_over_duplex(b"HTTP/1.1 200 OK\r\n".to_vec())
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("read HTTP proxy CONNECT response"));
+    }
+
+    #[tokio::test]
+    async fn http_connect_preserves_bytes_after_response_headers() {
+        let mut stream = connect_over_duplex(
+            b"HTTP/1.1 200 Connection established\r\n\r\nSSH-2.0-test\r\n".to_vec(),
+        )
+        .await
+        .unwrap();
+        let mut banner = [0_u8; 14];
+        stream.read_exact(&mut banner).await.unwrap();
+        assert_eq!(&banner, b"SSH-2.0-test\r\n");
     }
 
     #[test]
