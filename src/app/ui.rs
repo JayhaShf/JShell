@@ -340,6 +340,9 @@ impl Ashell {
                     .border_color(cx.theme().border)
                     .bg(cx.theme().tab_bar)
                     .child(div().flex_1())
+                    .when(self.active_connected_ssh_tab_id().is_some(), |this| {
+                        this.child(self.render_command_bar_button(cx))
+                    })
                     .child(
                         Button::new("open-transfers")
                             .ghost()
@@ -775,6 +778,9 @@ impl Ashell {
                         .text_color(cx.theme().primary)
                         .child(status),
                 )
+                .when(self.active_connected_ssh_tab_id().is_some(), |this| {
+                    this.child(self.render_command_bar_button(cx))
+                })
                 .child(
                     Button::new("open-transfers")
                         .ghost()
@@ -2626,9 +2632,6 @@ impl Ashell {
                                     this.split_current_pane("right", cx);
                                 })),
                         )
-                        .when(self.active_connected_ssh_tab_id().is_some(), |this| {
-                            this.child(self.render_command_bar_button(cx))
-                        })
                         .child(self.render_search_button(cx))
                     }),
             )

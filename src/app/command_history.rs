@@ -110,6 +110,14 @@ fn command_input_payload(input: &str) -> Option<Vec<u8>> {
     Some(payload)
 }
 
+fn command_bar_toggle_tooltip_key(is_visible: bool) -> &'static str {
+    if is_visible {
+        "command_bar_hide"
+    } else {
+        "command_bar_toggle"
+    }
+}
+
 fn history_prefix_matches(entries: &[String], input: &str, limit: usize) -> Vec<String> {
     if input.chars().filter(|ch| !ch.is_whitespace()).count() < 2 || limit == 0 {
         return Vec::new();
@@ -441,12 +449,12 @@ impl Ashell {
         &self,
         cx: &mut Context<Self>,
     ) -> impl gpui::IntoElement {
+        let tooltip_key = command_bar_toggle_tooltip_key(self.command_bar_open);
         Button::new("command-bar-toggle")
             .ghost()
             .small()
-            .rounded(px(999.))
             .icon(IconName::SquareTerminal)
-            .tooltip(t!("command_bar_toggle").to_string())
+            .tooltip(t!(tooltip_key).to_string())
             .on_click(cx.listener(|this, _, window, cx| {
                 this.toggle_command_bar(window, cx);
             }))
@@ -720,8 +728,8 @@ impl Ashell {
 mod completion_tests {
     use super::{
         HISTORY_COMPLETION_PLUGIN_ID, apply_terminal_input_bytes,
-        builtin_terminal_completion_plugins, command_input_payload, completion_candidates_for,
-        history_prefix_matches,
+        builtin_terminal_completion_plugins, command_bar_toggle_tooltip_key, command_input_payload,
+        completion_candidates_for, history_prefix_matches,
     };
 
     #[test]
@@ -812,5 +820,11 @@ mod completion_tests {
         input.push_str("cargo");
         apply_terminal_input_bytes(&mut input, b"\t");
         assert!(input.is_empty());
+    }
+
+    #[test]
+    fn command_bar_toggle_tooltip_key_matches_visibility() {
+        assert_eq!(command_bar_toggle_tooltip_key(false), "command_bar_toggle");
+        assert_eq!(command_bar_toggle_tooltip_key(true), "command_bar_hide");
     }
 }
