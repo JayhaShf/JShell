@@ -2859,7 +2859,7 @@ impl Ashell {
                                                                         .small()
                                                                         .label(t!("about_project_home").to_string())
                                                                         .on_click(|_, _window, _cx| {
-                                                                            let _ = open::that("https://github.com/JayhaShf/ashell");
+                                                                            let _ = open::that("https://github.com/JayhaShf/JShell");
                                                                         }),
                                                                 )
                                                                 .child(

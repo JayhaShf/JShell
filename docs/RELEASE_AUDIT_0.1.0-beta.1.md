@@ -16,7 +16,7 @@
 
 - 软件名称、二进制、Windows 资源、Linux 桌面入口和 macOS 应用包统一为 JShell。
 - 保留透明 PNG 母版，并提供 Windows ICO、Linux PNG 和 macOS ICNS。
-- 发布流程只向当前 `JayhaShf/ashell` 仓库写入 Release，不再更新上游 Homebrew Tap。
+- 发布流程只向当前 `JayhaShf/JShell` 仓库写入 Release，不再更新上游 Homebrew Tap。
 - 发布标签必须与 `Cargo.toml` 的包版本完全一致。
 
 ### 2.2 SSH 与代理

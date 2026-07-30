@@ -14,7 +14,7 @@
 
 - 实际仓库：`D:/Git/ashell`。
 - 保留当前所有未提交修改，不使用 `git reset --hard`、`git checkout --` 或其他破坏性回退。
-- 发布前校正 GitHub Actions 与三平台产物名；发布任务只能写入当前 `JayhaShf/ashell` 仓库，不得更新上游仓库或上游 Homebrew Tap。
+- 发布前校正 GitHub Actions 与三平台产物名；发布任务只能写入当前 `JayhaShf/JShell` 仓库，不得更新上游仓库或上游 Homebrew Tap。
 - 默认用户界面和新增文档使用中文；保留英文 README 的结构，但不让它覆盖中文默认文档。
 - 测试通过前不提交。每个任务可以形成工作区检查点，但不创建提交。
 - 删除旧资源或无用代码前必须通过 `git grep`、Rust 编译/Clippy 和构建引用检查确认没有消费者。

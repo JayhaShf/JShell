@@ -47,7 +47,7 @@ JShell 是一个使用 Rust、GPUI 与 `alacritty_terminal` 构建的桌面终�
 
 ## 安装与运行
 
-预编译版本发布在 [GitHub Releases](https://github.com/JayhaShf/ashell/releases)。发布产物名称为：
+预编译版本发布在 [GitHub Releases](https://github.com/JayhaShf/JShell/releases)。发布产物名称为：
 
 - Windows：`jshell-<版本>-windows-x86_64.zip`
 - Linux：`jshell-<版本>-linux-x86_64.tar.gz`

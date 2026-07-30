@@ -25,7 +25,7 @@ Disconnecting never auto-saves an edited document. Local text remains in memory,
 
 ## Downloads
 
-Prebuilt archives are published on [GitHub Releases](https://github.com/JayhaShf/ashell/releases):
+Prebuilt archives are published on [GitHub Releases](https://github.com/JayhaShf/JShell/releases):
 
 - `jshell-<version>-windows-x86_64.zip`
 - `jshell-<version>-linux-x86_64.tar.gz`
