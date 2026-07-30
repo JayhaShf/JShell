@@ -4,7 +4,7 @@
 
 **Goal:** 为所有可见工作区标签增加统一的 3 px 左侧状态色带和类型图标，完整、可靠地表达终端聚合状态与远程文档状态，同时保持现有标签交互和 SSH 强调样式。
 
-**Architecture:** 新建 `src/app/workspace_tabs.rs` 承载可独立测试的视觉类型、状态、语义色角色以及终端/文档状态归约函数；`src/app/ui.rs` 只负责从现有 `TerminalTab`、`RemoteDocument` 生成 `WorkspaceTabRenderData`，并在唯一的共享标签分支中把类型映射为图标、把语义色角色映射为当前主题颜色。主题 JSON 只调整两套 JShell 主题的 `base.blue`，现有 `filter_map`、标签激活/关闭/滚动、SSH 黑底与底部指示线均保持原数据流。
+**Architecture:** 新建 `src/app/workspace_tabs.rs` 承载可独立测试的视觉类型、状态、语义色角色以及终端/文档状态归约函数；`src/app/ui.rs` 只负责从现有 `TerminalTab`、`RemoteDocument` 生成 `WorkspaceTabRenderData`，并在唯一的共享标签分支中把类型映射为图标、把语义色角色映射为当前主题颜色。文件蓝色在标签渲染层提供专用回退，不修改主题 JSON 的全局 `base.blue`；现有 `filter_map`、标签激活/关闭/滚动、SSH 黑底与底部指示线均保持原数据流。
 
 **Tech Stack:** Rust 2024、GPUI、gpui-component、Cargo 单元测试、serde_json 主题夹具、Windows Debug 桌面交互验证。
 
@@ -15,8 +15,8 @@
 - Create: `src/app/workspace_tabs.rs`：工作区标签视觉类型、状态、语义色角色，以及终端多 pane 与远程文档状态的纯逻辑归约和表驱动测试。
 - Modify: `src/app/mod.rs:1-10`：注册 `workspace_tabs` 模块。
 - Modify: `src/app/ui.rs:24-49,2350-2580`：构造带类型、状态、dirty 标记的渲染数据，并统一渲染 3 px 色带、类型图标、截断标题、未保存标记和关闭按钮。
-- Modify: `src/app/theme.rs:307-332`：锁定 JShell Light、JShell Dark 与 VS Code Dark 的 `base.blue` 主题值。
-- Modify: `assets/themes/ashell.json:17,33`：把 JShell Light 与 JShell Dark 的 `base.blue` 改为 `#2f7faa`。
+- Modify: `src/app/theme.rs`：为文件标签提供专用回退蓝，并校正色带及 SSH 选中线对比度。
+- Modify: `locales/en.yml`、`locales/zh-CN.yml`：提供标签栏可访问名称。
 
 ## 状态与渲染契约
 
@@ -439,12 +439,11 @@ git add src/app/workspace_tabs.rs
 git commit -m "feat(ui): classify remote document tab status"
 ```
 
-### Task 3：语义色角色与内置主题蓝色
+### Task 3：语义色角色与标签专用文件蓝
 
 **Files:**
 - Modify: `src/app/workspace_tabs.rs`
-- Modify: `src/app/theme.rs:307-332`
-- Modify: `assets/themes/ashell.json:17,33`
+- Modify: `src/app/theme.rs`
 - Test: `src/app/workspace_tabs.rs`
 - Test: `src/app/theme.rs`
 
@@ -527,7 +526,7 @@ Run: `cargo test workspace_tab_color_roles_preserve_green_blue_yellow_red_and_gr
 
 Expected: 1 项测试通过，终端正常与文件正常分别映射 `Success` 和 `Blue`，其余三种状态不受视觉类型影响。
 
-- [ ] **Step 5：先锁定三套主题的蓝色值**
+- [ ] **Step 5：先锁定三套主题的全局蓝色值不变**
 
 用以下完整函数替换 `src/app/theme.rs` 中现有的 `bundled_themes_match_the_workspace_preview_palette`：
 
@@ -545,13 +544,13 @@ Expected: 1 项测试通过，终端正常与文件正常分别映射 `Success` 
         assert_eq!(light["secondary.hover.background"], "#e6e6e6");
         assert_eq!(light["sidebar.background"], "#f5f5f5");
         assert_eq!(light["tab.active.background"], "#151515");
-        assert_eq!(light["base.blue"], "#2f7faa");
+        assert_eq!(light["base.blue"], "#202020");
 
         let dark = &ashell_theme["themes"][1]["colors"];
         assert_eq!(dark["base.green"], "#a7d797");
         assert_eq!(dark["base.yellow"], "#d8ca77");
         assert_eq!(dark["base.red"], "#d75050");
-        assert_eq!(dark["base.blue"], "#2f7faa");
+        assert_eq!(dark["base.blue"], "#f5f5f5");
         assert_eq!(dark["sidebar.background"], "#171717");
         assert_eq!(dark["tab.active.background"], "#f5f5f5");
 
@@ -563,36 +562,32 @@ Expected: 1 项测试通过，终端正常与文件正常分别映射 `Success` 
     }
 ```
 
-- [ ] **Step 6：运行主题夹具测试并确认 RED**
+- [ ] **Step 6：为标签调色板增加专用文件蓝回退测试**
 
-Run: `cargo test bundled_themes_match_the_workspace_preview_palette -- --nocapture`
+Run: `cargo test workspace_tab_palette_uses_a_dedicated_file_blue -- --nocapture`
 
-Expected: 断言失败；JShell Light 的实际值仍是 `#202020`，JShell Dark 的实际值仍是 `#f5f5f5`。
+Expected: 在实现专用回退前失败；JShell 的低饱和度 `blue` 应在标签调色板中映射为 `#2f7faa`。
 
-- [ ] **Step 7：只修改两套 JShell 主题的 `base.blue`**
+- [ ] **Step 7：只在标签调色板中提供回退蓝**
 
-在 `assets/themes/ashell.json` 中执行两处精确替换：
+当 `theme.blue` 为低饱和度中性色时，`workspace_tab_palette` 使用：
 
-```json
-"base.yellow": "#816200", "base.blue": "#2f7faa", "base.magenta": "#4a4a4a"
+```rust
+gpui::rgb(0x2f7faa).into()
 ```
 
-```json
-"base.yellow": "#d8ca77", "base.blue": "#2f7faa", "base.magenta": "#b8b8b8"
-```
-
-不要修改 `assets/themes/vscode.json`；它的 `base.blue` 必须继续为 `#569cd6`。
+不要修改 `assets/themes/ashell.json` 或 `assets/themes/vscode.json`；有明确蓝色的主题继续使用自身的 `base.blue`。
 
 - [ ] **Step 8：重新运行主题夹具测试并确认 GREEN**
 
 Run: `cargo test bundled_themes_match_the_workspace_preview_palette -- --nocapture`
 
-Expected: 1 项测试通过，两个 JShell 主题均为 `#2f7faa`，VS Code Dark 仍为 `#569cd6`。
+Expected: 主题夹具保持原值；两个 JShell 主题的标签文件蓝使用 `#2f7faa` 回退，VS Code Dark 标签继续使用 `#569cd6`。
 
 - [ ] **Step 9：提交语义色与主题值**
 
 ```powershell
-git add src/app/workspace_tabs.rs src/app/theme.rs assets/themes/ashell.json
+git add src/app/workspace_tabs.rs src/app/theme.rs
 git commit -m "feat(theme): define workspace tab status colors"
 ```
 
@@ -1034,7 +1029,7 @@ Expected: 无空白错误。
 
 Run: `git status --short`
 
-Expected: 功能实现只涉及 `src/app/mod.rs`、`src/app/workspace_tabs.rs`、`src/app/ui.rs`、`src/app/theme.rs` 和 `assets/themes/ashell.json`；不包含持久化格式、文档编辑器、SFTP、命令栏、Release 工作流或发布脚本改动。
+Expected: 功能实现只涉及 `src/app/mod.rs`、`src/app/workspace_tabs.rs`、`src/app/ui.rs`、`src/app/theme.rs`、`locales/en.yml` 和 `locales/zh-CN.yml`；不修改主题 JSON，也不包含持久化格式、文档编辑器、SFTP、命令栏、Release 工作流或发布脚本改动。
 
 ## 验收映射
 
@@ -1043,5 +1038,6 @@ Expected: 功能实现只涉及 `src/app/mod.rs`、`src/app/workspace_tabs.rs`�
 - pane 缺失与空工作区不得判正常：Task 1 的 `None`/空集合用例，Task 4 的逐 pane 查找接线。
 - 文档 `load_state`、`save_state`、`connection_state`、`large_file.loading/error` 全覆盖：Task 2 的 14 项表驱动用例，Task 4 Step 4 的生产接线。
 - dirty 圆点位于标题截断容器外、旧状态圆点删除：Task 4 Steps 4-6。
-- JShell Light/Dark `base.blue=#2f7faa` 且 VS Code Dark 不变：Task 3 Steps 5-8。
+- JShell Light/Dark 的全局 `base.blue` 保持不变，标签层使用 `#2f7faa` 文件蓝回退，VS Code Dark 使用自身蓝色：Task 3 Steps 5-8。
+- 稳定标签 ID、`TabList`/`Tab` 语义、完整可访问名称和标准标签键盘切换：Task 4、Task 5。
 - 单元测试、严格静态检查和桌面交互验证：Task 5。

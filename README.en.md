@@ -2,120 +2,73 @@
 
 # JShell
 
-![Preview](preview.png)
+JShell is a Rust and GPUI desktop terminal workspace for local terminals, SSH sessions, SFTP file management, and remote text editing. The current release is `0.1.0-beta.1`; Chinese is the default UI and documentation language.
 
-`JShell` is a modern, GPUI Component-based desktop terminal client written in Rust, reworked from upstream Ashell for Windows-focused SSH workflows.
+![JShell workspace](assets/screenshots/compact-workspace.png)
 
-This project focuses on providing a high-performance and visually appealing shell workspace by combining local and remote environments with a rich set of built-in features. 
+## Highlights
 
-## 🚀 v0.4 Major Upgrades
+- Local terminal, SSH, and serial sessions with saved-session folders and connection reuse.
+- Horizontal and vertical splits that can mix terminals and remote text editors.
+- Direct, global-proxy, and per-session proxy modes with SOCKS5, SOCKS5H, HTTP, and HTTPS support.
+- SFTP browsing, Linux permission display, upload, download, directory creation, and deletion.
+- Single-click row focus, checkbox-only selection, and double-click navigation or file opening.
+- Automatic SFTP connection supervision without replaying destructive or transfer operations.
+- Persistent soft wrap, explicit save states, conflict detection, and conservative disconnect handling.
+- Detachable editor windows that reuse the same document, undo history, and save state.
+- Tree-sitter highlighting for common shell, systems, web, data, and configuration languages.
+- Dynamic Windows taskbar titles such as `JShell - nginx.conf*`.
 
-v0.4 builds on the v0.3 foundation and focuses on more capable workspace operations and a smoother daily workflow:
-- ✨ **Keybinding Management**: View and edit common shortcuts from the settings UI with conflict hints.
-- ✨ **Settings Page Polish**: A more compact and clearer settings experience with improved layout and interaction flow.
-- ✨ **Multi-Pane Tabs with a tmux-like Workflow**: A single tab can now host multiple panes, with split, focus, and switching actions for a tmux-inspired experience.
-- ✨ **Transfer History Improvements**: The transfer history panel now presents richer task details, making upload and download activity easier to review.
-- ✨ **SSH Passphrase Support**: Private keys can now store a passphrase, and SSH connections will use it automatically.
-- ✨ **Terminal Rendering Enhancements**: Terminal rendering now handles Block Elements and similar custom glyphs more completely.
+## Save and reconnect behavior
 
-## Download
+Disconnecting never auto-saves an edited document. Local text remains in memory, and the user saves manually after reconnecting. If a write may have reached the server but its result cannot be confirmed, JShell keeps the document dirty and reports an unknown save outcome instead of retrying blindly.
 
-You can download the latest pre-compiled releases for macOS, Windows, and Linux from the [GitHub Releases page](https://github.com/rust-kotlin/ashell/releases/latest).
+## Downloads
 
-## Mac Installation Guide
+Prebuilt archives are published on [GitHub Releases](https://github.com/JayhaShf/ashell/releases):
 
-### Method 1: Homebrew (Recommended)
+- `jshell-<version>-windows-x86_64.zip`
+- `jshell-<version>-linux-x86_64.tar.gz`
+- `jshell-<version>-macos-aarch64.zip`
+- `jshell-<version>-macos-x86_64.zip`
 
-If you use [Homebrew](https://brew.sh/), you can install it quickly with:
-
-```bash
-brew install rust-kotlin/taps/ashell --cask
-```
-
-To update the app:
-
-```bash
-brew update
-brew upgrade ashell --cask
-```
-
-> **Note**: Since the app uses ad-hoc signing, the Homebrew installation or update includes a postflight script to automatically handle the quarantine flag. This will require you to enter your administrator password for authorization.
-
-### Method 2: Manual Download
-
-1. Download and unzip from the [Releases page](https://github.com/rust-kotlin/ashell/releases/latest).
-2. Move `ashell.app` to your **Applications** folder. 
-3. Since the app uses ad-hoc signing, macOS may warn that the app is "damaged" upon first launch. If this happens, open Terminal and run:
+The macOS bundle is ad-hoc signed. After verifying the download source, remove quarantine if macOS blocks the first launch:
 
 ```bash
-sudo xattr -cr /Applications/ashell.app
+xattr -cr /Applications/JShell.app
 ```
 
-## Features
+## Configuration
 
-The current version provides a fully-featured GPUI-native workspace:
+The default configuration file is `~/.config/jshell/sessions.json`. JShell migrates the legacy `~/.config/ashell` location and old theme names. The `.ashell-*` remote temporary-file protocol remains intentionally compatible with previous versions.
 
-- **Local & Remote Sessions:** Open local terminal tabs or connect to remote servers via SSH.
-- **Advanced SSH Authentication:** Supports both password-based and key-based (file path or inline) SSH connections.
-- **Session Management:** Save, reopen, edit, and remove SSH sessions; reopening an already connected session activates its existing tab instead of creating a duplicate connection.
-- **SFTP Integration:** Built-in SFTP file manager to browse, upload, download, and manage remote files.
-- **Robust Terminal Emulator:** Parses terminal output with `alacritty_terminal`, supporting rich ANSI color spans, fast rendering, and complete keyboard input forwarding.
-- **System Telemetry:** Real-time visualization of CPU, memory, swap, network, and disk metrics in the left cockpit sidebar.
-- **Theming System:** Choose JShell Light, JShell Dark, or VS Code Dark. The JShell light and dark themes use monochrome palettes, while VS Code Dark uses blue active accents.
-- **Default Fonts:** The UI uses bundled `NotoSansCJKsc-Regular.otf`. Terminals follow the system monospace font and measure the selected font's real glyph advance for the grid; bundled `NotoSansMonoCJKsc-Regular.otf` remains available as a fallback for missing fonts and CJK glyphs.
-- **Windows Title Bar:** A compact custom Windows-style title bar follows the active theme and places minimize, maximize, and close controls on the right.
-- **v0.3 Core Enhancements:** Global font and font-size controls, concurrent SFTP transfers, persistent layout state, disconnect awareness, hot-swappable i18n, and smart terminal right-click copy/paste.
+## Development
 
-## Run
-
-To run the application locally:
+Rust `1.88.0` or newer is required.
 
 ```bash
-cargo run --release
+cargo run --locked
+cargo build --locked --release
 ```
 
-## Package macOS App
+Use `./scripts/package-macos-app.sh` to create a local macOS application bundle.
+
+## Verification
 
 ```bash
-./scripts/package-macos-app.sh
-open target/release/JShell.app
+cargo fmt --check
+cargo test --locked --quiet
+cargo check --locked --all-targets
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo build --locked --release
+cargo audit
+git diff --check
 ```
-
-The packaging script creates a standard `.app` bundle. It does not attach an entitlements file, and after signing, it verifies that `com.apple.security.app-sandbox` is not present (meaning it runs non-sandboxed).
-
-## Package Linux (Debian/Ubuntu)
-
-### Prerequisites
-
-```bash
-sudo apt install pkg-config libfontconfig1-dev
-cargo install cargo-deb
-```
-
-### Build .deb
-
-```bash
-cargo build --release
-cargo deb
-```
-
-The `.deb` file will be generated at:
-
-```
-target/debian/ashell_0.4.8-1_amd64.deb
-```
-
-### Install
-
-```bash
-sudo dpkg -i target/debian/ashell_0.4.8-1_amd64.deb
-```
-
-After installation, you can launch from the application menu or by running `ashell` in the terminal. The `.deb` package includes:
-- `/usr/bin/ashell` — Main binary
-- `/usr/share/applications/ashell.desktop` — Desktop entry
-- `/usr/share/icons/hicolor/256x256/apps/ashell.png` — Application icon
 
 ## License
 
-This project is licensed under the [GPL-3.0-or-later License](LICENSE).
+This project is licensed under [GPL-3.0-or-later](LICENSE).
+
+## Acknowledgements
+
+JShell evolves from [rust-kotlin/ashell](https://github.com/rust-kotlin/ashell), created by [TomZz](https://github.com/TomZz). Thank you to TomZz, the upstream maintainers, and every upstream contributor.
