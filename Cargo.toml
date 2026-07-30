@@ -96,8 +96,8 @@ section = "terminal"
 priority = "optional"
 assets = [
     ["target/release/jshell", "usr/bin/", "755"],
-    ["assets/ashell.desktop", "usr/share/applications/", "644"],
-    ["assets/icons/ashell.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
+    ["assets/jshell.desktop", "usr/share/applications/", "644"],
+    ["assets/icons/jshell.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
 ]
 
 [profile.release]

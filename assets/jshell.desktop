@@ -1,8 +1,8 @@
 [Desktop Entry]
 Name=JShell
-Comment=A Windows-focused SSH and local terminal workspace
+Comment=SSH、SFTP 与本地终端工作区
 Exec=jshell
-Icon=ashell
+Icon=jshell
 Terminal=false
 Type=Application
 Categories=System;TerminalEmulator;Utility;

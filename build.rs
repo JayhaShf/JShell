@@ -6,7 +6,7 @@ fn main() {
         println!("cargo:rustc-link-arg-bin=jshell=/STACK:8388608");
 
         let mut res = winres::WindowsResource::new();
-        res.set_icon("assets/icons/ashell.ico");
+        res.set_icon("assets/icons/jshell.ico");
         res.compile().unwrap();
     }
 }
