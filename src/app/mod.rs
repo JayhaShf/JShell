@@ -3,15 +3,17 @@ pub mod config_sync;
 pub mod constants;
 pub mod dialogs;
 pub mod keybinding_recorder;
+pub mod pane_layout;
 pub mod resizable;
 pub mod search;
 pub mod startup;
 pub mod theme;
 pub mod ui;
+pub mod workspace_tabs;
 
 use std::{
     cell::{Cell, RefCell},
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ops::Range,
     rc::Rc,
     sync::mpsc,
@@ -21,8 +23,8 @@ use std::{
 use crate::app::resizable::ResizableState;
 use crate::app::startup::StartupConfig;
 use gpui::{
-    AppContext as _, Bounds, Context, Entity, FocusHandle, Pixels, Point, SharedString, Size,
-    UniformListScrollHandle, Window, point, px, size,
+    AnyWindowHandle, AppContext as _, Bounds, Context, Entity, FocusHandle, Pixels, Point,
+    SharedString, Size, UniformListScrollHandle, Window, point, px, size,
 };
 use gpui_component::{
     Theme, ThemeMode,
@@ -38,12 +40,25 @@ use crate::{
     system::{SystemSampler, SystemSnapshot},
     terminal::{self, BackendEvent, TabKind, TerminalTab},
 };
+pub(crate) use pane_layout::{PaneLayout, PaneLeaf};
 
-#[derive(Clone, Debug)]
-pub(crate) enum PaneLayout {
-    Single(String),
-    Horizontal(Vec<PaneLayout>, f32), // children, split_ratio (0.0-1.0)
-    Vertical(Vec<PaneLayout>, f32),   // children, split_ratio (0.0-1.0)
+pub(crate) fn format_window_title(
+    document: Option<(&str, bool)>,
+    session_fallback: Option<&str>,
+) -> String {
+    if let Some((path, dirty)) = document {
+        let file_name = path
+            .rsplit(['/', '\\'])
+            .find(|part| !part.is_empty())
+            .unwrap_or(path);
+        let dirty_marker = if dirty { "*" } else { "" };
+        return format!("JShell - {file_name}{dirty_marker}");
+    }
+
+    session_fallback
+        .filter(|title| !title.is_empty())
+        .map(|title| format!("JShell - {title}"))
+        .unwrap_or_else(|| "JShell".to_string())
 }
 
 #[derive(Clone)]
@@ -51,86 +66,29 @@ pub(crate) struct TabGroup {
     pub(crate) id: String,
     pub(crate) title: String,
     pub(crate) pane_root: PaneLayout,
+    pub(crate) focused_pane_path: Vec<usize>,
     pub(crate) sftp: Option<crate::terminal::SftpUiState>,
 }
 
-impl PaneLayout {
-    pub fn tab_ids(&self) -> Vec<&str> {
-        match self {
-            PaneLayout::Single(id) => vec![id.as_str()],
-            PaneLayout::Horizontal(children, _) | PaneLayout::Vertical(children, _) => {
-                children.iter().flat_map(|c| c.tab_ids()).collect()
-            }
-        }
+#[cfg(test)]
+mod window_title_tests {
+    use super::format_window_title;
+
+    #[test]
+    fn document_title_uses_only_the_file_name_and_dirty_marker() {
+        assert_eq!(
+            format_window_title(Some(("/etc/nginx/nginx.conf", true)), Some("production")),
+            "JShell - nginx.conf*"
+        );
     }
 
-    pub fn contains(&self, tab_id: &str) -> bool {
-        match self {
-            PaneLayout::Single(id) => id == tab_id,
-            PaneLayout::Horizontal(children, _) | PaneLayout::Vertical(children, _) => {
-                children.iter().any(|c| c.contains(tab_id))
-            }
-        }
-    }
-
-    pub fn focused_tab_id(&self, path: &[usize]) -> Option<&str> {
-        match self {
-            PaneLayout::Single(id) if path.is_empty() => Some(id.as_str()),
-            PaneLayout::Horizontal(children, _) | PaneLayout::Vertical(children, _) => {
-                let (&first, rest) = path.split_first()?;
-                children.get(first).and_then(|c| c.focused_tab_id(rest))
-            }
-            _ => None,
-        }
-    }
-
-    pub fn replace_at(&mut self, path: &[usize], replacement: PaneLayout) {
-        match (self, path) {
-            (this @ PaneLayout::Single(_), []) => *this = replacement,
-            (
-                PaneLayout::Horizontal(children, _) | PaneLayout::Vertical(children, _),
-                [first, rest @ ..],
-            ) => {
-                if let Some(child) = children.get_mut(*first) {
-                    child.replace_at(rest, replacement);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    pub fn remove_tab(&mut self, tab_id: &str) -> bool {
-        match self {
-            PaneLayout::Single(id) if id == tab_id => {
-                *self = PaneLayout::Single(String::new());
-                true
-            }
-            PaneLayout::Single(_) => false,
-            PaneLayout::Horizontal(children, _) | PaneLayout::Vertical(children, _) => {
-                for child in children.iter_mut() {
-                    child.remove_tab(tab_id);
-                }
-                children.retain(|c| !matches!(c, PaneLayout::Single(id) if id.is_empty()));
-                if children.is_empty() {
-                    *self = PaneLayout::Single(String::new());
-                } else if children.len() == 1
-                    && let Some(replacement) = children.pop()
-                {
-                    *self = replacement;
-                }
-                true
-            }
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn total_panes(&self) -> usize {
-        match self {
-            PaneLayout::Single(_) => 1,
-            PaneLayout::Horizontal(children, _) | PaneLayout::Vertical(children, _) => {
-                children.iter().map(|c| c.total_panes()).sum()
-            }
-        }
+    #[test]
+    fn session_title_is_used_when_no_document_is_focused() {
+        assert_eq!(
+            format_window_title(None, Some("production")),
+            "JShell - production"
+        );
+        assert_eq!(format_window_title(None, None), "JShell");
     }
 }
 
@@ -266,6 +224,9 @@ pub(crate) struct Ashell {
     pub(crate) workspace_tabs: Vec<crate::document::WorkspaceTab>,
     pub(crate) active_workspace_tab: Option<String>,
     pub(crate) documents: std::collections::HashMap<String, crate::document::RemoteDocument>,
+    pub(crate) detaching_document_ids: HashSet<String>,
+    pub(crate) detached_document_windows: HashMap<String, AnyWindowHandle>,
+    pub(crate) closing_application: bool,
     pub(crate) allow_window_close: bool,
     pub(crate) window_close_prompt_open: bool,
     pub(crate) window_close_save_queue: Vec<String>,
@@ -301,8 +262,6 @@ pub(crate) struct Ashell {
     pub(crate) terminal_marked_text: Option<String>,
     pub(crate) sftp_panel_minimized: bool,
     pub(crate) sidebar_collapsed: bool,
-    #[allow(dead_code)]
-    pub(crate) collapsed_saved_scroll_handle: gpui::ScrollHandle,
     pub(crate) prev_monitoring_size: Option<Pixels>,
     pub(crate) status: SharedString,
     pub(crate) config: ConfigStore,
@@ -392,6 +351,34 @@ pub(crate) struct SftpContextMenuState {
 }
 
 impl Ashell {
+    pub(crate) fn current_window_title(&self) -> String {
+        let document = self
+            .pane_root
+            .focused_leaf(&self.focused_pane_path)
+            .and_then(|leaf| match leaf {
+                PaneLeaf::Document(document_id) => self.documents.get(document_id),
+                PaneLeaf::Terminal(_) | PaneLeaf::Empty => None,
+            })
+            .map(|document| {
+                (
+                    document.key.remote_path.as_str(),
+                    document.revisions.is_dirty(),
+                )
+            });
+        let session_fallback = self
+            .active_group
+            .as_ref()
+            .and_then(|group_id| self.tab_groups.iter().find(|group| &group.id == group_id))
+            .map(|group| group.title.as_str())
+            .or_else(|| {
+                self.active_tab
+                    .as_ref()
+                    .and_then(|tab_id| self.tabs.iter().find(|tab| &tab.id == tab_id))
+                    .map(|tab| tab.title.as_str())
+            });
+        format_window_title(document, session_fallback)
+    }
+
     fn transfer_source_title(&self, tab_id: &str) -> String {
         self.tabs
             .iter()
@@ -692,11 +679,14 @@ impl Ashell {
             workspace_tabs: Vec::new(),
             active_workspace_tab: None,
             documents: std::collections::HashMap::new(),
+            detaching_document_ids: HashSet::new(),
+            detached_document_windows: HashMap::new(),
+            closing_application: false,
             allow_window_close: false,
             window_close_prompt_open: false,
             window_close_save_queue: Vec::new(),
             window_close_save_current: None,
-            pane_root: PaneLayout::Single(String::new()),
+            pane_root: PaneLayout::empty(),
             focused_pane_path: Vec::new(),
             terminal_panel_bounds: None,
             selector_selection: 0,
@@ -740,7 +730,6 @@ impl Ashell {
             drag_split_origin: None,
             sftp_panel_minimized: config.sftp_panel_minimized(),
             sidebar_collapsed: config.sidebar_collapsed(),
-            collapsed_saved_scroll_handle: gpui::ScrollHandle::new(),
             prev_monitoring_size: None,
             status: "ready".into(),
             config,
@@ -987,16 +976,42 @@ impl Ashell {
         while let Ok(event) = self.events_rx.try_recv() {
             changed = true;
             match event {
-                BackendEvent::Output { tab_id, bytes } => {
-                    if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
-                        tab.backend_initialized = true;
+                BackendEvent::Output {
+                    tab_id,
+                    generation,
+                    bytes,
+                } => {
+                    if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id)
+                        && crate::terminal::backend_generation_matches(
+                            tab.backend_generation,
+                            generation,
+                        )
+                    {
                         tab.feed(&bytes);
                     }
                 }
-                BackendEvent::Status { tab_id, text } => {
-                    if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
-                        tab.backend_initialized = true;
-                        tab.status = text.clone();
+                BackendEvent::Status {
+                    tab_id,
+                    generation,
+                    text,
+                } => {
+                    let accepted = self
+                        .tabs
+                        .iter_mut()
+                        .find(|tab| tab.id == tab_id)
+                        .is_some_and(|tab| {
+                            if crate::terminal::backend_generation_matches(
+                                tab.backend_generation,
+                                generation,
+                            ) {
+                                tab.status = text.clone();
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                    if !accepted {
+                        continue;
                     }
                     if let Some(progress) = self.connection_progress.as_mut()
                         && progress.tab_id == tab_id
@@ -1008,11 +1023,24 @@ impl Ashell {
                     }
                     self.status = text.into();
                 }
-                BackendEvent::Connected { tab_id } => {
-                    if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
-                        tab.backend_initialized = true;
-                        tab.connected = true;
-                        tab.disconnected_reason = None;
+                BackendEvent::Connected { tab_id, generation } => {
+                    let accepted = self
+                        .tabs
+                        .iter_mut()
+                        .find(|tab| tab.id == tab_id)
+                        .is_some_and(|tab| {
+                            if !crate::terminal::backend_generation_matches(
+                                tab.backend_generation,
+                                generation,
+                            ) {
+                                return false;
+                            }
+                            tab.connected = true;
+                            tab.disconnected_reason = None;
+                            true
+                        });
+                    if !accepted {
+                        continue;
                     }
                     self.sync_system_tab_to_active_group();
                     self.request_active_system_snapshot();
@@ -1033,33 +1061,96 @@ impl Ashell {
                 }
                 BackendEvent::SftpEntries {
                     tab_id,
+                    generation,
                     path,
                     entries,
                 } => {
                     if let Some(group) = self.tab_groups.iter_mut().find(|g| g.id == tab_id)
                         && let Some(sftp) = group.sftp.as_mut()
+                        && sftp.accepts_generation(generation)
+                        && sftp.current_path == path
                     {
                         sftp.current_path = path;
                         sftp.entries = entries;
                         self.pending_sftp_path_sync = Some(sftp.current_path.clone());
                     }
                 }
-                BackendEvent::SftpPreview { tab_id, preview } => {
+                BackendEvent::SftpPreview {
+                    tab_id,
+                    generation,
+                    preview,
+                } => {
                     if let Some(group) = self.tab_groups.iter_mut().find(|g| g.id == tab_id)
                         && let Some(sftp) = group.sftp.as_mut()
+                        && sftp.accepts_generation(generation)
+                        && sftp.selected_path.as_deref() == Some(preview.path.as_str())
                     {
-                        sftp.selected_path = Some(preview.path.clone());
                         sftp.preview = Some(preview);
                     }
                 }
-                BackendEvent::SftpStatus { tab_id, text } => {
-                    if let Some(group) = self.tab_groups.iter_mut().find(|g| g.id == tab_id)
-                        && let Some(sftp) = group.sftp.as_mut()
-                    {
-                        sftp.status = text.clone();
+                BackendEvent::SftpStatus {
+                    tab_id,
+                    generation,
+                    text,
+                } => {
+                    let current_path = self
+                        .tab_groups
+                        .iter_mut()
+                        .find(|group| group.id == tab_id)
+                        .and_then(|group| group.sftp.as_mut())
+                        .and_then(|sftp| {
+                            if sftp.accepts_generation(generation) {
+                                sftp.status = text.clone();
+                                Some(sftp.current_path.clone())
+                            } else {
+                                None
+                            }
+                        });
+                    let Some(current_path) = current_path else {
+                        continue;
+                    };
+                    if text == rust_i18n::t!("sftp_connected") {
+                        if let Some(handle) = self.sftp_handles.get(&tab_id) {
+                            handle.list_dir(current_path);
+                        }
+                        for document in self
+                            .documents
+                            .values_mut()
+                            .filter(|document| document.key.connection_id == tab_id)
+                        {
+                            document.connection_state =
+                                crate::document::DocumentConnectionState::Online;
+                        }
+                    } else if text.starts_with(rust_i18n::t!("sftp_reconnecting").as_ref()) {
+                        for document in self
+                            .documents
+                            .values_mut()
+                            .filter(|document| document.key.connection_id == tab_id)
+                        {
+                            document.connection_state =
+                                crate::document::DocumentConnectionState::Reconnecting;
+                        }
                     }
                     if self.active_group.as_ref() == Some(&tab_id) {
                         self.status = text.into();
+                    }
+                }
+                BackendEvent::SftpDeleteFinished {
+                    tab_id,
+                    generation,
+                    paths,
+                    deleted_paths,
+                } => {
+                    if let Some(group) = self.tab_groups.iter_mut().find(|g| g.id == tab_id)
+                        && let Some(sftp) = group.sftp.as_mut()
+                        && sftp.accepts_generation(generation)
+                    {
+                        crate::sftp::ops::apply_sftp_delete_result(
+                            &mut sftp.deleting_entries,
+                            &mut sftp.selected_entries,
+                            &paths,
+                            &deleted_paths,
+                        );
                     }
                 }
                 BackendEvent::RemoteSystem { tab_id, snapshot } => {
@@ -1099,21 +1190,23 @@ impl Ashell {
                     history.loading = false;
                     history.error = Some(reason);
                 }
-                BackendEvent::Closed { tab_id, reason } => {
+                BackendEvent::Closed {
+                    tab_id,
+                    generation,
+                    reason,
+                } => {
                     self.remote_sample_in_flight = false;
-                    let is_stale = self
+                    let is_current = self
                         .tabs
                         .iter()
                         .find(|t| t.id == tab_id)
                         .is_some_and(|tab| {
-                            // After retry_disconnected_tab, the old backend's threads
-                            // may still send Closed events. Skip those — they arrive
-                            // before the new backend sends its first Output/Connected.
-                            // Once backend_initialized is set, any Closed is from the
-                            // current backend and should be processed.
-                            tab.backend_generation > 0 && !tab.backend_initialized
+                            crate::terminal::backend_generation_matches(
+                                tab.backend_generation,
+                                generation,
+                            )
                         });
-                    if is_stale {
+                    if !is_current {
                         continue;
                     }
                     let is_graceful_exit =
@@ -1144,13 +1237,18 @@ impl Ashell {
                     self.status = reason.into();
                 }
                 BackendEvent::TransferProgress {
-                    tab_id: _,
+                    tab_id,
+                    generation,
                     id,
                     transferred,
                     total,
                     state,
                 } => {
-                    if let Some(t) = self.transfers.iter_mut().find(|t| t.info.id == id) {
+                    if let Some(t) = self.transfers.iter_mut().find(|transfer| {
+                        transfer.tab_id == tab_id
+                            && transfer.generation == generation
+                            && transfer.info.id == id
+                    }) {
                         t.transferred = transferred;
                         if let Some(total) = total {
                             t.total = Some(total);
@@ -1159,12 +1257,26 @@ impl Ashell {
                         transfers_changed = true;
                     }
                 }
-                BackendEvent::TransferStarted { tab_id, info } => {
+                BackendEvent::TransferStarted {
+                    tab_id,
+                    generation,
+                    info,
+                } => {
+                    let accepted = self
+                        .tab_groups
+                        .iter()
+                        .find(|group| group.id == tab_id)
+                        .and_then(|group| group.sftp.as_ref())
+                        .is_some_and(|sftp| sftp.accepts_generation(generation));
+                    if !accepted {
+                        continue;
+                    }
                     let tab_title = self.transfer_source_title(&tab_id);
                     self.transfers.insert(
                         0,
                         crate::terminal::Transfer {
                             tab_id,
+                            generation,
                             tab_title,
                             info,
                             transferred: 0,
@@ -1177,11 +1289,41 @@ impl Ashell {
                     }
                     transfers_changed = true;
                 }
-                BackendEvent::SftpHome { tab_id, home } => {
+                BackendEvent::SftpHome {
+                    tab_id,
+                    generation,
+                    home,
+                } => {
                     if let Some(group) = self.tab_groups.iter_mut().find(|g| g.id == tab_id)
                         && let Some(sftp) = group.sftp.as_mut()
+                        && sftp.accepts_generation(generation)
                     {
-                        sftp.home_dir = home;
+                        sftp.apply_home(home);
+                        self.pending_sftp_path_sync = Some(sftp.current_path.clone());
+                    }
+                }
+                BackendEvent::SftpGeneration { tab_id, generation } => {
+                    let accepted = self
+                        .tab_groups
+                        .iter_mut()
+                        .find(|group| group.id == tab_id)
+                        .and_then(|group| group.sftp.as_mut())
+                        .is_some_and(|sftp| sftp.begin_generation(generation));
+                    if accepted {
+                        for transfer in self.transfers.iter_mut().filter(|transfer| {
+                            transfer.tab_id == tab_id && transfer.generation < generation
+                        }) {
+                            if matches!(
+                                transfer.state,
+                                crate::terminal::TransferState::Running
+                                    | crate::terminal::TransferState::Paused
+                            ) {
+                                transfer.state = crate::terminal::TransferState::Interrupted(
+                                    "SFTP connection restarted".to_string(),
+                                );
+                                transfers_changed = true;
+                            }
+                        }
                     }
                 }
                 BackendEvent::TerminalTitleChanged { tab_id, title } => {
@@ -1331,6 +1473,7 @@ impl Ashell {
 
         for (ix, tab_id, session, tab_kind) in retry_tabs {
             let proxy_config = self.config.connection_proxy_config();
+            let new_generation = self.tabs[ix].backend_generation.saturating_add(1);
             // Close old backend
             self.tabs[ix].send_backend(crate::terminal::BackendCommand::Close);
 
@@ -1340,6 +1483,7 @@ impl Ashell {
                     let b = crate::backend::serial::spawn_serial_client(
                         self.runtime.handle(),
                         tab_id.clone(),
+                        new_generation,
                         session.clone(),
                         self.events_tx.clone(),
                     );
@@ -1348,6 +1492,7 @@ impl Ashell {
                 crate::terminal::TabKind::Ssh => crate::backend::ssh::spawn_ssh_terminal(
                     self.runtime.handle(),
                     tab_id.clone(),
+                    new_generation,
                     session.clone(),
                     proxy_config.clone(),
                     self.tabs[ix].cols,
@@ -1362,7 +1507,7 @@ impl Ashell {
             self.tabs[ix].connected = false;
             self.tabs[ix].status = "connecting".into();
             self.tabs[ix].disconnected_reason = None;
-            self.tabs[ix].backend_initialized = false;
+            self.tabs[ix].backend_generation = new_generation;
 
             // Restart SFTP for the group containing this tab
             if let Some(group) = self
@@ -1371,29 +1516,12 @@ impl Ashell {
                 .find(|g| g.pane_root.contains(&tab_id))
             {
                 let group_id = group.id.clone();
-                let group_session = self
-                    .tabs
-                    .iter()
-                    .find(|t| group.pane_root.contains(&t.id) && t.session.is_some())
-                    .and_then(|t| t.session.clone());
-
-                if let Some(session) = group_session
-                    && session.protocol != "serial"
-                {
-                    self.sftp_handles.remove(&group_id);
-                    let sftp_handle = crate::sftp::spawn_sftp(
-                        self.runtime.handle(),
-                        group_id.clone(),
-                        session,
-                        proxy_config.clone(),
-                        self.events_tx.clone(),
-                    );
-                    self.sftp_handles.insert(group_id.clone(), sftp_handle);
-
+                if let Some(handle) = self.sftp_handles.get(&group_id) {
+                    handle.reconnect_now();
                     if let Some(group) = self.tab_groups.iter_mut().find(|g| g.id == group_id)
                         && let Some(sftp) = group.sftp.as_mut()
                     {
-                        sftp.status = rust_i18n::t!("sftp_connecting").to_string();
+                        sftp.status = rust_i18n::t!("sftp_reconnecting").to_string();
                     }
                 }
             }

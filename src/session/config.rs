@@ -227,6 +227,8 @@ pub struct ConfigFile {
     pub right_click_copy_paste: bool,
     #[serde(default)]
     pub keyword_highlight: bool,
+    #[serde(default)]
+    pub editor_soft_wrap: bool,
     #[serde(default = "default_history_completion_plugin_enabled")]
     pub history_completion_plugin_enabled: bool,
     #[serde(default = "default_ui_font_family")]
@@ -408,6 +410,7 @@ impl Default for ConfigFile {
             ui_font_size: default_ui_font_size(),
             right_click_copy_paste: false,
             keyword_highlight: false,
+            editor_soft_wrap: false,
             history_completion_plugin_enabled: default_history_completion_plugin_enabled(),
             ui_font_family: default_ui_font_family(),
             terminal_font_family: default_terminal_font_family(),
@@ -904,7 +907,6 @@ impl ConfigStore {
         self.cache.workspace_panels.as_ref()
     }
 
-    #[allow(dead_code)]
     pub fn body_panels(&self) -> Option<&Vec<f32>> {
         self.cache.body_panels.as_ref()
     }
@@ -969,6 +971,14 @@ impl ConfigStore {
 
     pub fn set_keyword_highlight(&mut self, val: bool) {
         self.cache.keyword_highlight = val;
+    }
+
+    pub fn editor_soft_wrap(&self) -> bool {
+        self.cache.editor_soft_wrap
+    }
+
+    pub fn set_editor_soft_wrap(&mut self, val: bool) {
+        self.cache.editor_soft_wrap = val;
     }
 
     pub fn history_completion_plugin_enabled(&self) -> bool {
@@ -1213,6 +1223,7 @@ impl ConfigStore {
         disk_config.ui_font_size = local_config.ui_font_size;
         disk_config.right_click_copy_paste = local_config.right_click_copy_paste;
         disk_config.keyword_highlight = local_config.keyword_highlight;
+        disk_config.editor_soft_wrap = local_config.editor_soft_wrap;
         disk_config.history_completion_plugin_enabled =
             local_config.history_completion_plugin_enabled;
         disk_config.ui_font_family = local_config.ui_font_family;
@@ -2697,6 +2708,22 @@ mod tests {
 
         let legacy_config: ConfigFile = serde_json::from_str("{}").unwrap();
         assert!(legacy_config.history_completion_plugin_enabled);
+    }
+
+    #[test]
+    fn editor_soft_wrap_is_backward_compatible_and_serializable() {
+        let legacy_config: ConfigFile = serde_json::from_str("{}").unwrap();
+        assert!(!legacy_config.editor_soft_wrap);
+
+        let config = ConfigFile {
+            editor_soft_wrap: true,
+            ..ConfigFile::default()
+        };
+        let serialized = serde_json::to_string(&config).unwrap();
+        assert!(serialized.contains("\"editor_soft_wrap\":true"));
+
+        let restored: ConfigFile = serde_json::from_str(&serialized).unwrap();
+        assert!(restored.editor_soft_wrap);
     }
 
     #[test]

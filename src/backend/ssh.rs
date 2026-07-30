@@ -25,9 +25,14 @@ use crate::{
     terminal::{BackendCommand, BackendEvent, BackendTx},
 };
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the backend entry point receives the terminal identity, connection settings, size, and event channel"
+)]
 pub fn spawn_ssh_terminal(
     runtime: &tokio::runtime::Handle,
     tab_id: String,
+    generation: u32,
     session: Session,
     proxy_config: ConnectionProxyConfig,
     cols: u16,
@@ -39,6 +44,7 @@ pub fn spawn_ssh_terminal(
     runtime.spawn(async move {
         if let Err(err) = run_ssh(
             task_tab.clone(),
+            generation,
             session,
             proxy_config,
             cols,
@@ -50,6 +56,7 @@ pub fn spawn_ssh_terminal(
         {
             let _ = events.send(BackendEvent::Closed {
                 tab_id: task_tab,
+                generation,
                 reason: format!("{err:#}"),
             });
         }
@@ -123,8 +130,13 @@ async fn load_remote_command_history_with_handle(
     Ok(parse_remote_command_history(&output))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the SSH worker owns one explicit value for each connection and terminal channel"
+)]
 async fn run_ssh(
     tab_id: String,
+    generation: u32,
     session: Session,
     proxy_config: ConnectionProxyConfig,
     cols: u16,
@@ -134,6 +146,7 @@ async fn run_ssh(
 ) -> Result<()> {
     let _ = events.send(BackendEvent::Status {
         tab_id: tab_id.clone(),
+        generation,
         text: format!(
             "connecting {}@{}:{}...",
             session.user, session.host, session.port
@@ -141,7 +154,7 @@ async fn run_ssh(
     });
 
     let handle = Arc::new(tokio::sync::Mutex::new(
-        connect_and_authenticate(&tab_id, &session, &proxy_config, &events).await?,
+        connect_and_authenticate(&tab_id, generation, &session, &proxy_config, &events).await?,
     ));
 
     let mut channel = handle
@@ -158,10 +171,12 @@ async fn run_ssh(
 
     let _ = events.send(BackendEvent::Status {
         tab_id: tab_id.clone(),
+        generation,
         text: format!("connected {}@{}", session.user, session.host),
     });
     let _ = events.send(BackendEvent::Connected {
         tab_id: tab_id.clone(),
+        generation,
     });
 
     let exit_reason;
@@ -238,6 +253,7 @@ async fn run_ssh(
                     Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, ext: _ }) => {
                         let _ = events.send(BackendEvent::Output {
                             tab_id: tab_id.clone(),
+                            generation,
                             bytes: data.to_vec(),
                         });
                     }
@@ -277,6 +293,7 @@ async fn run_ssh(
         .await;
     let _ = events.send(BackendEvent::Closed {
         tab_id,
+        generation,
         reason: exit_reason,
     });
     Ok(())
@@ -284,6 +301,7 @@ async fn run_ssh(
 
 async fn connect_and_authenticate(
     tab_id: &str,
+    generation: u32,
     session: &Session,
     proxy_config: &ConnectionProxyConfig,
     events: &std::sync::mpsc::Sender<BackendEvent>,
@@ -309,6 +327,7 @@ async fn connect_and_authenticate(
     );
     let _ = events.send(BackendEvent::Status {
         tab_id: tab_id.to_string(),
+        generation,
         text: status_text,
     });
     let stream = crate::session::config::connect_proxy(session, proxy_config).await?;
@@ -328,6 +347,7 @@ async fn connect_and_authenticate(
             );
             let _ = events.send(BackendEvent::Status {
                 tab_id: tab_id.to_string(),
+                generation,
                 text: format!(
                     "connected to {addr}, sending password authentication for {}",
                     session.user
@@ -354,6 +374,7 @@ async fn connect_and_authenticate(
             );
             let _ = events.send(BackendEvent::Status {
                 tab_id: tab_id.to_string(),
+                generation,
                 text: if has_explicit_key {
                     format!("connected to {addr}, loading private key from {source}")
                 } else {
@@ -372,6 +393,7 @@ async fn connect_and_authenticate(
                 let algorithm = format!("{:?}", keypair.algorithm());
                 let _ = events.send(BackendEvent::Status {
                     tab_id: tab_id.to_string(),
+                    generation,
                     text: format!("private key loaded from {source}, algorithm {algorithm}, sending public key authentication for {}", session.user),
                 });
                 let keys = private_keys_with_algs(keypair);
@@ -430,6 +452,7 @@ async fn connect_and_authenticate(
             );
             let _ = events.send(BackendEvent::Status {
                 tab_id: tab_id.to_string(),
+                generation,
                 text: format!("connected to {addr}, loading private key from {source}"),
             });
 
@@ -472,6 +495,7 @@ async fn connect_and_authenticate(
                 let passphrase = (!passphrase.is_empty()).then_some(passphrase);
                 let _ = events.send(BackendEvent::Status {
                     tab_id: tab_id.to_string(),
+                    generation,
                     text: format!(
                         "connected to {addr}, trying default keys from ~/.ssh/ for {}",
                         session.user
@@ -527,6 +551,7 @@ async fn connect_and_authenticate(
 
     let _ = events.send(BackendEvent::Status {
         tab_id: tab_id.to_string(),
+        generation,
         text: format!(
             "authentication accepted, opening shell for {}@{}",
             session.user, session.host

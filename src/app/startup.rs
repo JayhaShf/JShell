@@ -230,7 +230,7 @@ pub(crate) fn open_main_window_with_config(cx: &mut App, startup_config: Startup
     };
 
     #[cfg(not(target_os = "macos"))]
-    if let Ok(img) = image::load_from_memory(include_bytes!("../../assets/icons/ashell.png")) {
+    if let Ok(img) = image::load_from_memory(include_bytes!("../../assets/icons/jshell.png")) {
         window_options.icon = Some(std::sync::Arc::new(img.into_rgba8()));
     }
 
@@ -302,7 +302,10 @@ pub(crate) fn open_main_window_with_config(cx: &mut App, startup_config: Startup
                 return true;
             }
             if view_clone.read(cx).allow_window_close {
-                view_clone.read(cx).save_layout_state(window, cx);
+                view_clone.update(cx, |this, cx| {
+                    this.close_detached_windows_for_shutdown(cx);
+                    this.save_layout_state(window, cx);
+                });
                 return true;
             }
             if view_clone.read(cx).has_dirty_documents() {
@@ -311,7 +314,10 @@ pub(crate) fn open_main_window_with_config(cx: &mut App, startup_config: Startup
                 });
                 return false;
             }
-            view_clone.read(cx).save_layout_state(window, cx);
+            view_clone.update(cx, |this, cx| {
+                this.close_detached_windows_for_shutdown(cx);
+                this.save_layout_state(window, cx);
+            });
             true
         });
 

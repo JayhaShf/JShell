@@ -461,6 +461,7 @@ impl Ashell {
 
     pub(crate) fn on_terminal_scroll(
         &mut self,
+        tab_id: &str,
         event: &ScrollWheelEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -483,16 +484,12 @@ impl Ashell {
             return;
         }
 
-        let Some(active_id) = self.active_tab.clone() else {
-            return;
-        };
-
         // Get coordinates before mutably borrowing tabs
         let grid_point = self.terminal_grid_point_and_side(event.position);
 
         let line_height = self.terminal_line_height();
 
-        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == active_id) {
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
             let delta_lines = match event.delta {
                 ScrollDelta::Lines(point) => point.y.round() as i32,
                 ScrollDelta::Pixels(point) => {

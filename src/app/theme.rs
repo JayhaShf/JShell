@@ -1,5 +1,5 @@
 use anyhow::{Context as _, Result};
-use gpui::{App, Context, Font, SharedString, TextRun, Window, black, px};
+use gpui::{App, Context, Font, Hsla, Rgba, SharedString, TextRun, Window, black, px};
 use gpui_component::{ActiveTheme as _, Theme, ThemeMode, ThemeRegistry};
 
 use crate::{
@@ -127,6 +127,68 @@ pub(crate) fn set_theme_font_names(
 ) {
     theme.font_family = ui_font_family.into();
     theme.mono_font_family = terminal_font_family.into();
+}
+
+const WORKSPACE_TAB_FILE_BLUE: u32 = 0x2f7faa;
+
+pub(crate) fn workspace_tab_palette(theme: &Theme) -> [Hsla; 5] {
+    // The JShell themes use a neutral base.blue, so keep the file accent local to tabs.
+    let file_blue = if theme.blue.s <= 0.05 {
+        gpui::rgb(WORKSPACE_TAB_FILE_BLUE).into()
+    } else {
+        theme.blue
+    };
+    [
+        theme.success,
+        file_blue,
+        theme.warning,
+        theme.danger,
+        theme.muted_foreground,
+    ]
+}
+
+fn color_contrast_ratio(foreground: Hsla, background: Hsla) -> f32 {
+    fn relative_luminance(color: Hsla) -> f32 {
+        fn linearize(component: f32) -> f32 {
+            if component <= 0.03928 {
+                component / 12.92
+            } else {
+                ((component + 0.055) / 1.055).powf(2.4)
+            }
+        }
+
+        let rgba: Rgba = color.into();
+        0.2126 * linearize(rgba.r) + 0.7152 * linearize(rgba.g) + 0.0722 * linearize(rgba.b)
+    }
+
+    let foreground = relative_luminance(foreground);
+    let background = relative_luminance(background);
+    let (lighter, darker) = if foreground > background {
+        (foreground, background)
+    } else {
+        (background, foreground)
+    };
+    (lighter + 0.05) / (darker + 0.05)
+}
+
+pub(crate) fn workspace_tab_accent(color: Hsla, background: Hsla) -> Hsla {
+    const MINIMUM_CONTRAST: f32 = 3.0;
+
+    if color_contrast_ratio(color, background) >= MINIMUM_CONTRAST {
+        return color;
+    }
+
+    let target_lightness = if background.l >= 0.5 { 0.0 } else { 1.0 };
+    let mut adjusted = color;
+    for step in 1..=20 {
+        let amount = step as f32 / 20.0;
+        adjusted.l = color.l + (target_lightness - color.l) * amount;
+        if color_contrast_ratio(adjusted, background) >= MINIMUM_CONTRAST {
+            return adjusted;
+        }
+    }
+
+    adjusted
 }
 
 impl Ashell {
@@ -317,6 +379,7 @@ mod tests {
         assert_eq!(light["secondary.hover.background"], "#e6e6e6");
         assert_eq!(light["sidebar.background"], "#f5f5f5");
         assert_eq!(light["tab.active.background"], "#151515");
+        assert_eq!(light["base.blue"], "#202020");
 
         let dark = &ashell_theme["themes"][1]["colors"];
         assert_eq!(dark["base.green"], "#a7d797");
@@ -324,10 +387,101 @@ mod tests {
         assert_eq!(dark["base.red"], "#d75050");
         assert_eq!(dark["sidebar.background"], "#171717");
         assert_eq!(dark["tab.active.background"], "#f5f5f5");
+        assert_eq!(dark["base.blue"], "#f5f5f5");
 
         let vscode = &vscode_theme["themes"][0]["colors"];
         assert_eq!(vscode["muted.foreground"], "#a5a5a5");
         assert_eq!(vscode["sidebar.background"], "#252526");
         assert_eq!(vscode["tab.active.background"], "#094771");
+        assert_eq!(vscode["base.blue"], "#569cd6");
+    }
+
+    #[test]
+    fn workspace_tab_palette_reads_each_semantic_theme_color() {
+        let success = gpui::rgb(0x117711).into();
+        let blue = gpui::rgb(0x2255cc).into();
+        let warning = gpui::rgb(0xddaa22).into();
+        let danger = gpui::rgb(0xdd2233).into();
+        let muted = gpui::rgb(0x667788).into();
+        let theme = Theme::from(&gpui_component::ThemeColor {
+            success,
+            blue,
+            warning,
+            danger,
+            muted_foreground: muted,
+            ..Default::default()
+        });
+
+        assert_eq!(
+            workspace_tab_palette(&theme),
+            [success, blue, warning, danger, muted]
+        );
+    }
+
+    #[test]
+    fn workspace_tab_palette_uses_a_dedicated_file_blue() {
+        let theme = Theme::from(&gpui_component::ThemeColor {
+            blue: gpui::rgb(0x202020).into(),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            workspace_tab_palette(&theme)[1],
+            gpui::rgb(WORKSPACE_TAB_FILE_BLUE).into()
+        );
+    }
+
+    #[test]
+    fn workspace_tab_selection_accent_reaches_three_to_one_contrast_on_ssh_black() {
+        let accent = workspace_tab_accent(gpui::rgb(0x151515).into(), gpui::black());
+
+        assert!(color_contrast_ratio(accent, gpui::black()) >= 3.0);
+    }
+
+    #[test]
+    fn bundled_workspace_tab_accents_cover_idle_active_hover_and_ssh_backgrounds() {
+        fn color(colors: &serde_json::Value, key: &str) -> Hsla {
+            let hex = colors[key].as_str().unwrap().strip_prefix('#').unwrap();
+            gpui::rgb(u32::from_str_radix(hex, 16).unwrap()).into()
+        }
+
+        let ashell: serde_json::Value =
+            serde_json::from_str(include_str!("../../assets/themes/ashell.json")).unwrap();
+        let vscode: serde_json::Value =
+            serde_json::from_str(include_str!("../../assets/themes/vscode.json")).unwrap();
+
+        for theme in ashell["themes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(vscode["themes"].as_array().unwrap())
+        {
+            let name = theme["name"].as_str().unwrap();
+            let colors = &theme["colors"];
+            let palette_theme = Theme::from(&gpui_component::ThemeColor {
+                success: color(colors, "base.green"),
+                blue: color(colors, "base.blue"),
+                warning: color(colors, "base.yellow"),
+                danger: color(colors, "danger.background"),
+                muted_foreground: color(colors, "muted.foreground"),
+                ..Default::default()
+            });
+
+            let backgrounds = [
+                color(colors, "tab.background"),
+                color(colors, "tab.active.background"),
+                color(colors, "secondary.hover.background"),
+                gpui::black(),
+            ];
+            for background in backgrounds {
+                for accent in workspace_tab_palette(&palette_theme) {
+                    let adjusted = workspace_tab_accent(accent, background);
+                    assert!(
+                        color_contrast_ratio(adjusted, background) >= 3.0,
+                        "{name} workspace tab accent did not meet 3:1 contrast"
+                    );
+                }
+            }
+        }
     }
 }

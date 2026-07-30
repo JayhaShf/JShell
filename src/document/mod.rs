@@ -3,6 +3,7 @@ pub mod language;
 pub mod large_file;
 pub mod remote;
 pub mod ui;
+pub(crate) mod window;
 
 use gpui::Entity;
 use gpui_component::input::InputState;
@@ -75,6 +76,7 @@ pub enum SaveState {
     Saved,
     Conflict,
     Failed(String),
+    OutcomeUnknown(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -122,6 +124,11 @@ pub enum DocumentEvent {
         operation_id: String,
         error: String,
         offline: bool,
+    },
+    SaveOutcomeUnknown {
+        document_id: String,
+        operation_id: String,
+        error: String,
     },
     PageLoaded {
         document_id: String,
@@ -244,19 +251,6 @@ impl WorkspaceTab {
     }
 }
 
-pub fn active_document_id<'a>(
-    workspaces: &'a [WorkspaceTab],
-    active_workspace_id: Option<&str>,
-) -> Option<&'a str> {
-    let active_workspace_id = active_workspace_id?;
-    workspaces.iter().find_map(|workspace| match workspace {
-        WorkspaceTab::RemoteDocument { id, document_id } if id == active_workspace_id => {
-            Some(document_id.as_str())
-        }
-        _ => None,
-    })
-}
-
 pub fn ordered_dirty_document_ids(
     workspaces: &[WorkspaceTab],
     mut is_dirty: impl FnMut(&str) -> bool,
@@ -326,7 +320,7 @@ mod tests {
 
 #[cfg(test)]
 mod workspace_tests {
-    use super::{WorkspaceTab, active_document_id, ordered_dirty_document_ids};
+    use super::{WorkspaceTab, ordered_dirty_document_ids};
 
     #[test]
     fn exposes_stable_ids_for_both_workspace_kinds() {
@@ -340,24 +334,6 @@ mod workspace_tests {
         };
         assert_eq!(terminal.id(), "w1");
         assert_eq!(document.id(), "w2");
-    }
-
-    #[test]
-    fn resolves_only_the_active_document_workspace() {
-        let workspaces = vec![
-            WorkspaceTab::Session {
-                id: "w1".into(),
-                group_id: "g1".into(),
-            },
-            WorkspaceTab::RemoteDocument {
-                id: "w2".into(),
-                document_id: "d1".into(),
-            },
-        ];
-
-        assert_eq!(active_document_id(&workspaces, Some("w2")), Some("d1"));
-        assert_eq!(active_document_id(&workspaces, Some("w1")), None);
-        assert_eq!(active_document_id(&workspaces, Some("missing")), None);
     }
 
     #[test]

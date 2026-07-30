@@ -5,8 +5,8 @@ pub mod ssh_config;
 pub mod ssh_keys;
 
 use gpui::{
-    AppContext as _, Context, Entity, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    SharedString, Window, px,
+    AppContext as _, Context, Entity, Focusable as _, KeyDownEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, SharedString, Window, px,
 };
 use gpui_component::{Theme, WindowExt as _, input::InputState};
 use rust_i18n::t;
@@ -16,7 +16,7 @@ use uuid::Uuid;
 use self::config::{AuthMethod, Session, SessionFolder};
 
 use crate::{
-    Ashell, PaneLayout, SelectorEntry, TabGroup,
+    Ashell, PaneLayout, PaneLeaf, SelectorEntry, TabGroup,
     app::constants::{DEFAULT_COLS, DEFAULT_ROWS, TERMINAL_LINE_HEIGHT_EM},
     backend::{local, ssh},
     terminal::{BackendCommand, RenderSnapshot, TabKind, TerminalTab},
@@ -167,6 +167,7 @@ impl Ashell {
         let id = Uuid::new_v4().to_string();
         match local::spawn_local_terminal(
             id.clone(),
+            0,
             DEFAULT_COLS,
             DEFAULT_ROWS,
             self.events_tx.clone(),
@@ -178,13 +179,14 @@ impl Ashell {
                 tab.resize(DEFAULT_COLS, DEFAULT_ROWS);
                 self.tabs.push(tab);
                 self.active_tab = Some(id.clone());
-                self.pane_root = PaneLayout::Single(id.clone());
+                self.pane_root = PaneLayout::terminal(id.clone());
                 self.focused_pane_path = vec![];
                 let group_id = Uuid::new_v4().to_string();
                 self.tab_groups.push(TabGroup {
                     id: group_id.clone(),
                     title: "Local".to_string(),
-                    pane_root: PaneLayout::Single(id),
+                    pane_root: PaneLayout::terminal(id),
+                    focused_pane_path: Vec::new(),
                     sftp: None,
                 });
                 self.active_group = Some(group_id.clone());
@@ -992,6 +994,7 @@ impl Ashell {
         let backend = ssh::spawn_ssh_terminal(
             self.runtime.handle(),
             id.clone(),
+            0,
             session.clone(),
             proxy_config.clone(),
             DEFAULT_COLS,
@@ -1011,20 +1014,23 @@ impl Ashell {
             lines: vec![rust_i18n::t!("starting_connection").into()],
             failed: false,
         });
-        self.pane_root = PaneLayout::Single(id.clone());
+        self.pane_root = PaneLayout::terminal(id.clone());
         self.focused_pane_path = vec![];
         let group_id = Uuid::new_v4().to_string();
         self.tab_groups.push(TabGroup {
             id: group_id.clone(),
             title: session.name.clone(),
-            pane_root: PaneLayout::Single(id.clone()),
+            pane_root: PaneLayout::terminal(id.clone()),
+            focused_pane_path: Vec::new(),
             sftp: Some(crate::terminal::SftpUiState {
                 current_path: "/".into(),
+                generation: 0,
                 status: rust_i18n::t!("sftp_connecting").to_string(),
                 entries: Vec::new(),
                 selected_path: None,
                 preview: None,
                 selected_entries: std::collections::HashSet::new(),
+                deleting_entries: std::collections::HashSet::new(),
                 home_dir: "/".into(),
             }),
         });
@@ -1065,6 +1071,7 @@ impl Ashell {
         let backend = crate::backend::serial::spawn_serial_client(
             self.runtime.handle(),
             id.clone(),
+            0,
             session.clone(),
             self.events_tx.clone(),
         );
@@ -1081,13 +1088,14 @@ impl Ashell {
             lines: vec![rust_i18n::t!("starting_connection").into()],
             failed: false,
         });
-        self.pane_root = PaneLayout::Single(id.clone());
+        self.pane_root = PaneLayout::terminal(id.clone());
         self.focused_pane_path = vec![];
         let group_id = Uuid::new_v4().to_string();
         self.tab_groups.push(TabGroup {
             id: group_id.clone(),
             title: session.name.clone(),
-            pane_root: PaneLayout::Single(id.clone()),
+            pane_root: PaneLayout::terminal(id.clone()),
+            focused_pane_path: Vec::new(),
             sftp: None,
         });
         self.active_group = Some(group_id.clone());
@@ -1146,6 +1154,7 @@ impl Ashell {
                     let backend = crate::backend::serial::spawn_serial_client(
                         self.runtime.handle(),
                         tab_id.to_string(),
+                        new_generation,
                         session.clone(),
                         self.events_tx.clone(),
                     );
@@ -1155,6 +1164,7 @@ impl Ashell {
                     let backend = ssh::spawn_ssh_terminal(
                         self.runtime.handle(),
                         tab_id.to_string(),
+                        new_generation,
                         session.clone(),
                         proxy_config.clone(),
                         cols,
@@ -1169,7 +1179,6 @@ impl Ashell {
             self.tabs[ix].status = "connecting".into();
             self.tabs[ix].disconnected_reason = None;
             self.tabs[ix].backend_generation = new_generation;
-            self.tabs[ix].backend_initialized = false;
 
             // Restart SFTP for the group containing this tab
             if let Some(group) = self
@@ -1178,29 +1187,12 @@ impl Ashell {
                 .find(|g| g.pane_root.contains(tab_id))
             {
                 let group_id = group.id.clone();
-                let group_session = self
-                    .tabs
-                    .iter()
-                    .find(|t| group.pane_root.contains(&t.id) && t.session.is_some())
-                    .and_then(|t| t.session.clone());
-
-                if let Some(session) = group_session
-                    && session.protocol != "serial"
-                {
-                    self.sftp_handles.remove(&group_id);
-                    let sftp_handle = crate::sftp::spawn_sftp(
-                        self.runtime.handle(),
-                        group_id.clone(),
-                        session,
-                        proxy_config.clone(),
-                        self.events_tx.clone(),
-                    );
-                    self.sftp_handles.insert(group_id.clone(), sftp_handle);
-
+                if let Some(handle) = self.sftp_handles.get(&group_id) {
+                    handle.reconnect_now();
                     if let Some(group) = self.tab_groups.iter_mut().find(|g| g.id == group_id)
                         && let Some(sftp) = group.sftp.as_mut()
                     {
-                        sftp.status = rust_i18n::t!("sftp_connecting").to_string();
+                        sftp.status = rust_i18n::t!("sftp_reconnecting").to_string();
                     }
                 }
             }
@@ -1208,6 +1200,7 @@ impl Ashell {
             // Local tab: spawn new local shell
             match local::spawn_local_terminal(
                 tab_id.to_string(),
+                new_generation,
                 cols,
                 rows,
                 self.events_tx.clone(),
@@ -1219,7 +1212,6 @@ impl Ashell {
                     self.tabs[ix].status = "local shell".into();
                     self.tabs[ix].disconnected_reason = None;
                     self.tabs[ix].backend_generation = new_generation;
-                    self.tabs[ix].backend_initialized = false;
                     // Resize the new PTY to match the pane dimensions.
                     self.tabs[ix].send_backend(BackendCommand::Resize { cols, rows });
                 }
@@ -1240,39 +1232,36 @@ impl Ashell {
         cx.notify();
     }
 
-    #[allow(dead_code)]
     pub(crate) fn activate_tab(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
-        // Save current group state
         if let Some(group_id) = self.active_group.clone()
             && let Some(group) = self.tab_groups.iter_mut().find(|g| g.id == group_id)
         {
             group.pane_root = self.pane_root.clone();
+            group.focused_pane_path = self.focused_pane_path.clone();
         }
         self.active_tab = Some(id.clone());
-        // Find which group this tab belongs to and restore its pane_root
         let tab_group = self
             .tab_groups
             .iter_mut()
-            .find(|g| g.pane_root.contains(&id));
+            .find(|group| group.pane_root.contains(&id));
         if let Some(group) = tab_group {
             self.pane_root = group.pane_root.clone();
             self.active_group = Some(group.id.clone());
-            // Focus the activated tab in the pane tree
             self.focus_pane_with_id(id.clone());
         } else {
-            self.pane_root = PaneLayout::Single(id.clone());
+            self.pane_root = PaneLayout::terminal(id.clone());
             self.focused_pane_path = vec![];
         }
-        if let Some(index) = self.tabs.iter().position(|t| t.id == id) {
+        if let Some(index) = self.tabs.iter().position(|tab| tab.id == id) {
             self.tabs_scroll_handle.scroll_to_item(index);
         }
-        if self.tabs.iter().any(|t| t.id == id)
+        if self.tabs.iter().any(|tab| tab.id == id)
             && let Some(session_id) = self.active_session_id()
             && let Some(index) = self
                 .config
                 .sessions()
                 .iter()
-                .position(|s| s.id == session_id)
+                .position(|session| session.id == session_id)
         {
             self.saved_scroll_handle.scroll_to_item(index);
         }
@@ -1281,8 +1270,9 @@ impl Ashell {
         cx.notify();
     }
 
-    pub(crate) fn close_tab(&mut self, id: String, cx: &mut Context<Self>) {
+    pub(crate) fn close_tab(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
         self.handle_tab_close(id);
+        self.focus_active_pane(window, cx);
         cx.notify();
     }
 
@@ -1318,7 +1308,9 @@ impl Ashell {
 
         let pane_ids = group.pane_root.tab_ids();
         let pane_ids_str: Vec<&str> = pane_ids.to_vec();
-        let is_group_close = pane_ids.len() <= 1;
+        let has_documents = !group.pane_root.document_ids().is_empty();
+        let is_group_close = pane_ids.len() <= 1 && !has_documents;
+        let target_group_is_active = self.active_group.as_deref() == Some(group.id.as_str());
         tracing::info!(
             "[handle_tab_close] id='{}' group_panes={:?} is_group_close={}",
             id,
@@ -1382,7 +1374,9 @@ impl Ashell {
                         if group_id == &group.id
                 )
             });
-            self.pane_root.remove_tab(&id);
+            if self.active_group.as_deref() == Some(group.id.as_str()) {
+                self.pane_root.remove_tab(&id);
+            }
         } else {
             // Just remove this tab from the group
             if let Some(ix) = self.tabs.iter().position(|tab| tab.id == id) {
@@ -1394,14 +1388,23 @@ impl Ashell {
                 .iter_mut()
                 .find(|g| g.pane_root.contains(&id))
             {
-                g.pane_root.remove_tab(&id);
+                g.focused_pane_path = g
+                    .pane_root
+                    .remove_terminal_and_focus(&id)
+                    .or_else(|| g.pane_root.first_leaf_path())
+                    .unwrap_or_default();
+                if target_group_is_active {
+                    self.pane_root = g.pane_root.clone();
+                    self.focused_pane_path = g.focused_pane_path.clone();
+                }
             }
-            self.pane_root.remove_tab(&id);
-            self.sync_pane_root_to_group();
+            if target_group_is_active {
+                self.sync_pane_root_to_group();
+            }
         }
 
-        if self.tabs.is_empty() || self.tab_groups.is_empty() {
-            self.pane_root = PaneLayout::Single(String::new());
+        if self.tab_groups.is_empty() {
+            self.pane_root = PaneLayout::empty();
             self.focused_pane_path = vec![];
             self.active_tab = None;
             self.active_group = None;
@@ -1420,11 +1423,20 @@ impl Ashell {
             return;
         }
 
-        if was_active
-            || self
-                .active_tab
-                .as_ref()
-                .is_some_and(|active_id| !self.tabs.iter().any(|tab| &tab.id == active_id))
+        let active_group_survives = self
+            .active_group
+            .as_ref()
+            .is_some_and(|active_id| self.tab_groups.iter().any(|g| &g.id == active_id));
+        if target_group_is_active && active_group_survives {
+            self.focus_pane_path(self.focused_pane_path.clone());
+        }
+
+        if (!target_group_is_active || !active_group_survives)
+            && (was_active
+                || self
+                    .active_tab
+                    .as_ref()
+                    .is_some_and(|active_id| !self.tabs.iter().any(|tab| &tab.id == active_id)))
         {
             // Activate next available pane
             let new_id = next_active_id.or_else(|| {
@@ -1567,6 +1579,7 @@ impl Ashell {
             TabKind::Local => {
                 match local::spawn_local_terminal(
                     new_id.clone(),
+                    0,
                     DEFAULT_COLS,
                     DEFAULT_ROWS,
                     self.events_tx.clone(),
@@ -1594,20 +1607,13 @@ impl Ashell {
                 let backend = ssh::spawn_ssh_terminal(
                     self.runtime.handle(),
                     new_id.clone(),
+                    0,
                     session.clone(),
-                    proxy_config.clone(),
+                    proxy_config,
                     DEFAULT_COLS,
                     DEFAULT_ROWS,
                     self.events_tx.clone(),
                 );
-                let sftp_handle = crate::sftp::spawn_sftp(
-                    self.runtime.handle(),
-                    new_id.clone(),
-                    session.clone(),
-                    proxy_config,
-                    self.events_tx.clone(),
-                );
-                self.sftp_handles.insert(new_id.clone(), sftp_handle);
                 TerminalTab::new_ssh(new_id.clone(), &session, backend, self.events_tx.clone())
             }
             TabKind::Serial => {
@@ -1619,6 +1625,7 @@ impl Ashell {
                 let backend = crate::backend::serial::spawn_serial_client(
                     self.runtime.handle(),
                     new_id.clone(),
+                    0,
                     session.clone(),
                     self.events_tx.clone(),
                 );
@@ -1635,8 +1642,8 @@ impl Ashell {
         self.tabs.push(tab);
         // Do NOT scroll tab bar or add tab bar entry
 
-        let current_pane = PaneLayout::Single(current_id);
-        let new_pane = PaneLayout::Single(new_id.clone());
+        let current_pane = PaneLayout::terminal(current_id);
+        let new_pane = PaneLayout::terminal(new_id.clone());
 
         let split_layout = match direction {
             "left" | "right" => {
@@ -1680,32 +1687,93 @@ impl Ashell {
         cx.notify();
     }
 
-    pub(crate) fn focus_adjacent_pane(&mut self, direction: &str, cx: &mut Context<Self>) {
+    pub(crate) fn focus_adjacent_pane(
+        &mut self,
+        direction: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.focused_pane_path.is_empty() {
             return;
         }
         let path = self.focused_pane_path.clone();
-        if let Some(new_path) = Self::find_adjacent_pane(&self.pane_root, &path, direction) {
-            self.focused_pane_path = new_path;
-            if let Some(id) = self.pane_root.focused_tab_id(&self.focused_pane_path) {
-                let id_owned = id.to_string();
-                let changed = self.active_tab.as_deref() != Some(id_owned.as_str());
-                self.active_tab = Some(id_owned);
-                // Clear stale search state when switching to a different pane.
-                if changed && self.search_active {
-                    self.search_query.clear();
-                    self.search_matches.clear();
-                    self.search_current = 0;
-                    self.search_target_tab = None;
+        if let Some(new_path) = Self::find_adjacent_pane(&self.pane_root, &path, direction)
+            && self.focus_pane_path(new_path).is_some()
+        {
+            self.focus_active_pane(window, cx);
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn focus_pane_path(&mut self, path: Vec<usize>) -> Option<PaneLeaf> {
+        let leaf = self.pane_root.focused_leaf(&path)?.clone();
+        let previous_terminal = self.active_tab.clone();
+        self.focused_pane_path = path;
+
+        match &leaf {
+            PaneLeaf::Terminal(tab_id) => {
+                self.active_tab = Some(tab_id.clone());
+                self.active_workspace_tab = self.active_group.clone();
+            }
+            PaneLeaf::Document(document_id) => {
+                let terminal_id = self
+                    .active_group
+                    .as_ref()
+                    .and_then(|group_id| self.tab_groups.iter().find(|group| &group.id == group_id))
+                    .and_then(|group| {
+                        group
+                            .pane_root
+                            .focused_tab_id(&self.focused_pane_path)
+                            .or_else(|| group.pane_root.terminal_ids().first().copied())
+                    })
+                    .map(str::to_string);
+                self.active_tab = terminal_id;
+                self.active_workspace_tab =
+                    self.workspace_tabs
+                        .iter()
+                        .find_map(|workspace| match workspace {
+                            crate::document::WorkspaceTab::RemoteDocument {
+                                id,
+                                document_id: existing,
+                            } if existing == document_id => Some(id.clone()),
+                            _ => None,
+                        });
+            }
+            PaneLeaf::Empty => {
+                self.active_tab = None;
+                self.active_workspace_tab = None;
+            }
+        }
+
+        if previous_terminal != self.active_tab && self.search_active {
+            self.search_active = false;
+            self.search_query.clear();
+            self.search_matches.clear();
+            self.search_current = 0;
+            self.search_target_tab = None;
+        }
+        self.sync_pane_root_to_group();
+        Some(leaf)
+    }
+
+    pub(crate) fn focus_active_pane(&self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.pane_root.focused_leaf(&self.focused_pane_path) {
+            Some(PaneLeaf::Document(document_id)) => {
+                if !self.activate_detached_document(document_id, cx)
+                    && let Some(document) = self.documents.get(document_id)
+                {
+                    document.editor.focus_handle(cx).focus(window, cx);
                 }
             }
-            cx.notify();
+            Some(PaneLeaf::Terminal(_)) | Some(PaneLeaf::Empty) | None => {
+                self.focus_handle.focus(window, cx);
+            }
         }
     }
 
     fn first_leaf_path(layout: &PaneLayout) -> Vec<usize> {
         match layout {
-            PaneLayout::Single(_) => vec![],
+            PaneLayout::Leaf(_) => vec![],
             PaneLayout::Horizontal(children, _) | PaneLayout::Vertical(children, _) => {
                 let mut path = vec![0];
                 path.extend(Self::first_leaf_path(&children[0]));
@@ -1716,7 +1784,7 @@ impl Ashell {
 
     fn leaf_at_index(layout: &PaneLayout, index: usize) -> Vec<usize> {
         match layout {
-            PaneLayout::Single(_) => vec![],
+            PaneLayout::Leaf(_) => vec![],
             PaneLayout::Horizontal(children, _) | PaneLayout::Vertical(children, _) => {
                 if children.is_empty() {
                     return vec![];
@@ -1738,7 +1806,7 @@ impl Ashell {
             return None;
         }
         match layout {
-            PaneLayout::Single(_) => None,
+            PaneLayout::Leaf(_) => None,
             PaneLayout::Horizontal(children, _) | PaneLayout::Vertical(children, _) => {
                 let is_horizontal = matches!(layout, PaneLayout::Horizontal(_, _));
                 let idx = path[0];
@@ -1819,18 +1887,23 @@ impl Ashell {
                 .find(|g| g.id == current_group_id)
         {
             group.pane_root = self.pane_root.clone();
+            group.focused_pane_path = self.focused_pane_path.clone();
         }
         // Load new group state
         if let Some(group) = self.tab_groups.iter().find(|g| g.id == group_id) {
             self.pane_root = group.pane_root.clone();
+            self.focused_pane_path = group.focused_pane_path.clone();
             self.active_group = Some(group_id.clone());
             self.active_workspace_tab = Some(group_id);
-            let ids = group.pane_root.tab_ids();
-            if let Some(&first_id) = ids.first() {
-                self.active_tab = Some(first_id.to_string());
-                self.focus_pane_with_id(first_id.to_string());
+            let ids = group.pane_root.terminal_ids();
+            if let Some(id) = group
+                .pane_root
+                .focused_tab_id(&self.focused_pane_path)
+                .or_else(|| ids.first().copied())
+            {
+                self.active_tab = Some(id.to_string());
             }
-            self.focus_handle.focus(window, cx);
+            self.focus_active_pane(window, cx);
         }
         self.sync_system_tab_to_active_group();
         cx.notify();
@@ -1866,6 +1939,7 @@ impl Ashell {
             && let Some(group) = self.tab_groups.iter_mut().find(|g| g.id == group_id)
         {
             group.pane_root = self.pane_root.clone();
+            group.focused_pane_path = self.focused_pane_path.clone();
         }
     }
 
@@ -1989,35 +2063,8 @@ impl Ashell {
     }
 
     pub(crate) fn focus_pane_with_id(&mut self, tab_id: String) {
-        // Find the path to the given tab_id in the pane tree
-        fn find_path(layout: &PaneLayout, target: &str, path: &mut Vec<usize>) -> bool {
-            match layout {
-                PaneLayout::Single(id) => id == target,
-                PaneLayout::Horizontal(children, _) | PaneLayout::Vertical(children, _) => {
-                    for (i, child) in children.iter().enumerate() {
-                        path.push(i);
-                        if find_path(child, target, path) {
-                            return true;
-                        }
-                        path.pop();
-                    }
-                    false
-                }
-            }
-        }
-        let mut path = Vec::new();
-        if find_path(&self.pane_root, &tab_id, &mut path) {
-            let changed = self.active_tab.as_deref() != Some(tab_id.as_str());
-            self.focused_pane_path = path;
-            self.active_tab = Some(tab_id);
-            // Clear stale search state when switching to a different pane.
-            // The user can press Enter to re-search in the new pane.
-            if changed && self.search_active {
-                self.search_query.clear();
-                self.search_matches.clear();
-                self.search_current = 0;
-                self.search_target_tab = None;
-            }
+        if let Some(path) = self.pane_root.path_to_terminal(&tab_id) {
+            self.focus_pane_path(path);
         }
     }
 }

@@ -58,6 +58,7 @@ pub(crate) fn render_document(
     let mode = document.mode;
     let large_file = document.large_file.clone();
     let soft_wrap = document.soft_wrap;
+    let can_detach = crate::document::window::can_detach_document(&load_state, &save_state, mode);
     let size = document
         .metadata
         .as_ref()
@@ -88,9 +89,14 @@ pub(crate) fn render_document(
         SaveState::Saved => t!("document_saved").to_string(),
         SaveState::Conflict => t!("document_conflict_state").to_string(),
         SaveState::Failed(error) => t!("document_save_failed", error = error.clone()).to_string(),
+        SaveState::OutcomeUnknown(error) => {
+            t!("document_save_outcome_unknown", error = error.clone()).to_string()
+        }
     };
-    let status_color = match save_state {
-        SaveState::Failed(_) | SaveState::Conflict => cx.theme().danger,
+    let status_color = match &save_state {
+        SaveState::Failed(_) | SaveState::OutcomeUnknown(_) | SaveState::Conflict => {
+            cx.theme().danger
+        }
         SaveState::Saved => cx.theme().success,
         _ if dirty => cx.theme().warning,
         _ => cx.theme().muted_foreground,
@@ -103,7 +109,7 @@ pub(crate) fn render_document(
             .justify_center()
             .gap_3()
             .child(
-                Button::new("document-loading")
+                Button::new(format!("document-loading-{document_id}"))
                     .primary()
                     .loading(true)
                     .label(t!("document_loading").to_string()),
@@ -121,7 +127,7 @@ pub(crate) fn render_document(
                     .child(error.clone()),
             )
             .child(
-                Button::new("document-retry")
+                Button::new(format!("document-retry-{document_id}"))
                     .secondary()
                     .label(t!("document_retry").to_string())
                     .on_click({
@@ -223,7 +229,7 @@ pub(crate) fn render_document(
                             .border_t_1()
                             .border_color(cx.theme().border)
                             .child(
-                                Button::new("document-page-previous")
+                                Button::new(format!("document-page-previous-{document_id}"))
                                     .secondary()
                                     .small()
                                     .icon(IconName::ChevronLeft)
@@ -241,7 +247,7 @@ pub(crate) fn render_document(
                                     }),
                             )
                             .child(
-                                Button::new("document-page-next")
+                                Button::new(format!("document-page-next-{document_id}"))
                                     .secondary()
                                     .small()
                                     .icon(IconName::ChevronRight)
@@ -271,7 +277,7 @@ pub(crate) fn render_document(
                                 ),
                             )
                             .child(
-                                Button::new("document-page-copy")
+                                Button::new(format!("document-page-copy-{document_id}"))
                                     .secondary()
                                     .small()
                                     .icon(IconName::Copy)
@@ -333,13 +339,16 @@ pub(crate) fn render_document(
     };
 
     v_flex()
-        .id("document-workspace")
+        .id(format!("document-workspace-{document_id}"))
         .key_context(DOCUMENT_KEY_CONTEXT)
         .size_full()
         .bg(cx.theme().background)
-        .on_action(cx.listener(|this, _: &crate::SaveDocument, window, cx| {
-            this.save_active_document(window, cx);
-        }))
+        .on_action({
+            let document_id = document_id.to_string();
+            cx.listener(move |this, _: &crate::SaveDocument, window, cx| {
+                this.save_document(document_id.clone(), window, cx);
+            })
+        })
         .child(
             h_flex()
                 .flex_none()
@@ -372,7 +381,21 @@ pub(crate) fn render_document(
                 .child(div().text_size(rems(0.833)).child(encoding_label))
                 .child(div().text_size(rems(0.833)).child(line_ending))
                 .child(
-                    Button::new("document-wrap")
+                    Button::new(format!("document-detach-{document_id}"))
+                        .secondary()
+                        .small()
+                        .icon(IconName::ExternalLink)
+                        .tooltip(t!("document_detach").to_string())
+                        .disabled(!can_detach)
+                        .on_click({
+                            let document_id = document_id.to_string();
+                            cx.listener(move |this, _, window, cx| {
+                                this.detach_document_window(document_id.clone(), window, cx);
+                            })
+                        }),
+                )
+                .child(
+                    Button::new(format!("document-wrap-{document_id}"))
                         .small()
                         .when(soft_wrap, |button| button.primary())
                         .when(!soft_wrap, |button| button.secondary())
@@ -386,7 +409,7 @@ pub(crate) fn render_document(
                 )
                 .when(read_only, |toolbar| {
                     toolbar.child(
-                        Button::new("document-download")
+                        Button::new(format!("document-download-{document_id}"))
                             .secondary()
                             .small()
                             .label(t!("document_download").to_string())
@@ -399,17 +422,30 @@ pub(crate) fn render_document(
                     )
                 })
                 .when(!read_only, |toolbar| {
+                    let save_in_progress =
+                        matches!(save_state, SaveState::Checking | SaveState::Saving);
+                    let save_button_label = match save_state {
+                        SaveState::Checking => t!("document_checking").to_string(),
+                        SaveState::Saving => t!("document_saving").to_string(),
+                        _ => t!("document_save").to_string(),
+                    };
                     toolbar.child(
-                        Button::new("document-save")
+                        Button::new(format!("document-save-{document_id}"))
                             .primary()
                             .small()
                             .disabled(
-                                !dirty || !is_online || !matches!(load_state, LoadState::Ready),
+                                !dirty
+                                    || !is_online
+                                    || !matches!(load_state, LoadState::Ready)
+                                    || save_in_progress,
                             )
-                            .label(t!("document_save").to_string())
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.save_active_document(window, cx);
-                            })),
+                            .label(save_button_label)
+                            .on_click({
+                                let document_id = document_id.to_string();
+                                cx.listener(move |this, _, window, cx| {
+                                    this.save_document(document_id.clone(), window, cx);
+                                })
+                            }),
                     )
                 }),
         )
@@ -438,7 +474,7 @@ pub(crate) fn render_document(
                             DocumentConnectionState::Online => String::new(),
                         }))
                         .child(
-                            Button::new("document-reconnect")
+                            Button::new(format!("document-reconnect-{document_id}"))
                                 .secondary()
                                 .small()
                                 .loading(matches!(

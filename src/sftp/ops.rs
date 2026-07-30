@@ -1,10 +1,61 @@
 use gpui::{Context, PathPromptOptions, Pixels, Point, Window};
+use std::collections::HashSet;
 
 use crate::{
     Ashell, SftpContextMenuState,
     sftp::{RemoteEntry, SftpHandle},
     terminal,
 };
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum SftpEntryGesture {
+    SingleClick,
+    DoubleClick,
+    Checkbox,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum SftpEntryAction {
+    Focus,
+    OpenFile,
+    NavigateDirectory,
+    ToggleSelection,
+}
+
+pub(crate) fn sftp_entry_action(is_dir: bool, gesture: SftpEntryGesture) -> SftpEntryAction {
+    match gesture {
+        SftpEntryGesture::SingleClick => SftpEntryAction::Focus,
+        SftpEntryGesture::DoubleClick if is_dir => SftpEntryAction::NavigateDirectory,
+        SftpEntryGesture::DoubleClick => SftpEntryAction::OpenFile,
+        SftpEntryGesture::Checkbox => SftpEntryAction::ToggleSelection,
+    }
+}
+
+pub(crate) fn begin_sftp_delete(pending: &mut HashSet<String>, paths: &[String]) -> bool {
+    if paths.is_empty() || paths.iter().any(|path| pending.contains(path)) {
+        return false;
+    }
+    pending.extend(paths.iter().cloned());
+    true
+}
+
+pub(crate) fn finish_sftp_delete(pending: &mut HashSet<String>, paths: &[String]) {
+    for path in paths {
+        pending.remove(path);
+    }
+}
+
+pub(crate) fn apply_sftp_delete_result(
+    pending: &mut HashSet<String>,
+    selected: &mut HashSet<String>,
+    attempted: &[String],
+    deleted: &[String],
+) {
+    finish_sftp_delete(pending, attempted);
+    for path in deleted {
+        selected.remove(path);
+    }
+}
 
 pub(crate) fn is_editable_text_file(filename: &str) -> bool {
     let lower = filename.to_lowercase();
@@ -27,6 +78,26 @@ pub(crate) fn is_editable_text_file(filename: &str) -> bool {
 }
 
 impl Ashell {
+    pub(crate) fn delete_sftp_paths(&mut self, paths: Vec<String>, cx: &mut Context<Self>) -> bool {
+        let Some(handle) = self.active_sftp_handle().cloned() else {
+            return false;
+        };
+        let Some(sftp) = self.active_sftp_mut() else {
+            return false;
+        };
+        if !begin_sftp_delete(&mut sftp.deleting_entries, &paths) {
+            return false;
+        }
+        if !handle.send(crate::sftp::SftpCommand::DeletePaths(paths.clone())) {
+            finish_sftp_delete(&mut sftp.deleting_entries, &paths);
+            sftp.status = rust_i18n::t!("sftp_command_channel_closed").to_string();
+            cx.notify();
+            return false;
+        }
+        cx.notify();
+        true
+    }
+
     pub(crate) fn active_sftp(&self) -> Option<&terminal::SftpUiState> {
         self.active_group
             .as_ref()
@@ -48,28 +119,35 @@ impl Ashell {
             .and_then(|id| self.sftp_handles.get(id))
     }
 
+    pub(crate) fn reconnect_active_sftp(&mut self, cx: &mut Context<Self>) {
+        if let Some(handle) = self.active_sftp_handle().cloned() {
+            handle.reconnect_now();
+            if let Some(sftp) = self.active_sftp_mut() {
+                sftp.status = rust_i18n::t!("sftp_reconnecting").to_string();
+            }
+            cx.notify();
+        }
+    }
+
     pub(crate) fn navigate_sftp(&mut self, path: String, cx: &mut Context<Self>) {
         if let Some(handle) = self.active_sftp_handle() {
             tracing::info!("[sftp] navigating to directory: '{}'", path);
             handle.list_dir(path.clone());
             if let Some(sftp) = self.active_sftp_mut() {
                 sftp.current_path = path;
+                sftp.selected_path = None;
+                sftp.preview = None;
+                sftp.selected_entries.clear();
                 self.pending_sftp_path_sync = Some(sftp.current_path.clone());
             }
             cx.notify();
         }
     }
 
-    pub(crate) fn select_sftp_entry(&mut self, entry: RemoteEntry, cx: &mut Context<Self>) {
-        if entry.is_dir {
-            self.navigate_sftp(entry.full_path, cx);
-            return;
-        }
+    pub(crate) fn focus_sftp_entry(&mut self, entry: &RemoteEntry, cx: &mut Context<Self>) {
         self.mark_sftp_entry_selected(&entry.full_path, cx);
-        if let Some(sftp) = self.active_sftp_mut()
-            && !sftp.selected_entries.remove(&entry.full_path)
-        {
-            sftp.selected_entries.insert(entry.full_path);
+        if let Some(handle) = self.active_sftp_handle() {
+            handle.preview(entry.full_path.clone());
         }
     }
 
@@ -166,6 +244,22 @@ impl Ashell {
         if !menu.is_dir {
             self.open_remote_document(menu.remote_path, window, cx);
         }
+        cx.notify();
+    }
+
+    pub(crate) fn trigger_sftp_context_delete(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(menu) = self.sftp_context_menu.take() else {
+            return;
+        };
+        if let Some(sftp) = self.active_sftp_mut() {
+            sftp.selected_entries.clear();
+            sftp.selected_entries.insert(menu.remote_path);
+        }
+        self.show_delete_confirm_dialog(window, cx);
         cx.notify();
     }
 
@@ -323,9 +417,15 @@ impl Ashell {
     }
 
     pub(crate) fn toggle_all_sftp_entries(&mut self, checked: bool, cx: &mut Context<Self>) {
+        let show_hidden_files = self.show_hidden_files;
         if let Some(sftp) = self.active_sftp_mut() {
             if checked {
-                let paths: Vec<String> = sftp.entries.iter().map(|e| e.full_path.clone()).collect();
+                let paths: Vec<String> = sftp
+                    .entries
+                    .iter()
+                    .filter(|entry| show_hidden_files || !entry.name.starts_with('.'))
+                    .map(|entry| entry.full_path.clone())
+                    .collect();
                 for path in paths {
                     sftp.selected_entries.insert(path);
                 }
@@ -413,5 +513,87 @@ impl Ashell {
             self.show_transfers_dialog = true;
             cx.notify();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::{
+        SftpEntryAction, SftpEntryGesture, apply_sftp_delete_result, begin_sftp_delete,
+        finish_sftp_delete, sftp_entry_action,
+    };
+
+    #[test]
+    fn single_click_only_focuses_entries() {
+        assert_eq!(
+            sftp_entry_action(false, SftpEntryGesture::SingleClick),
+            SftpEntryAction::Focus
+        );
+        assert_eq!(
+            sftp_entry_action(true, SftpEntryGesture::SingleClick),
+            SftpEntryAction::Focus
+        );
+    }
+
+    #[test]
+    fn double_click_opens_files_and_navigates_directories() {
+        assert_eq!(
+            sftp_entry_action(false, SftpEntryGesture::DoubleClick),
+            SftpEntryAction::OpenFile
+        );
+        assert_eq!(
+            sftp_entry_action(true, SftpEntryGesture::DoubleClick),
+            SftpEntryAction::NavigateDirectory
+        );
+    }
+
+    #[test]
+    fn checkbox_only_toggles_selection() {
+        assert_eq!(
+            sftp_entry_action(false, SftpEntryGesture::Checkbox),
+            SftpEntryAction::ToggleSelection
+        );
+        assert_eq!(
+            sftp_entry_action(true, SftpEntryGesture::Checkbox),
+            SftpEntryAction::ToggleSelection
+        );
+    }
+
+    #[test]
+    fn delete_submission_rejects_pending_paths() {
+        let mut pending = HashSet::new();
+        let paths = vec!["/tmp/a".to_string(), "/tmp/b".to_string()];
+
+        assert!(begin_sftp_delete(&mut pending, &paths));
+        assert!(!begin_sftp_delete(&mut pending, &paths));
+        assert_eq!(pending.len(), 2);
+    }
+
+    #[test]
+    fn delete_completion_releases_all_pending_paths() {
+        let mut pending = HashSet::from([
+            "/tmp/a".to_string(),
+            "/tmp/b".to_string(),
+            "/tmp/c".to_string(),
+        ]);
+
+        finish_sftp_delete(&mut pending, &["/tmp/a".to_string(), "/tmp/b".to_string()]);
+
+        assert_eq!(pending, HashSet::from(["/tmp/c".to_string()]));
+    }
+
+    #[test]
+    fn failed_delete_stays_selected_for_retry() {
+        let attempted = vec!["/tmp/a".to_string(), "/tmp/b".to_string()];
+        let deleted = vec!["/tmp/a".to_string()];
+        let mut pending = HashSet::from_iter(attempted.clone());
+        let mut selected = HashSet::from_iter(attempted.clone());
+
+        apply_sftp_delete_result(&mut pending, &mut selected, &attempted, &deleted);
+
+        assert!(pending.is_empty());
+        assert_eq!(selected, HashSet::from(["/tmp/b".to_string()]));
     }
 }

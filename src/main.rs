@@ -22,7 +22,7 @@ pub(crate) use app::keybinding_recorder::{
     SplitPaneRight, SplitPaneUp, ToggleSftpZoom, ToggleSidebar,
 };
 
-pub(crate) use app::{Ashell, PaneLayout, SelectorEntry, SftpContextMenuState, TabGroup};
+pub(crate) use app::{Ashell, PaneLayout, PaneLeaf, SelectorEntry, SftpContextMenuState, TabGroup};
 
 fn main() {
     app::startup::sync_macos_launch_environment();

@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
-    Ashell,
+    Ashell, PaneLeaf,
     document::{
         DocumentConnectionState, DocumentEvent, DocumentRevisions, LineEnding, LoadState,
         RemoteDocument, SaveState, WorkspaceTab, remote::SftpRemoteFileBackend,
@@ -83,12 +83,35 @@ pub enum SaveOutcome {
     },
     Conflict(PendingSave),
     RemoteDeleted(PendingSave),
+    OutcomeUnknown(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CloseDecision {
     CloseNow,
     Prompt,
+}
+
+pub fn save_state_after_completion(dirty: bool) -> SaveState {
+    if dirty {
+        SaveState::Idle
+    } else {
+        SaveState::Saved
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteFailureDisposition {
+    Failed,
+    OutcomeUnknown,
+}
+
+pub fn write_failure_disposition(error: &anyhow::Error) -> WriteFailureDisposition {
+    if crate::document::remote::is_connection_closed(error) {
+        WriteFailureDisposition::OutcomeUnknown
+    } else {
+        WriteFailureDisposition::Failed
+    }
 }
 
 pub fn close_decision(revisions: DocumentRevisions) -> CloseDecision {
@@ -120,14 +143,25 @@ pub async fn run_save_check<B: RemoteFileBackend>(
         )));
     }
 
-    let metadata = backend
+    let metadata = match backend
         .write_atomic(
             &request.path,
             request.bytes.clone(),
             request.opened_metadata.permissions,
             &request.operation_id,
         )
-        .await?;
+        .await
+    {
+        Ok(metadata) => metadata,
+        Err(error)
+            if write_failure_disposition(&error) == WriteFailureDisposition::OutcomeUnknown =>
+        {
+            return Ok(SaveOutcome::OutcomeUnknown(format!(
+                "connection closed after the save started: {error:#}"
+            )));
+        }
+        Err(error) => return Err(error),
+    };
     Ok(SaveOutcome::Saved {
         revision: request.revision,
         metadata,
@@ -289,18 +323,19 @@ impl Ashell {
 
         let document_id = Uuid::new_v4().to_string();
         let operation_id = Uuid::new_v4().to_string();
+        let soft_wrap = self.config.editor_soft_wrap();
         let editor: Entity<InputState> = cx.new(|cx| {
             InputState::new(window, cx)
                 .code_editor("text")
                 .line_number(true)
                 .searchable(true)
-                .soft_wrap(false)
+                .soft_wrap(soft_wrap)
         });
         let large_file_viewer: Entity<InputState> = cx.new(|cx| {
             InputState::new(window, cx)
                 .multi_line(true)
                 .searchable(true)
-                .soft_wrap(false)
+                .soft_wrap(soft_wrap)
         });
         let large_file_search: Entity<InputState> = cx.new(|cx| {
             InputState::new(window, cx).placeholder(t!("document_search_chunk").to_string())
@@ -349,7 +384,7 @@ impl Ashell {
             operation_id: operation_id.clone(),
             backend: backend.clone(),
             suppress_changes: false,
-            soft_wrap: false,
+            soft_wrap,
             close_after_save: false,
             pending_save: None,
             large_file: None,
@@ -357,10 +392,27 @@ impl Ashell {
             _large_file_search_subscription: large_file_search_subscription,
         };
         self.documents.insert(document_id.clone(), document);
+        let insert_path = self
+            .pane_root
+            .insert_right(
+                &self.focused_pane_path,
+                PaneLeaf::Document(document_id.clone()),
+            )
+            .or_else(|| {
+                let anchor_path = self
+                    .active_tab
+                    .as_deref()
+                    .and_then(|tab_id| self.pane_root.path_to_terminal(tab_id))?;
+                self.pane_root
+                    .insert_right(&anchor_path, PaneLeaf::Document(document_id.clone()))
+            });
         self.workspace_tabs.push(WorkspaceTab::RemoteDocument {
             id: document_id.clone(),
             document_id: document_id.clone(),
         });
+        if let Some(path) = insert_path {
+            self.focus_pane_path(path);
+        }
         self.active_workspace_tab = Some(document_id.clone());
         editor.focus_handle(cx).focus(window, cx);
         cx.notify();
@@ -413,6 +465,23 @@ impl Ashell {
             return;
         };
         self.active_workspace_tab = Some(workspace_id);
+        if self.activate_detached_document(document_id, cx) {
+            cx.notify();
+            return;
+        }
+        if let Some(group) = self
+            .tab_groups
+            .iter()
+            .find(|group| group.pane_root.contains_document(document_id))
+        {
+            self.active_group = Some(group.id.clone());
+            self.pane_root = group.pane_root.clone();
+            self.focused_pane_path = group
+                .pane_root
+                .path_to_document(document_id)
+                .unwrap_or_default();
+            self.focus_pane_path(self.focused_pane_path.clone());
+        }
         if let Some(document) = self.documents.get(document_id) {
             document.editor.focus_handle(cx).focus(window, cx);
         }
@@ -500,14 +569,16 @@ impl Ashell {
                     document.metadata = Some(metadata);
                     document.original_hash = original_hash;
                     document.revisions.finish_save(revision);
-                    document.save_state = SaveState::Saved;
                     document.pending_save = None;
                     document.connection_state = DocumentConnectionState::Online;
-                    (document.close_after_save, document.revisions.is_dirty())
+                    let is_dirty = document.revisions.is_dirty();
+                    document.save_state = save_state_after_completion(is_dirty);
+                    (document.close_after_save, is_dirty)
                 };
                 if self.window_close_save_current.as_deref() == Some(document_id.as_str()) {
                     if is_dirty {
                         self.cancel_window_close_save();
+                        cx.notify();
                     } else {
                         self.window_close_save_current = None;
                         self.window_close_save_queue
@@ -536,6 +607,23 @@ impl Ashell {
                     if offline {
                         document.connection_state = DocumentConnectionState::Offline(error);
                     }
+                }
+                if self.window_close_save_current.as_deref() == Some(document_id.as_str()) {
+                    self.cancel_window_close_save();
+                }
+            }
+            DocumentEvent::SaveOutcomeUnknown {
+                document_id,
+                operation_id,
+                error,
+            } => {
+                let Some(document) = self.documents.get_mut(&document_id) else {
+                    return;
+                };
+                if document.operation_id == operation_id {
+                    document.save_state = SaveState::OutcomeUnknown(error.clone());
+                    document.connection_state = DocumentConnectionState::Offline(error);
+                    document.close_after_save = false;
                 }
                 if self.window_close_save_current.as_deref() == Some(document_id.as_str()) {
                     self.cancel_window_close_save();
@@ -592,11 +680,14 @@ impl Ashell {
     }
 
     pub(crate) fn active_document_id(&self) -> Option<String> {
-        crate::document::active_document_id(
-            &self.workspace_tabs,
-            self.active_workspace_tab.as_deref(),
-        )
-        .map(str::to_string)
+        match self.pane_root.focused_leaf(&self.focused_pane_path) {
+            Some(crate::PaneLeaf::Document(document_id))
+                if self.documents.contains_key(document_id) =>
+            {
+                Some(document_id.clone())
+            }
+            _ => None,
+        }
     }
 
     pub(crate) fn dirty_document_ids(&self) -> Vec<String> {
@@ -683,16 +774,10 @@ impl Ashell {
     }
 
     fn finish_window_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_detached_windows_for_shutdown(cx);
         self.allow_window_close = true;
         self.save_layout_state(window, cx);
         window.remove_window();
-    }
-
-    pub(crate) fn save_active_document(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(document_id) = self.active_document_id() else {
-            return;
-        };
-        self.save_document(document_id, window, cx);
     }
 
     pub(crate) fn save_document(
@@ -770,6 +855,7 @@ impl Ashell {
                             if is_window_close_save {
                                 this.cancel_window_close_save();
                             }
+                            cx.notify();
                             this.show_document_conflict_dialog(
                                 document_id.clone(),
                                 false,
@@ -790,6 +876,7 @@ impl Ashell {
                             if is_window_close_save {
                                 this.cancel_window_close_save();
                             }
+                            cx.notify();
                             this.show_document_conflict_dialog(
                                 document_id.clone(),
                                 true,
@@ -798,6 +885,15 @@ impl Ashell {
                             );
                         }
                     }
+                    Ok(SaveOutcome::OutcomeUnknown(error)) => this.apply_document_event(
+                        DocumentEvent::SaveOutcomeUnknown {
+                            document_id,
+                            operation_id,
+                            error,
+                        },
+                        window,
+                        cx,
+                    ),
                     Err(error) => {
                         let offline = crate::document::remote::is_connection_closed(&error);
                         this.apply_document_event(
@@ -851,15 +947,19 @@ impl Ashell {
                     metadata,
                     original_hash: Sha256::digest(&bytes).into(),
                 },
-                Err(error) => {
-                    let offline = crate::document::remote::is_connection_closed(&error);
-                    DocumentEvent::SaveFailed {
+                Err(error) => match write_failure_disposition(&error) {
+                    WriteFailureDisposition::OutcomeUnknown => DocumentEvent::SaveOutcomeUnknown {
+                        document_id,
+                        operation_id,
+                        error: format!("connection closed after the save started: {error:#}"),
+                    },
+                    WriteFailureDisposition::Failed => DocumentEvent::SaveFailed {
                         document_id,
                         operation_id,
                         error: format!("{error:#}"),
-                        offline,
-                    }
-                }
+                        offline: false,
+                    },
+                },
             };
             let _ = gpui::AsyncWindowContext::update(cx, |window, cx| {
                 let _ = this.update(cx, |this, cx| {
@@ -1065,37 +1165,30 @@ impl Ashell {
     pub(crate) fn reconnect_document(
         &mut self,
         document_id: String,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some((session, dirty)) = self
+        let Some(connection_id) = self
             .documents
             .get(&document_id)
-            .map(|document| (document.session.clone(), document.revisions.is_dirty()))
+            .map(|document| document.key.connection_id.clone())
         else {
             return;
         };
-        let proxy_config = self.config.connection_proxy_config();
-        let handle = crate::sftp::spawn_sftp(
-            self.runtime.handle(),
-            format!("document-{document_id}"),
-            session,
-            proxy_config,
-            self.events_tx.clone(),
-        );
+        let Some(handle) = self.sftp_handles.get(&connection_id).cloned() else {
+            if let Some(document) = self.documents.get_mut(&document_id) {
+                document.connection_state =
+                    DocumentConnectionState::Offline(t!("document_sftp_unavailable").to_string());
+            }
+            cx.notify();
+            return;
+        };
         let Some(document) = self.documents.get_mut(&document_id) else {
             return;
         };
-        document.backend = SftpRemoteFileBackend::new(handle);
         document.connection_state = DocumentConnectionState::Reconnecting;
-        document.save_state = SaveState::Idle;
+        handle.reconnect_now();
         cx.notify();
-
-        if dirty {
-            self.save_document(document_id, window, cx);
-        } else {
-            self.reload_document(document_id, window, cx);
-        }
     }
 
     pub(crate) fn cancel_document_conflict(&mut self, document_id: &str, cx: &mut Context<Self>) {
@@ -1113,17 +1206,32 @@ impl Ashell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(document) = self.documents.get_mut(&document_id) else {
+        let Some(soft_wrap) = self
+            .documents
+            .get(&document_id)
+            .map(|document| !document.soft_wrap)
+        else {
             return;
         };
-        document.soft_wrap = !document.soft_wrap;
-        let soft_wrap = document.soft_wrap;
-        document.editor.update(cx, |editor, cx| {
-            editor.set_soft_wrap(soft_wrap, window, cx);
-        });
-        document.large_file_viewer.update(cx, |viewer, cx| {
-            viewer.set_soft_wrap(soft_wrap, window, cx);
-        });
+        self.config.set_editor_soft_wrap(soft_wrap);
+        self.save_preferences_background();
+
+        let editors = self
+            .documents
+            .values_mut()
+            .map(|document| {
+                document.soft_wrap = soft_wrap;
+                (document.editor.clone(), document.large_file_viewer.clone())
+            })
+            .collect::<Vec<_>>();
+        for (editor, viewer) in editors {
+            editor.update(cx, |editor, cx| {
+                editor.set_soft_wrap(soft_wrap, window, cx);
+            });
+            viewer.update(cx, |viewer, cx| {
+                viewer.set_soft_wrap(soft_wrap, window, cx);
+            });
+        }
         cx.notify();
     }
 
@@ -1167,6 +1275,29 @@ impl Ashell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.close_detached_document_window(document_id, cx);
+        let updated_group = self
+            .tab_groups
+            .iter_mut()
+            .find(|group| group.pane_root.contains_document(document_id))
+            .map(|group| {
+                let adjacent_path = group.pane_root.remove_document_and_focus(document_id);
+                group.focused_pane_path = adjacent_path
+                    .or_else(|| group.pane_root.first_leaf_path())
+                    .unwrap_or_default();
+                (
+                    group.id.clone(),
+                    group.pane_root.clone(),
+                    group.focused_pane_path.clone(),
+                )
+            });
+        if let Some((group_id, pane_root, focused_path)) = &updated_group
+            && self.active_group.as_deref() == Some(group_id.as_str())
+        {
+            self.pane_root = pane_root.clone();
+            self.focused_pane_path = focused_path.clone();
+        }
+
         let workspace_index = self.workspace_tabs.iter().position(|workspace| {
             matches!(
                 workspace,
@@ -1185,14 +1316,42 @@ impl Ashell {
         self.documents.remove(document_id);
 
         if self.active_workspace_tab == removed_workspace_id {
-            let next_index = workspace_index
-                .unwrap_or(0)
-                .min(self.workspace_tabs.len().saturating_sub(1));
-            let next = self.workspace_tabs.get(next_index).cloned();
-            if let Some(next) = next {
-                self.activate_workspace(next.id().to_string(), window, cx);
-            } else {
-                self.active_workspace_tab = None;
+            match self.pane_root.focused_leaf(&self.focused_pane_path) {
+                Some(PaneLeaf::Terminal(tab_id)) => {
+                    self.active_tab = Some(tab_id.clone());
+                    self.active_workspace_tab = self.active_group.clone();
+                    self.focus_handle.focus(window, cx);
+                }
+                Some(PaneLeaf::Document(next_document_id)) => {
+                    let next_document_id = next_document_id.clone();
+                    self.active_workspace_tab =
+                        self.workspace_tabs
+                            .iter()
+                            .find_map(|workspace| match workspace {
+                                WorkspaceTab::RemoteDocument { id, document_id }
+                                    if document_id == &next_document_id =>
+                                {
+                                    Some(id.clone())
+                                }
+                                _ => None,
+                            });
+                    if !self.activate_detached_document(&next_document_id, cx)
+                        && let Some(document) = self.documents.get(&next_document_id)
+                    {
+                        document.editor.focus_handle(cx).focus(window, cx);
+                    }
+                }
+                _ => {
+                    let next_index = workspace_index
+                        .unwrap_or(0)
+                        .min(self.workspace_tabs.len().saturating_sub(1));
+                    let next = self.workspace_tabs.get(next_index).cloned();
+                    if let Some(next) = next {
+                        self.activate_workspace(next.id().to_string(), window, cx);
+                    } else {
+                        self.active_workspace_tab = None;
+                    }
+                }
             }
         }
         cx.notify();
@@ -1202,7 +1361,7 @@ impl Ashell {
 #[cfg(test)]
 mod tests {
     use super::{CloseDecision, close_decision, find_existing_document};
-    use crate::document::{DocumentMode, DocumentRevisions, LineEnding, remote::*};
+    use crate::document::{DocumentMode, DocumentRevisions, LineEnding, SaveState, remote::*};
     use anyhow::{Result, anyhow};
     use async_trait::async_trait;
     use std::sync::{
@@ -1243,6 +1402,7 @@ mod tests {
     enum WriteBehavior {
         Metadata(RemoteMetadata),
         Failure(String),
+        ChannelClosed,
     }
 
     type WriteRecord = (String, Vec<u8>, Option<u32>);
@@ -1272,6 +1432,14 @@ mod tests {
             Self {
                 stat: StatBehavior::Metadata(metadata),
                 write: WriteBehavior::Failure(message.into()),
+                writes: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn channel_closed_write(metadata: RemoteMetadata) -> Self {
+            Self {
+                stat: StatBehavior::Metadata(metadata),
+                write: WriteBehavior::ChannelClosed,
                 writes: Arc::new(Mutex::new(Vec::new())),
             }
         }
@@ -1316,6 +1484,7 @@ mod tests {
             match &self.write {
                 WriteBehavior::Metadata(metadata) => Ok(metadata.clone()),
                 WriteBehavior::Failure(message) => Err(anyhow!(message.clone())),
+                WriteBehavior::ChannelClosed => Err(RemoteFileError::ChannelClosed.into()),
             }
         }
     }
@@ -1367,6 +1536,27 @@ mod tests {
                 &RemoteDocumentKey::new("connection-c", "/etc/app.conf"),
             ),
             None
+        );
+    }
+
+    #[test]
+    fn completed_save_only_reports_saved_when_revision_is_clean() {
+        assert_eq!(super::save_state_after_completion(false), SaveState::Saved);
+        assert_eq!(super::save_state_after_completion(true), SaveState::Idle);
+    }
+
+    #[test]
+    fn classifies_closed_write_as_unknown_outcome() {
+        let closed = anyhow::Error::new(RemoteFileError::ChannelClosed);
+        assert_eq!(
+            super::write_failure_disposition(&closed),
+            super::WriteFailureDisposition::OutcomeUnknown
+        );
+
+        let failed = anyhow!("disk full");
+        assert_eq!(
+            super::write_failure_disposition(&failed),
+            super::WriteFailureDisposition::Failed
         );
     }
 
@@ -1501,6 +1691,29 @@ mod tests {
         assert!(error.to_string().contains("disk full"));
         assert_eq!(request.bytes, b"local");
         assert_eq!(request.revision, 1);
+        assert_eq!(backend.writes().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn interrupted_write_reports_unknown_outcome_without_retrying() {
+        let backend = MemoryBackend::channel_closed_write(opened_metadata());
+        let outcome = super::run_save_check(
+            &backend,
+            super::SaveRequest::new(
+                "/etc/app.conf",
+                b"local".to_vec(),
+                opened_metadata(),
+                1,
+                "operation-1",
+            ),
+        )
+        .await
+        .unwrap();
+
+        let super::SaveOutcome::OutcomeUnknown(error) = outcome else {
+            panic!("expected unknown save outcome")
+        };
+        assert!(error.contains("connection"));
         assert_eq!(backend.writes().len(), 1);
     }
 

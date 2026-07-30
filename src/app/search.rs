@@ -16,6 +16,13 @@ use crate::Ashell;
 
 impl Ashell {
     pub(crate) fn toggle_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .pane_root
+            .focused_tab_id(&self.focused_pane_path)
+            .is_none()
+        {
+            return;
+        }
         if self.search_active {
             self.close_search(window, cx);
         } else {
@@ -73,26 +80,13 @@ impl Ashell {
             return;
         }
 
-        // Find the active tab — try active_tab first, then fall back to the
-        // first tab in the active group, then any tab.
-        let tab = self
-            .active_tab
-            .as_ref()
-            .and_then(|id| self.tabs.iter().find(|t| &t.id == id));
-
-        let tab = tab.or_else(|| {
-            let first_id = self
-                .active_group
-                .as_ref()
-                .and_then(|gid| self.tab_groups.iter().find(|g| &g.id == gid))
-                .and_then(|g| g.pane_root.tab_ids().into_iter().next())
-                .map(|s| s.to_string());
-            first_id
-                .as_deref()
-                .and_then(|id| self.tabs.iter().find(|t| t.id == id))
-        });
-
-        let tab = tab.or_else(|| self.tabs.first());
+        let tab_id = self
+            .pane_root
+            .focused_tab_id(&self.focused_pane_path)
+            .map(str::to_string);
+        let tab = tab_id
+            .as_deref()
+            .and_then(|id| self.tabs.iter().find(|t| t.id == id));
 
         let Some(tab) = tab else {
             self.status = t!("no_results").into();
@@ -202,19 +196,10 @@ impl Ashell {
         };
 
         // Find the tab ID first (immutable borrow), then look up mutably.
-        let tab_id = self.active_tab.clone().or_else(|| {
-            self.active_group
-                .as_ref()
-                .and_then(|gid| self.tab_groups.iter().find(|g| &g.id == gid))
-                .and_then(|g| g.pane_root.tab_ids().into_iter().next())
-                .map(|s| s.to_string())
-        });
-
-        let tab = if let Some(id) = tab_id.as_deref() {
-            self.tabs.iter_mut().find(|t| t.id == id)
-        } else {
-            self.tabs.first_mut()
-        };
+        let tab = self
+            .search_target_tab
+            .as_deref()
+            .and_then(|id| self.tabs.iter_mut().find(|t| t.id == id));
 
         if let Some(tab) = tab {
             let snapshot = tab.render_snapshot(false);
@@ -254,27 +239,12 @@ impl Ashell {
             return None;
         }
 
-        // Get current display_offset to convert grid line → viewport row.
+        // Get the same terminal that was searched, rather than whichever tab
+        // happens to remain active after focus moved elsewhere.
         let tab = self
-            .active_tab
-            .as_ref()
-            .and_then(|id| self.tabs.iter().find(|t| &t.id == id));
-
-        let tab = tab.or_else(|| {
-            let first_id = self
-                .active_group
-                .as_ref()
-                .and_then(|gid| self.tab_groups.iter().find(|g| &g.id == gid))
-                .and_then(|g| g.pane_root.tab_ids().into_iter().next())
-                .map(|s| s.to_string());
-            first_id
-                .as_deref()
-                .and_then(|id| self.tabs.iter().find(|t| t.id == id))
-        });
-
-        let tab = tab.or_else(|| self.tabs.first());
-
-        let tab = tab?;
+            .search_target_tab
+            .as_deref()
+            .and_then(|id| self.tabs.iter().find(|t| t.id == id))?;
         let snapshot = tab.render_snapshot(false);
         let display_offset = snapshot.display_offset as i32;
         let rows = snapshot.rows as i32;

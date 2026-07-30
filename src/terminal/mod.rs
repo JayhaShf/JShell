@@ -46,27 +46,43 @@ pub enum BackendCommand {
 pub enum BackendEvent {
     Output {
         tab_id: String,
+        generation: u32,
         bytes: Vec<u8>,
     },
     Status {
         tab_id: String,
+        generation: u32,
         text: String,
     },
     Connected {
         tab_id: String,
+        generation: u32,
     },
     SftpEntries {
         tab_id: String,
+        generation: u64,
         path: String,
         entries: Vec<RemoteEntry>,
     },
     SftpPreview {
         tab_id: String,
+        generation: u64,
         preview: PreviewData,
     },
     SftpStatus {
         tab_id: String,
+        generation: u64,
         text: String,
+    },
+    SftpDeleteFinished {
+        tab_id: String,
+        generation: u64,
+        paths: Vec<String>,
+        deleted_paths: Vec<String>,
+    },
+    SftpGeneration {
+        tab_id: String,
+        generation: u64,
     },
     RemoteSystem {
         tab_id: String,
@@ -86,11 +102,12 @@ pub enum BackendEvent {
     },
     SftpHome {
         tab_id: String,
+        generation: u64,
         home: String,
     },
     TransferProgress {
-        #[allow(dead_code)]
         tab_id: String,
+        generation: u64,
         id: String,
         transferred: u64,
         total: Option<u64>,
@@ -98,10 +115,12 @@ pub enum BackendEvent {
     },
     TransferStarted {
         tab_id: String,
+        generation: u64,
         info: TransferInfo,
     },
     Closed {
         tab_id: String,
+        generation: u32,
         reason: String,
     },
     TerminalTitleChanged {
@@ -143,12 +162,8 @@ pub struct TerminalTab {
     pub connected: bool,
     pub disconnected_reason: Option<String>,
     /// Incremented each time the tab is reconnected. Used to ignore stale
-    /// `BackendEvent::Closed` from the previous backend after a retry.
+    /// terminal events from the previous backend after a retry.
     pub backend_generation: u32,
-    /// Set to `true` when the current backend sends its first `Output` or
-    /// `Connected` event. Used to skip stale `Closed` events that arrive
-    /// before the new backend has started producing output.
-    pub backend_initialized: bool,
     pub session: Option<Session>,
     processor: Processor,
     term: Term<TerminalListener>,
@@ -197,12 +212,105 @@ pub struct ViewportSelection {
 #[derive(Clone, Default)]
 pub struct SftpUiState {
     pub current_path: String,
+    pub generation: u64,
     pub status: String,
     pub entries: Vec<RemoteEntry>,
     pub selected_path: Option<String>,
     pub preview: Option<PreviewData>,
     pub selected_entries: std::collections::HashSet<String>,
+    pub deleting_entries: std::collections::HashSet<String>,
     pub home_dir: String,
+}
+
+pub(crate) const fn backend_generation_matches(current: u32, event: u32) -> bool {
+    current == event
+}
+
+impl SftpUiState {
+    pub(crate) fn begin_generation(&mut self, generation: u64) -> bool {
+        if generation < self.generation {
+            return false;
+        }
+        self.generation = generation;
+        true
+    }
+
+    pub(crate) const fn accepts_generation(&self, generation: u64) -> bool {
+        self.generation == generation
+    }
+
+    pub(crate) fn apply_home(&mut self, home: String) {
+        let initialize_path = self.current_path == "/" && self.entries.is_empty();
+        self.home_dir = home.clone();
+        if initialize_path {
+            self.current_path = home;
+            self.selected_path = None;
+            self.preview = None;
+            self.selected_entries.clear();
+        }
+    }
+}
+
+#[cfg(test)]
+mod sftp_ui_state_tests {
+    use super::{SftpUiState, backend_generation_matches};
+
+    #[test]
+    fn applying_home_synchronizes_the_initial_directory() {
+        let mut state = SftpUiState {
+            current_path: "/".to_string(),
+            generation: 0,
+            selected_path: Some("/stale".to_string()),
+            ..SftpUiState::default()
+        };
+
+        state.apply_home("/home/alice".to_string());
+
+        assert_eq!(state.home_dir, "/home/alice");
+        assert_eq!(state.current_path, "/home/alice");
+        assert_eq!(state.selected_path, None);
+    }
+
+    #[test]
+    fn applying_home_does_not_reset_a_directory_being_reloaded() {
+        let mut state = SftpUiState {
+            current_path: "/var/log".to_string(),
+            generation: 0,
+            entries: vec![crate::sftp::RemoteEntry {
+                name: "app.log".to_string(),
+                full_path: "/var/log/app.log".to_string(),
+                is_dir: false,
+                file_type: crate::sftp::permissions::RemoteFileType::File,
+                permissions: Some(0o100644),
+                size: 12,
+                modified: 0,
+            }],
+            ..SftpUiState::default()
+        };
+
+        state.apply_home("/home/alice".to_string());
+
+        assert_eq!(state.home_dir, "/home/alice");
+        assert_eq!(state.current_path, "/var/log");
+    }
+
+    #[test]
+    fn sftp_generation_only_moves_forward_and_rejects_stale_events() {
+        let mut state = SftpUiState::default();
+
+        assert!(state.begin_generation(2));
+        assert!(state.accepts_generation(2));
+        assert!(!state.accepts_generation(1));
+        assert!(!state.begin_generation(1));
+        assert_eq!(state.generation, 2);
+    }
+
+    #[test]
+    fn terminal_backend_events_only_match_the_current_generation() {
+        assert!(backend_generation_matches(3, 3));
+        assert!(!backend_generation_matches(3, 2));
+        assert!(!backend_generation_matches(3, 4));
+    }
 }
 
 impl TerminalTab {
@@ -281,7 +389,6 @@ impl TerminalTab {
             connected: matches!(kind, TabKind::Local),
             disconnected_reason: None,
             backend_generation: 0,
-            backend_initialized: true,
             session: None,
             processor: Processor::new(),
             term: new_term(100, 30, shared_backend.clone(), id, events.clone()),
@@ -467,13 +574,6 @@ impl TerminalTab {
 
     pub fn scroll_to_bottom(&mut self) {
         self.term.scroll_display(Scroll::Bottom);
-    }
-
-    #[allow(dead_code)]
-    pub fn has_selection(&self) -> bool {
-        self.term
-            .selection_to_string()
-            .is_some_and(|text| !text.is_empty())
     }
 
     pub fn clear_selection(&mut self) {
@@ -929,6 +1029,8 @@ pub struct TransferInfo {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Transfer {
     pub tab_id: String,
+    #[serde(default)]
+    pub generation: u64,
     pub tab_title: String,
     pub info: TransferInfo,
     pub transferred: u64,

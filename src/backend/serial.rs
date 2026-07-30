@@ -7,6 +7,7 @@ use std::io::{Read, Write};
 pub fn spawn_serial_client(
     _handle: &tokio::runtime::Handle,
     tab_id: String,
+    generation: u32,
     session: Session,
     events_tx: std::sync::mpsc::Sender<BackendEvent>,
 ) -> tokio::sync::mpsc::UnboundedSender<BackendCommand> {
@@ -18,6 +19,7 @@ pub fn spawn_serial_client(
     std::thread::spawn(move || {
         let _ = events_tx_clone.send(BackendEvent::Status {
             tab_id: tab_id_clone.clone(),
+            generation,
             text: rust_i18n::t!("starting_connection").to_string(),
         });
 
@@ -50,6 +52,7 @@ pub fn spawn_serial_client(
                 tracing::error!("[serial] failed to open port {}: {}", port_name, e);
                 let _ = events_tx_clone.send(BackendEvent::Closed {
                     tab_id: tab_id_clone,
+                    generation,
                     reason: format!("Failed to open serial port {port_name}: {e}"),
                 });
                 return;
@@ -62,6 +65,7 @@ pub fn spawn_serial_client(
                 tracing::error!("[serial] failed to clone port: {}", e);
                 let _ = events_tx_clone.send(BackendEvent::Closed {
                     tab_id: tab_id_clone,
+                    generation,
                     reason: format!("Failed to clone serial port: {e}"),
                 });
                 return;
@@ -71,6 +75,7 @@ pub fn spawn_serial_client(
         // Notify connected
         let _ = events_tx_clone.send(BackendEvent::Connected {
             tab_id: tab_id_clone.clone(),
+            generation,
         });
 
         // Spawn write thread
@@ -84,6 +89,7 @@ pub fn spawn_serial_client(
                             tracing::error!("[serial] write error: {}", e);
                             let _ = events_tx_write.send(BackendEvent::Closed {
                                 tab_id: tab_id_write.clone(),
+                                generation,
                                 reason: format!("Serial write error: {e}"),
                             });
                             break;
@@ -122,6 +128,7 @@ pub fn spawn_serial_client(
 
                     let _ = events_tx_clone.send(BackendEvent::Output {
                         tab_id: tab_id_clone.clone(),
+                        generation,
                         bytes: processed,
                     });
                 }
@@ -131,6 +138,7 @@ pub fn spawn_serial_client(
                     tracing::info!("[serial] port read error/closed: {}", e);
                     let _ = events_tx_clone.send(BackendEvent::Closed {
                         tab_id: tab_id_clone,
+                        generation,
                         reason: format!("Serial read error: {e}"),
                     });
                     break;
@@ -173,7 +181,7 @@ mod tests {
         let (events_tx, events_rx) = std::sync::mpsc::channel();
         let handle = tokio::runtime::Handle::current();
         let session = Session::serial(slave_name, 0);
-        let cmd_tx = spawn_serial_client(&handle, "test-tab".to_string(), session, events_tx);
+        let cmd_tx = spawn_serial_client(&handle, "test-tab".to_string(), 0, session, events_tx);
 
         // Wait for the Status event
         let status_event = events_rx.recv_timeout(std::time::Duration::from_secs(2));
@@ -187,7 +195,7 @@ mod tests {
         // Wait for the Connected event
         let connected_event = events_rx.recv_timeout(std::time::Duration::from_secs(2));
         assert!(connected_event.is_ok(), "Failed to receive Connected event");
-        if let Ok(BackendEvent::Connected { tab_id }) = connected_event {
+        if let Ok(BackendEvent::Connected { tab_id, .. }) = connected_event {
             assert_eq!(tab_id, "test-tab");
         } else {
             panic!("Expected Connected event, got: {:?}", connected_event);
@@ -200,7 +208,7 @@ mod tests {
 
         let output_event = events_rx.recv_timeout(std::time::Duration::from_secs(2));
         assert!(output_event.is_ok(), "Failed to receive Output event");
-        if let Ok(BackendEvent::Output { tab_id, bytes }) = output_event {
+        if let Ok(BackendEvent::Output { tab_id, bytes, .. }) = output_event {
             assert_eq!(tab_id, "test-tab");
             assert_eq!(bytes, b"hello serial simulator");
         } else {

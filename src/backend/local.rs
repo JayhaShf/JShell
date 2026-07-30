@@ -11,6 +11,7 @@ use crate::terminal::{BackendCommand, BackendEvent, BackendTx};
 
 pub fn spawn_local_terminal(
     tab_id: String,
+    generation: u32,
     cols: u16,
     rows: u16,
     events: Sender<BackendEvent>,
@@ -73,12 +74,14 @@ pub fn spawn_local_terminal(
                 Ok(n) => {
                     let _ = read_events.send(BackendEvent::Output {
                         tab_id: read_tab.clone(),
+                        generation,
                         bytes: buf[..n].to_vec(),
                     });
                 }
                 Err(err) => {
                     let _ = read_events.send(BackendEvent::Closed {
                         tab_id: read_tab.clone(),
+                        generation,
                         reason: format!("local read error: {err}"),
                     });
                     return;
@@ -87,6 +90,7 @@ pub fn spawn_local_terminal(
         }
         let _ = read_events.send(BackendEvent::Closed {
             tab_id: read_tab,
+            generation,
             reason: "local shell closed".into(),
         });
     });
@@ -101,6 +105,7 @@ pub fn spawn_local_terminal(
                         if let Err(err) = writer.write_all(&bytes) {
                             let _ = write_events.send(BackendEvent::Closed {
                                 tab_id: write_tab.clone(),
+                                generation,
                                 reason: format!("local write error: {err}"),
                             });
                             break;
@@ -122,6 +127,7 @@ pub fn spawn_local_terminal(
                     if let Ok(Some(status)) = child.try_wait() {
                         let _ = write_events.send(BackendEvent::Closed {
                             tab_id: write_tab,
+                            generation,
                             reason: format!("local shell exited: {status}"),
                         });
                         return;
@@ -135,6 +141,7 @@ pub fn spawn_local_terminal(
 
     let _ = events.send(BackendEvent::Status {
         tab_id,
+        generation,
         text: "local shell ready".into(),
     });
 
