@@ -1,11 +1,11 @@
 [package]
 name = "jshell"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 edition = "2024"
 authors = ["JShell contributors"]
 description = "A Windows-focused SSH and local terminal workspace"
 license = "GPL-3.0-or-later"
-rust-version = "1.88.0"
+rust-version = "1.89.0"
 
 [dependencies]
 anyhow = "1"
@@ -15,9 +15,9 @@ async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 directories = "5"
 flate2 = "1"
-gpui = { git = "https://github.com/zed-industries/zed" }
-gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit", "runtime_shaders", "wayland", "x11"] }
-gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "ca85b5588f5feea021f1ee86cb13703dc6f30ec4", features = [
+gpui = { git = "https://github.com/JayhaShf/zed.git", rev = "1b324bfa283f90b1b0aa6e6761bccbd168a956d4" }
+gpui_platform = { git = "https://github.com/JayhaShf/zed.git", rev = "1b324bfa283f90b1b0aa6e6761bccbd168a956d4", features = ["font-kit", "runtime_shaders", "wayland", "x11"] }
+gpui-component = { git = "https://github.com/JayhaShf/gpui-component.git", rev = "d2373dc64e75717b5ed56de7e3803ac6eaaa4933", features = [
     "tree-sitter-bash",
     "tree-sitter-c",
     "tree-sitter-cpp",
@@ -36,11 +36,11 @@ gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "
     "tree-sitter-typescript",
     "tree-sitter-yaml",
 ] }
-gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "ca85b5588f5feea021f1ee86cb13703dc6f30ec4" }
-menu = { git = "https://github.com/zed-industries/zed" }
+gpui-component-assets = { git = "https://github.com/JayhaShf/gpui-component.git", rev = "d2373dc64e75717b5ed56de7e3803ac6eaaa4933" }
+menu = { git = "https://github.com/JayhaShf/zed.git", rev = "1b324bfa283f90b1b0aa6e6761bccbd168a956d4" }
 portable-pty = "0.9"
 rfd = "0.15"
-russh = { version = "0.60.3", default-features = false, features = ["ring", "flate2", "rsa"] }
+russh = { version = "0.60.3", git = "https://github.com/JayhaShf/russh.git", rev = "705e92dfb551e458d376016ecc83f43be71b0aa1", default-features = false, features = ["ring", "flate2", "rsa"] }
 russh-sftp = "2"
 rust-i18n = "3"
 sys-locale = "0.3"
@@ -86,6 +86,8 @@ rcgen = "0.13"
 winreg = "0.52"
 
 [patch.crates-io]
+metal = { git = "https://github.com/JayhaShf/metal-rs.git", rev = "d7512f0ac9d4b3b53a2677ebdaec3aaffe0908f7" }
+rav1e = { git = "https://github.com/JayhaShf/rav1e.git", rev = "6793853eb18fde2425aeab927fc3449268a41cbb" }
 xcb = { git = "https://github.com/rust-x-bindings/rust-xcb", rev = "ae3b2cd080e78173223038ccbebdc644eaf4a9ad" }
 
 [package.metadata.deb]
@@ -99,6 +101,12 @@ assets = [
     ["assets/jshell.desktop", "usr/share/applications/", "644"],
     ["assets/icons/jshell.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
 ]
+
+[package.metadata.winres]
+FileDescription = "JShell"
+InternalName = "JShell"
+OriginalFilename = "jshell.exe"
+ProductName = "JShell"
 
 [profile.release]
 opt-level = 3

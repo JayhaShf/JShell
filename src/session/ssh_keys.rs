@@ -4,7 +4,7 @@ use anyhow::Result;
 use directories::BaseDirs;
 use russh::{
     client::{self, Handler},
-    keys::{HashAlg, PrivateKey, key::PrivateKeyWithHashAlg, load_secret_key},
+    keys::{Algorithm, HashAlg, PrivateKey, key::PrivateKeyWithHashAlg, load_secret_key},
 };
 
 use crate::session::config::Session;
@@ -31,23 +31,23 @@ pub fn normalize_inline_private_key(value: &str) -> String {
     normalized
 }
 
-pub fn private_keys_with_algs(keypair: PrivateKey) -> Vec<PrivateKeyWithHashAlg> {
-    let mut algs = Vec::new();
-    let key_arc = Arc::new(keypair);
+const RSA_HASH_ALGS: &[Option<HashAlg>] = &[Some(HashAlg::Sha512), Some(HashAlg::Sha256)];
+const NATIVE_KEY_ALG: &[Option<HashAlg>] = &[None];
 
-    if key_arc.algorithm().is_rsa() {
-        algs.push(PrivateKeyWithHashAlg::new(
-            key_arc.clone(),
-            Some(HashAlg::Sha512),
-        ));
-        algs.push(PrivateKeyWithHashAlg::new(
-            key_arc.clone(),
-            Some(HashAlg::Sha256),
-        ));
+fn hash_algs_for_key(algorithm: &Algorithm) -> &'static [Option<HashAlg>] {
+    if algorithm.clone().is_rsa() {
+        RSA_HASH_ALGS
+    } else {
+        NATIVE_KEY_ALG
     }
-    algs.push(PrivateKeyWithHashAlg::new(key_arc, None));
+}
 
-    algs
+pub fn private_keys_with_algs(keypair: PrivateKey) -> Vec<PrivateKeyWithHashAlg> {
+    let key_arc = Arc::new(keypair);
+    hash_algs_for_key(&key_arc.algorithm())
+        .iter()
+        .map(|hash_alg| PrivateKeyWithHashAlg::new(key_arc.clone(), *hash_alg))
+        .collect()
 }
 
 pub async fn authenticate_with_default_keys<H>(
@@ -83,4 +83,23 @@ where
     }
 
     Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::hash_algs_for_key;
+    use russh::keys::{Algorithm, HashAlg};
+
+    #[test]
+    fn rsa_authentication_uses_sha2_only() {
+        assert_eq!(
+            hash_algs_for_key(&Algorithm::Rsa { hash: None }),
+            [Some(HashAlg::Sha512), Some(HashAlg::Sha256)]
+        );
+    }
+
+    #[test]
+    fn non_rsa_authentication_uses_its_native_algorithm() {
+        assert_eq!(hash_algs_for_key(&Algorithm::Ed25519), [None]);
+    }
 }

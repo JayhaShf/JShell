@@ -1961,6 +1961,32 @@ mod tests {
         assert_eq!(config.font_defaults_version, 4);
     }
 
+    #[test]
+    fn default_ssh_rsa_algorithms_use_sha2_only() {
+        use russh::keys::{Algorithm, HashAlg};
+
+        let rsa_algorithms = russh::Preferred::default()
+            .key
+            .iter()
+            .filter_map(|algorithm| match algorithm {
+                Algorithm::Rsa { .. } => Some(algorithm.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            rsa_algorithms,
+            vec![
+                Algorithm::Rsa {
+                    hash: Some(HashAlg::Sha512),
+                },
+                Algorithm::Rsa {
+                    hash: Some(HashAlg::Sha256),
+                },
+            ]
+        );
+    }
+
     fn direct_proxy_config() -> ConnectionProxyConfig {
         ConnectionProxyConfig {
             read_env_proxy: false,
