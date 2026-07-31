@@ -2,7 +2,7 @@
 
 # JShell
 
-JShell 是一个使用 Rust、GPUI 与 `alacritty_terminal` 构建的桌面终端工作区，面向需要同时管理本地终端、SSH 会话、SFTP 文件和远程文本的用户。当前版本为 `0.1.0-beta.1`，默认界面与默认文档使用中文。
+JShell 是一个使用 Rust、GPUI 与 `alacritty_terminal` 构建的桌面终端工作区，面向需要同时管理本地终端、SSH 会话、SFTP 文件和远程文本的用户。当前版本为 `0.1.0-beta.2`，默认界面与默认文档使用中文。
 
 ![JShell 工作区预览](assets/screenshots/compact-workspace.png)
 
@@ -79,7 +79,7 @@ C:\Users\<用户名>\.config\jshell\sessions.json
 
 ## 开发与构建
 
-要求 Rust `1.88.0` 或更高版本，以及目标平台所需的 GPUI 系统依赖。
+要求 Rust `1.89.0` 或更高版本，以及目标平台所需的 GPUI 系统依赖。
 
 ```bash
 cargo run --locked

@@ -55,4 +55,4 @@ jobs:
 
       - name: Build (release)
         # We build in release mode so that the release workflow can reuse the exact artifacts
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
