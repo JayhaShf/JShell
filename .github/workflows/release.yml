@@ -247,6 +247,20 @@ jobs:
     permissions:
       contents: write # required to create or update the GitHub Release
     steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify Chinese release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          NOTES=".github/release-notes/${GITHUB_REF_NAME}.zh-CN.md"
+          if [ ! -s "$NOTES" ]; then
+            echo "::error::Missing or empty Chinese release notes: $NOTES"
+            exit 1
+          fi
+
       - name: Download all workflow artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -257,6 +271,6 @@ jobs:
         with:
           name: JShell ${{ github.ref_name }}
           prerelease: ${{ contains(github.ref_name, '-') }}
+          body_path: .github/release-notes/${{ github.ref_name }}.zh-CN.md
           files: dist/**/*
-          generate_release_notes: true
           fail_on_unmatched_files: true

@@ -2,7 +2,7 @@
 
 # JShell
 
-JShell 是一个使用 Rust、GPUI 与 `alacritty_terminal` 构建的桌面终端工作区，面向需要同时管理本地终端、SSH 会话、SFTP 文件和远程文本的用户。当前源码版本为 `0.1.0-beta.2`；界面语言默认跟随系统，也可在设置中切换，项目默认文档入口为中文。GitHub 线上最新公开 Release 仍为 `v0.1.0-beta.1`，`beta.2` 尚未发布。
+JShell 是一个使用 Rust、GPUI 与 `alacritty_terminal` 构建的桌面终端工作区，面向需要同时管理本地终端、SSH 会话、SFTP 文件和远程文本的用户。当前源码版本为 `0.1.0-beta.3`；界面语言默认跟随系统，也可在设置中切换，项目默认文档入口为中文。
 
 ![JShell 工作区预览](assets/screenshots/compact-workspace.png)
 
@@ -47,7 +47,7 @@ JShell 是一个使用 Rust、GPUI 与 `alacritty_terminal` 构建的桌面终�
 
 ## 安装与运行
 
-预编译版本发布在 [GitHub Releases](https://github.com/JayhaShf/JShell/releases)。当前可下载的最新公开版本为 `v0.1.0-beta.1`；本地源码中的 `0.1.0-beta.2` 仍处于发布候选阶段。发布产物名称为：
+预编译版本发布在 [GitHub Releases](https://github.com/JayhaShf/JShell/releases)。发布产物名称为：
 
 - Windows：`jshell-<版本>-windows-x86_64.zip`
 - Linux：`jshell-<版本>-linux-x86_64.tar.gz`
