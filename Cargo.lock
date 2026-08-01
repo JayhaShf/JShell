@@ -1236,7 +1236,7 @@ dependencies = [
 [[package]]
 name = "collections"
 version = "0.1.0"
-source = "git+https://github.com/JayhaShf/zed.git?rev=1b324bfa283f90b1b0aa6e6761bccbd168a956d4#1b324bfa283f90b1b0aa6e6761bccbd168a956d4"
+source = "git+https://github.com/JayhaShf/zed.git?rev=8c555982deb9bfe7451ee40c4e393e048da98068#8c555982deb9bfe7451ee40c4e393e048da98068"
 dependencies = [
  "gpui_util",
  "indexmap",
@@ -1801,7 +1801,7 @@ dependencies = [
 [[package]]
 name = "derive_refineable"
 version = "0.1.0"
-source = "git+https://github.com/JayhaShf/zed.git?rev=1b324bfa283f90b1b0aa6e6761bccbd168a956d4#1b324bfa283f90b1b0aa6e6761bccbd168a956d4"
+source = "git+https://github.com/JayhaShf/zed.git?rev=8c555982deb9bfe7451ee40c4e393e048da98068#8c555982deb9bfe7451ee40c4e393e048da98068"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1871,7 +1871,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2167,7 +2167,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2775,7 +2775,7 @@ dependencies = [
  "log",
  "presser",
  "thiserror 2.0.18",
- "windows 0.57.0",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -2801,7 +2801,7 @@ dependencies = [
 [[package]]
 name = "gpui"
 version = "0.2.2"
-source = "git+https://github.com/JayhaShf/zed.git?rev=1b324bfa283f90b1b0aa6e6761bccbd168a956d4#1b324bfa283f90b1b0aa6e6761bccbd168a956d4"
+source = "git+https://github.com/JayhaShf/zed.git?rev=8c555982deb9bfe7451ee40c4e393e048da98068#8c555982deb9bfe7451ee40c4e393e048da98068"
 dependencies = [
  "accesskit",
  "anyhow",
@@ -2883,7 +2883,7 @@ dependencies = [
 [[package]]
 name = "gpui-component"
 version = "0.5.2"
-source = "git+https://github.com/JayhaShf/gpui-component.git?rev=d2373dc64e75717b5ed56de7e3803ac6eaaa4933#d2373dc64e75717b5ed56de7e3803ac6eaaa4933"
+source = "git+https://github.com/JayhaShf/gpui-component.git?rev=e3d17318fcde6fde02c38d2c405761d59ce1aa69#e3d17318fcde6fde02c38d2c405761d59ce1aa69"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -2950,7 +2950,7 @@ dependencies = [
 [[package]]
 name = "gpui-component-assets"
 version = "0.5.1"
-source = "git+https://github.com/JayhaShf/gpui-component.git?rev=d2373dc64e75717b5ed56de7e3803ac6eaaa4933#d2373dc64e75717b5ed56de7e3803ac6eaaa4933"
+source = "git+https://github.com/JayhaShf/gpui-component.git?rev=e3d17318fcde6fde02c38d2c405761d59ce1aa69#e3d17318fcde6fde02c38d2c405761d59ce1aa69"
 dependencies = [
  "anyhow",
  "gpui",
@@ -2964,7 +2964,7 @@ dependencies = [
 [[package]]
 name = "gpui-component-macros"
 version = "0.5.1"
-source = "git+https://github.com/JayhaShf/gpui-component.git?rev=d2373dc64e75717b5ed56de7e3803ac6eaaa4933#d2373dc64e75717b5ed56de7e3803ac6eaaa4933"
+source = "git+https://github.com/JayhaShf/gpui-component.git?rev=e3d17318fcde6fde02c38d2c405761d59ce1aa69#e3d17318fcde6fde02c38d2c405761d59ce1aa69"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2974,7 +2974,7 @@ dependencies = [
 [[package]]
 name = "gpui_linux"
 version = "0.1.0"
-source = "git+https://github.com/JayhaShf/zed.git?rev=1b324bfa283f90b1b0aa6e6761bccbd168a956d4#1b324bfa283f90b1b0aa6e6761bccbd168a956d4"
+source = "git+https://github.com/JayhaShf/zed.git?rev=8c555982deb9bfe7451ee40c4e393e048da98068#8c555982deb9bfe7451ee40c4e393e048da98068"
 dependencies = [
  "accesskit",
  "accesskit_unix",
@@ -3026,7 +3026,7 @@ dependencies = [
 [[package]]
 name = "gpui_macos"
 version = "0.1.0"
-source = "git+https://github.com/JayhaShf/zed.git?rev=1b324bfa283f90b1b0aa6e6761bccbd168a956d4#1b324bfa283f90b1b0aa6e6761bccbd168a956d4"
+source = "git+https://github.com/JayhaShf/zed.git?rev=8c555982deb9bfe7451ee40c4e393e048da98068#8c555982deb9bfe7451ee40c4e393e048da98068"
 dependencies = [
  "accesskit",
  "accesskit_macos",
@@ -3075,7 +3075,7 @@ dependencies = [
 [[package]]
 name = "gpui_macros"
 version = "0.1.0"
-source = "git+https://github.com/JayhaShf/zed.git?rev=1b324bfa283f90b1b0aa6e6761bccbd168a956d4#1b324bfa283f90b1b0aa6e6761bccbd168a956d4"
+source = "git+https://github.com/JayhaShf/zed.git?rev=8c555982deb9bfe7451ee40c4e393e048da98068#8c555982deb9bfe7451ee40c4e393e048da98068"
 dependencies = [
  "heck 0.5.0",
  "proc-macro2",
@@ -3086,7 +3086,7 @@ dependencies = [
 [[package]]
 name = "gpui_platform"
 version = "0.1.0"
-source = "git+https://github.com/JayhaShf/zed.git?rev=1b324bfa283f90b1b0aa6e6761bccbd168a956d4#1b324bfa283f90b1b0aa6e6761bccbd168a956d4"
+source = "git+https://github.com/JayhaShf/zed.git?rev=8c555982deb9bfe7451ee40c4e393e048da98068#8c555982deb9bfe7451ee40c4e393e048da98068"
 dependencies = [
  "console_error_panic_hook",
  "gpui",
@@ -3099,7 +3099,7 @@ dependencies = [
 [[package]]
 name = "gpui_shared_string"
 version = "0.1.0"
-source = "git+https://github.com/JayhaShf/zed.git?rev=1b324bfa283f90b1b0aa6e6761bccbd168a956d4#1b324bfa283f90b1b0aa6e6761bccbd168a956d4"
+source = "git+https://github.com/JayhaShf/zed.git?rev=8c555982deb9bfe7451ee40c4e393e048da98068#8c555982deb9bfe7451ee40c4e393e048da98068"
 dependencies = [
  "schemars",
  "serde",
@@ -3109,7 +3109,7 @@ dependencies = [
 [[package]]
 name = "gpui_util"
 version = "0.1.0"
-source = "git+https://github.com/JayhaShf/zed.git?rev=1b324bfa283f90b1b0aa6e6761bccbd168a956d4#1b324bfa283f90b1b0aa6e6761bccbd168a956d4"
+source = "git+https://github.com/JayhaShf/zed.git?rev=8c555982deb9bfe7451ee40c4e393e048da98068#8c555982deb9bfe7451ee40c4e393e048da98068"
 dependencies = [
  "anyhow",
  "log",
@@ -3119,7 +3119,7 @@ dependencies = [
 [[package]]
 name = "gpui_web"
 version = "0.1.0"
-source = "git+https://github.com/JayhaShf/zed.git?rev=1b324bfa283f90b1b0aa6e6761bccbd168a956d4#1b324bfa283f90b1b0aa6e6761bccbd168a956d4"
+source = "git+https://github.com/JayhaShf/zed.git?rev=8c555982deb9bfe7451ee40c4e393e048da98068#8c555982deb9bfe7451ee40c4e393e048da98068"
 dependencies = [
  "anyhow",
  "console_error_panic_hook",
@@ -3142,7 +3142,7 @@ dependencies = [
 [[package]]
 name = "gpui_wgpu"
 version = "0.1.0"
-source = "git+https://github.com/JayhaShf/zed.git?rev=1b324bfa283f90b1b0aa6e6761bccbd168a956d4#1b324bfa283f90b1b0aa6e6761bccbd168a956d4"
+source = "git+https://github.com/JayhaShf/zed.git?rev=8c555982deb9bfe7451ee40c4e393e048da98068#8c555982deb9bfe7451ee40c4e393e048da98068"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -3172,7 +3172,7 @@ dependencies = [
 [[package]]
 name = "gpui_windows"
 version = "0.1.0"
-source = "git+https://github.com/JayhaShf/zed.git?rev=1b324bfa283f90b1b0aa6e6761bccbd168a956d4#1b324bfa283f90b1b0aa6e6761bccbd168a956d4"
+source = "git+https://github.com/JayhaShf/zed.git?rev=8c555982deb9bfe7451ee40c4e393e048da98068#8c555982deb9bfe7451ee40c4e393e048da98068"
 dependencies = [
  "accesskit",
  "accesskit_windows",
@@ -3432,7 +3432,7 @@ dependencies = [
 [[package]]
 name = "http_client"
 version = "0.1.0"
-source = "git+https://github.com/JayhaShf/zed.git?rev=1b324bfa283f90b1b0aa6e6761bccbd168a956d4#1b324bfa283f90b1b0aa6e6761bccbd168a956d4"
+source = "git+https://github.com/JayhaShf/zed.git?rev=8c555982deb9bfe7451ee40c4e393e048da98068#8c555982deb9bfe7451ee40c4e393e048da98068"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -3539,7 +3539,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.57.0",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -4493,7 +4493,7 @@ checksum = "490cc448043f947bae3cbee9c203358d62dbee0db12107a74be5c30ccfd09771"
 [[package]]
 name = "media"
 version = "0.1.0"
-source = "git+https://github.com/JayhaShf/zed.git?rev=1b324bfa283f90b1b0aa6e6761bccbd168a956d4#1b324bfa283f90b1b0aa6e6761bccbd168a956d4"
+source = "git+https://github.com/JayhaShf/zed.git?rev=8c555982deb9bfe7451ee40c4e393e048da98068#8c555982deb9bfe7451ee40c4e393e048da98068"
 dependencies = [
  "anyhow",
  "bindgen",
@@ -4532,7 +4532,7 @@ dependencies = [
 [[package]]
 name = "menu"
 version = "0.1.0"
-source = "git+https://github.com/JayhaShf/zed.git?rev=1b324bfa283f90b1b0aa6e6761bccbd168a956d4#1b324bfa283f90b1b0aa6e6761bccbd168a956d4"
+source = "git+https://github.com/JayhaShf/zed.git?rev=8c555982deb9bfe7451ee40c4e393e048da98068#8c555982deb9bfe7451ee40c4e393e048da98068"
 dependencies = [
  "gpui",
 ]
@@ -4597,7 +4597,7 @@ version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "536bfad37a309d62069485248eeaba1e8d9853aaf951caaeaed0585a95346f08"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4857,7 +4857,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5646,7 +5646,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 [[package]]
 name = "perf"
 version = "0.1.0"
-source = "git+https://github.com/JayhaShf/zed.git?rev=1b324bfa283f90b1b0aa6e6761bccbd168a956d4#1b324bfa283f90b1b0aa6e6761bccbd168a956d4"
+source = "git+https://github.com/JayhaShf/zed.git?rev=8c555982deb9bfe7451ee40c4e393e048da98068#8c555982deb9bfe7451ee40c4e393e048da98068"
 dependencies = [
  "collections",
  "serde",
@@ -6454,7 +6454,7 @@ dependencies = [
 [[package]]
 name = "refineable"
 version = "0.1.0"
-source = "git+https://github.com/JayhaShf/zed.git?rev=1b324bfa283f90b1b0aa6e6761bccbd168a956d4#1b324bfa283f90b1b0aa6e6761bccbd168a956d4"
+source = "git+https://github.com/JayhaShf/zed.git?rev=8c555982deb9bfe7451ee40c4e393e048da98068#8c555982deb9bfe7451ee40c4e393e048da98068"
 dependencies = [
  "derive_refineable",
 ]
@@ -6963,7 +6963,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7067,7 +7067,7 @@ dependencies = [
 [[package]]
 name = "scheduler"
 version = "0.1.0"
-source = "git+https://github.com/JayhaShf/zed.git?rev=1b324bfa283f90b1b0aa6e6761bccbd168a956d4#1b324bfa283f90b1b0aa6e6761bccbd168a956d4"
+source = "git+https://github.com/JayhaShf/zed.git?rev=8c555982deb9bfe7451ee40c4e393e048da98068#8c555982deb9bfe7451ee40c4e393e048da98068"
 dependencies = [
  "async-task",
  "backtrace",
@@ -7681,7 +7681,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7764,7 +7764,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7870,7 +7870,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 [[package]]
 name = "sum_tree"
 version = "0.1.0"
-source = "git+https://github.com/JayhaShf/zed.git?rev=1b324bfa283f90b1b0aa6e6761bccbd168a956d4#1b324bfa283f90b1b0aa6e6761bccbd168a956d4"
+source = "git+https://github.com/JayhaShf/zed.git?rev=8c555982deb9bfe7451ee40c4e393e048da98068#8c555982deb9bfe7451ee40c4e393e048da98068"
 dependencies = [
  "heapless",
  "log",
@@ -8125,7 +8125,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8825,7 +8825,7 @@ checksum = "f2f6fb2847f6742cd76af783a2a2c49e9375d0a111c7bef6f71cd9e738c72d6e"
 dependencies = [
  "memoffset",
  "tempfile",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8984,7 +8984,7 @@ checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
 [[package]]
 name = "util_macros"
 version = "0.1.0"
-source = "git+https://github.com/JayhaShf/zed.git?rev=1b324bfa283f90b1b0aa6e6761bccbd168a956d4#1b324bfa283f90b1b0aa6e6761bccbd168a956d4"
+source = "git+https://github.com/JayhaShf/zed.git?rev=8c555982deb9bfe7451ee40c4e393e048da98068#8c555982deb9bfe7451ee40c4e393e048da98068"
 dependencies = [
  "perf",
  "quote",
@@ -10898,7 +10898,7 @@ dependencies = [
 [[package]]
 name = "zlog"
 version = "0.1.0"
-source = "git+https://github.com/JayhaShf/zed.git?rev=1b324bfa283f90b1b0aa6e6761bccbd168a956d4#1b324bfa283f90b1b0aa6e6761bccbd168a956d4"
+source = "git+https://github.com/JayhaShf/zed.git?rev=8c555982deb9bfe7451ee40c4e393e048da98068#8c555982deb9bfe7451ee40c4e393e048da98068"
 dependencies = [
  "anyhow",
  "chrono",
@@ -10927,7 +10927,7 @@ dependencies = [
 [[package]]
 name = "ztracing"
 version = "0.1.0"
-source = "git+https://github.com/JayhaShf/zed.git?rev=1b324bfa283f90b1b0aa6e6761bccbd168a956d4#1b324bfa283f90b1b0aa6e6761bccbd168a956d4"
+source = "git+https://github.com/JayhaShf/zed.git?rev=8c555982deb9bfe7451ee40c4e393e048da98068#8c555982deb9bfe7451ee40c4e393e048da98068"
 dependencies = [
  "tracing",
  "tracing-subscriber",
@@ -10938,7 +10938,7 @@ dependencies = [
 [[package]]
 name = "ztracing_macro"
 version = "0.1.0"
-source = "git+https://github.com/JayhaShf/zed.git?rev=1b324bfa283f90b1b0aa6e6761bccbd168a956d4#1b324bfa283f90b1b0aa6e6761bccbd168a956d4"
+source = "git+https://github.com/JayhaShf/zed.git?rev=8c555982deb9bfe7451ee40c4e393e048da98068#8c555982deb9bfe7451ee40c4e393e048da98068"
 
 [[package]]
 name = "zune-core"

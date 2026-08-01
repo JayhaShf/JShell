@@ -15,9 +15,9 @@ async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 directories = "5"
 flate2 = "1"
-gpui = { git = "https://github.com/JayhaShf/zed.git", rev = "1b324bfa283f90b1b0aa6e6761bccbd168a956d4" }
-gpui_platform = { git = "https://github.com/JayhaShf/zed.git", rev = "1b324bfa283f90b1b0aa6e6761bccbd168a956d4", features = ["font-kit", "runtime_shaders", "wayland", "x11"] }
-gpui-component = { git = "https://github.com/JayhaShf/gpui-component.git", rev = "d2373dc64e75717b5ed56de7e3803ac6eaaa4933", features = [
+gpui = { git = "https://github.com/JayhaShf/zed.git", rev = "8c555982deb9bfe7451ee40c4e393e048da98068" }
+gpui_platform = { git = "https://github.com/JayhaShf/zed.git", rev = "8c555982deb9bfe7451ee40c4e393e048da98068", features = ["font-kit", "runtime_shaders", "wayland", "x11"] }
+gpui-component = { git = "https://github.com/JayhaShf/gpui-component.git", rev = "e3d17318fcde6fde02c38d2c405761d59ce1aa69", features = [
     "tree-sitter-bash",
     "tree-sitter-c",
     "tree-sitter-cpp",
@@ -36,8 +36,8 @@ gpui-component = { git = "https://github.com/JayhaShf/gpui-component.git", rev =
     "tree-sitter-typescript",
     "tree-sitter-yaml",
 ] }
-gpui-component-assets = { git = "https://github.com/JayhaShf/gpui-component.git", rev = "d2373dc64e75717b5ed56de7e3803ac6eaaa4933" }
-menu = { git = "https://github.com/JayhaShf/zed.git", rev = "1b324bfa283f90b1b0aa6e6761bccbd168a956d4" }
+gpui-component-assets = { git = "https://github.com/JayhaShf/gpui-component.git", rev = "e3d17318fcde6fde02c38d2c405761d59ce1aa69" }
+menu = { git = "https://github.com/JayhaShf/zed.git", rev = "8c555982deb9bfe7451ee40c4e393e048da98068" }
 portable-pty = "0.9"
 rfd = "0.15"
 russh = { version = "0.60.3", git = "https://github.com/JayhaShf/russh.git", rev = "705e92dfb551e458d376016ecc83f43be71b0aa1", default-features = false, features = ["ring", "flate2", "rsa"] }
