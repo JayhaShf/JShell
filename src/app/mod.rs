@@ -1364,6 +1364,41 @@ impl Ashell {
                         self.status = text.into();
                     }
                 }
+                BackendEvent::SftpConnectionBlocked {
+                    tab_id,
+                    generation,
+                    reason,
+                } => {
+                    let text = rust_i18n::t!("sftp_reconnect_blocked", reason = reason.clone())
+                        .to_string();
+                    let accepted = self
+                        .tab_groups
+                        .iter_mut()
+                        .find(|group| group.id == tab_id)
+                        .and_then(|group| group.sftp.as_mut())
+                        .is_some_and(|sftp| {
+                            if sftp.accepts_generation(generation) {
+                                sftp.status = text.clone();
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                    if !accepted {
+                        continue;
+                    }
+                    for document in self
+                        .documents
+                        .values_mut()
+                        .filter(|document| document.key.connection_id == tab_id)
+                    {
+                        document.connection_state =
+                            crate::document::DocumentConnectionState::Offline(text.clone());
+                    }
+                    if self.active_group.as_ref() == Some(&tab_id) {
+                        self.status = text.into();
+                    }
+                }
                 BackendEvent::SftpDeleteFinished {
                     tab_id,
                     generation,

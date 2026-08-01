@@ -74,6 +74,11 @@ pub enum BackendEvent {
         generation: u64,
         text: String,
     },
+    SftpConnectionBlocked {
+        tab_id: String,
+        generation: u64,
+        reason: String,
+    },
     SftpDeleteFinished {
         tab_id: String,
         generation: u64,

@@ -823,24 +823,51 @@ impl Handler for ClientHandler {
 #[cfg(test)]
 mod command_history_tests {
     use super::{ClientHandler, parse_remote_command_history};
+    use crate::session::host_keys::HostKeyError;
 
     const TEST_HOST_KEY: &str =
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ";
+    const CHANGED_HOST_KEY: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA6rWI3G1sz07DnfFlrouTcysQlj2P+jpNSOEWD9OJ3X";
 
     #[tokio::test]
-    async fn client_handler_rejects_unknown_host_key() {
-        let path = std::env::temp_dir().join(format!(
-            "jshell-missing-known-hosts-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let mut handler = ClientHandler::with_known_hosts_path("example.test", 2222, path);
+    async fn client_handler_accepts_and_records_new_host_key() {
+        let root = tempfile::tempdir().expect("create temporary known_hosts root");
+        let path = root.path().join(".ssh").join("known_hosts");
+        let mut handler = ClientHandler::with_known_hosts_path("example.test", 2222, path.clone());
         let key = russh::keys::ssh_key::PublicKey::from_openssh(TEST_HOST_KEY)
             .expect("parse test public key");
 
         assert!(
             russh::client::Handler::check_server_key(&mut handler, &key)
                 .await
-                .is_err()
+                .expect("new host key should be accepted")
+        );
+        let contents = std::fs::read_to_string(path).expect("read persisted known_hosts");
+        assert_eq!(
+            contents.matches("[example.test]:2222 ssh-ed25519 ").count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn client_handler_rejects_changed_host_key_without_modifying_file() {
+        let root = tempfile::tempdir().expect("create temporary known_hosts root");
+        let path = root.path().join("known_hosts");
+        let original = format!("example.test {TEST_HOST_KEY}\n");
+        std::fs::write(&path, &original).expect("write known_hosts");
+        let mut handler = ClientHandler::with_known_hosts_path("example.test", 22, path.clone());
+        let changed = russh::keys::ssh_key::PublicKey::from_openssh(CHANGED_HOST_KEY)
+            .expect("parse changed public key");
+
+        let error = russh::client::Handler::check_server_key(&mut handler, &changed)
+            .await
+            .expect_err("changed host key must be rejected");
+
+        assert!(error.downcast_ref::<HostKeyError>().is_some());
+        assert_eq!(
+            std::fs::read_to_string(path).expect("read known_hosts"),
+            original,
         );
     }
 

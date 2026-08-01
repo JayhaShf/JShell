@@ -39,7 +39,7 @@ use rust_i18n::t;
 use crate::{
     session::{
         config::{AuthMethod, ConnectionProxyConfig, Session},
-        host_keys::HostKeyVerifier,
+        host_keys::{HostKeyVerifier, is_permanent_host_key_error},
         ssh_keys::{
             authenticate_with_default_keys, normalize_inline_private_key, private_keys_with_algs,
             session_has_explicit_key,
@@ -47,6 +47,20 @@ use crate::{
     },
     terminal::BackendEvent,
 };
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SftpRetryPolicy {
+    Backoff,
+    Manual,
+}
+
+fn sftp_retry_policy(error: &anyhow::Error) -> SftpRetryPolicy {
+    if is_permanent_host_key_error(error) {
+        SftpRetryPolicy::Manual
+    } else {
+        SftpRetryPolicy::Backoff
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct RemoteEntry {
@@ -492,7 +506,7 @@ async fn run_sftp_supervisor(
     let mut retry_timer: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
 
     loop {
-        if worker.is_none() && retry_timer.is_none() {
+        if worker.is_none() && retry_timer.is_none() && !connection.is_blocked() {
             let generation = connection
                 .begin_connecting()
                 .expect("SFTP supervisor is not closed");
@@ -514,21 +528,42 @@ async fn run_sftp_supervisor(
             tokio::select! {
                 result = &mut active_worker.join => {
                     let generation = active_worker.generation;
-                    let reason = match result {
-                        Ok(Ok(())) => "SFTP worker stopped".to_string(),
-                        Ok(Err(error)) => format!("sftp error: {error:#}"),
-                        Err(error) => format!("sftp worker stopped: {error}"),
+                    let (reason, retry_policy) = match result {
+                        Ok(Ok(())) => (
+                            "SFTP worker stopped".to_string(),
+                            SftpRetryPolicy::Backoff,
+                        ),
+                        Ok(Err(error)) => {
+                            let retry_policy = sftp_retry_policy(&error);
+                            (format!("sftp error: {error:#}"), retry_policy)
+                        }
+                        Err(error) => (
+                            format!("sftp worker stopped: {error}"),
+                            SftpRetryPolicy::Backoff,
+                        ),
                     };
-                    let delay = connection
-                        .disconnect(generation)
-                        .and_then(|outcome| outcome.retry_after)
-                        .unwrap_or_else(|| std::time::Duration::from_secs(30));
-                    let _ = events.send(BackendEvent::SftpStatus {
-                        tab_id: tab_id.clone(),
-                        generation: generation.0,
-                        text: format!("{} ({reason})", t!("sftp_reconnecting")),
-                    });
-                    retry_timer = Some(Box::pin(tokio::time::sleep(delay)));
+                    match retry_policy {
+                        SftpRetryPolicy::Backoff => {
+                            let delay = connection
+                                .disconnect(generation)
+                                .and_then(|outcome| outcome.retry_after)
+                                .unwrap_or_else(|| std::time::Duration::from_secs(30));
+                            let _ = events.send(BackendEvent::SftpStatus {
+                                tab_id: tab_id.clone(),
+                                generation: generation.0,
+                                text: format!("{} ({reason})", t!("sftp_reconnecting")),
+                            });
+                            retry_timer = Some(Box::pin(tokio::time::sleep(delay)));
+                        }
+                        SftpRetryPolicy::Manual => {
+                            let _ = connection.block(generation);
+                            let _ = events.send(BackendEvent::SftpConnectionBlocked {
+                                tab_id: tab_id.clone(),
+                                generation: generation.0,
+                                reason,
+                            });
+                        }
+                    }
                 }
                 _ = active_worker.ready.notified() => {
                     if active_worker.connected.load(Ordering::SeqCst) {
@@ -625,6 +660,25 @@ async fn run_sftp_supervisor(
             }
             if keep_waiting {
                 retry_timer = Some(timer);
+            }
+        } else if connection.is_blocked() {
+            match commands.recv().await {
+                None | Some(SftpCommand::Close) => break,
+                Some(SftpCommand::ReconnectNow) => {
+                    let _ = connection.manual_reconnect();
+                }
+                Some(command) if command.is_replayable() => {
+                    queue_pending_command(
+                        &mut pending,
+                        command,
+                        &tab_id,
+                        connection.generation(),
+                        &events,
+                    );
+                }
+                Some(command) => {
+                    reject_unavailable_command(&tab_id, connection.generation(), command, &events);
+                }
             }
         } else {
             tokio::task::yield_now().await;
@@ -2379,23 +2433,81 @@ async fn document_write_atomic_impl(
 #[cfg(test)]
 mod handle_tests {
     use super::*;
+    use crate::session::host_keys::HostKeyError;
 
     const TEST_HOST_KEY: &str =
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ";
+    const CHANGED_HOST_KEY: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA6rWI3G1sz07DnfFlrouTcysQlj2P+jpNSOEWD9OJ3X";
 
     #[tokio::test]
-    async fn sftp_handler_rejects_unknown_host_key() {
-        let path =
-            std::env::temp_dir().join(format!("jshell-missing-known-hosts-{}", Uuid::new_v4()));
+    async fn sftp_handler_accepts_and_records_new_host_key() {
+        let root = tempfile::tempdir().expect("create temporary known_hosts root");
+        let path = root.path().join(".ssh").join("known_hosts");
         let mut handler =
-            SftpClientHandler::with_known_hosts_path("files.example.test", 2222, path);
+            SftpClientHandler::with_known_hosts_path("files.example.test", 2222, path.clone());
         let key = russh::keys::ssh_key::PublicKey::from_openssh(TEST_HOST_KEY)
             .expect("parse test public key");
 
         assert!(
             russh::client::Handler::check_server_key(&mut handler, &key)
                 .await
-                .is_err()
+                .expect("new host key should be accepted")
+        );
+        let contents = fs::read_to_string(path).expect("read persisted known_hosts");
+        assert_eq!(
+            contents
+                .matches("[files.example.test]:2222 ssh-ed25519 ")
+                .count(),
+            1,
+        );
+    }
+
+    #[tokio::test]
+    async fn sftp_handler_rejects_changed_host_key_without_modifying_file() {
+        let root = tempfile::tempdir().expect("create temporary known_hosts root");
+        let path = root.path().join("known_hosts");
+        let original = format!("files.example.test {TEST_HOST_KEY}\n");
+        fs::write(&path, &original).expect("write known_hosts");
+        let mut handler =
+            SftpClientHandler::with_known_hosts_path("files.example.test", 22, path.clone());
+        let changed = russh::keys::ssh_key::PublicKey::from_openssh(CHANGED_HOST_KEY)
+            .expect("parse changed host key");
+
+        let error = russh::client::Handler::check_server_key(&mut handler, &changed)
+            .await
+            .expect_err("changed host key must be rejected");
+
+        assert!(error.downcast_ref::<HostKeyError>().is_some());
+        assert_eq!(
+            fs::read_to_string(path).expect("read known_hosts"),
+            original
+        );
+    }
+
+    #[test]
+    fn host_key_errors_require_manual_reconnect() {
+        let root = tempfile::tempdir().expect("create temporary known_hosts root");
+        let path = root.path().join("known_hosts");
+        fs::write(&path, format!("example.test {TEST_HOST_KEY}\n")).expect("write known_hosts");
+        let verifier = HostKeyVerifier::with_known_hosts_path("example.test", 22, path);
+        let changed = russh::keys::ssh_key::PublicKey::from_openssh(CHANGED_HOST_KEY)
+            .expect("parse changed host key");
+        let error = anyhow::Error::new(
+            verifier
+                .verify(&changed)
+                .expect_err("changed key must fail"),
+        )
+        .context("connect example.test:22 failed");
+
+        assert_eq!(sftp_retry_policy(&error), SftpRetryPolicy::Manual);
+    }
+
+    #[test]
+    fn ordinary_connection_errors_keep_backoff() {
+        assert_eq!(
+            sftp_retry_policy(&anyhow!("network reset")),
+            SftpRetryPolicy::Backoff,
         );
     }
 

@@ -62,6 +62,7 @@ pub enum ConnectionState {
     Connecting,
     Connected,
     Reconnecting,
+    Blocked,
     Closed,
 }
 
@@ -102,7 +103,10 @@ impl ConnectionSupervisor {
     }
 
     pub fn begin_connecting(&mut self) -> Option<SftpGeneration> {
-        if self.state == ConnectionState::Closed {
+        if matches!(
+            self.state,
+            ConnectionState::Blocked | ConnectionState::Closed
+        ) {
             return None;
         }
 
@@ -111,7 +115,11 @@ impl ConnectionSupervisor {
     }
 
     pub fn mark_connected(&mut self, generation: SftpGeneration) -> bool {
-        if self.state == ConnectionState::Closed || self.generation != generation {
+        if matches!(
+            self.state,
+            ConnectionState::Blocked | ConnectionState::Closed
+        ) || self.generation != generation
+        {
             return false;
         }
 
@@ -123,7 +131,7 @@ impl ConnectionSupervisor {
     pub fn disconnect(&mut self, generation: SftpGeneration) -> Option<DisconnectOutcome> {
         if matches!(
             self.state,
-            ConnectionState::Closed | ConnectionState::Reconnecting
+            ConnectionState::Blocked | ConnectionState::Closed | ConnectionState::Reconnecting
         ) || self.generation != generation
         {
             return None;
@@ -137,6 +145,34 @@ impl ConnectionSupervisor {
             generation: next_generation,
             retry_after: self.backoff.next_delay(),
         })
+    }
+
+    pub fn block(&mut self, generation: SftpGeneration) -> bool {
+        if matches!(
+            self.state,
+            ConnectionState::Blocked | ConnectionState::Closed
+        ) || self.generation != generation
+        {
+            return false;
+        }
+
+        self.state = ConnectionState::Blocked;
+        self.generation = self.generation.next();
+        true
+    }
+
+    pub fn manual_reconnect(&mut self) -> Option<SftpGeneration> {
+        if self.state == ConnectionState::Closed {
+            return None;
+        }
+
+        self.state = ConnectionState::Connecting;
+        self.backoff = ReconnectBackoff::new();
+        Some(self.generation)
+    }
+
+    pub fn is_blocked(&self) -> bool {
+        self.state == ConnectionState::Blocked
     }
 
     pub fn close(&mut self) {
@@ -235,5 +271,32 @@ mod tests {
         assert!(supervisor.backoff().is_stopped());
         assert_eq!(supervisor.begin_connecting(), None);
         assert!(!supervisor.mark_connected(supervisor.generation()));
+    }
+
+    #[test]
+    fn permanent_failure_waits_for_manual_reconnect() {
+        let mut supervisor = ConnectionSupervisor::new();
+        let generation = supervisor.generation();
+
+        assert!(supervisor.block(generation));
+        assert_eq!(supervisor.state(), ConnectionState::Blocked);
+        assert_eq!(supervisor.generation(), generation.next());
+        assert_eq!(supervisor.begin_connecting(), None);
+        assert!(supervisor.disconnect(supervisor.generation()).is_none());
+    }
+
+    #[test]
+    fn manual_reconnect_resumes_blocked_connection() {
+        let mut supervisor = ConnectionSupervisor::new();
+        let generation = supervisor.generation();
+        assert!(supervisor.block(generation));
+
+        let resumed = supervisor
+            .manual_reconnect()
+            .expect("blocked connection can be manually retried");
+
+        assert_eq!(supervisor.state(), ConnectionState::Connecting);
+        assert_eq!(resumed, generation.next());
+        assert_eq!(supervisor.begin_connecting(), Some(resumed));
     }
 }
