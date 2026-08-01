@@ -58,6 +58,7 @@ walkdir = "2"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 image = { version = "0.25.9", default-features = false, features = ["png"] }
 futures = "0.3.32"
+zeroize = "1.8"
 keyring = { version = "3.6.3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust", "vendored"] }
 notify = "6.1.1"
 open = "5.1"
@@ -71,7 +72,7 @@ httparse = "1"
 hex = "0.4"
 serialport = "4"
 rand = "0.8"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 rustls = { version = "=0.23.40", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "=0.8.4"
 sha1 = "0.10"

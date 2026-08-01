@@ -1,4 +1,18 @@
-use anyhow::{Context, Result, anyhow};
+mod credential_store;
+mod payload;
+mod target;
+
+pub use credential_store::{PlatformSyncCredentialStore, SyncCredentialStore};
+pub use credential_store::{SecretString, SyncError};
+#[cfg(test)]
+pub(crate) use payload::LegacySyncPayloadV1;
+pub use payload::{DecodedSyncPayload, PortableConfigV2, SyncPayloadV2, SyncPreview};
+pub use target::SyncTargetId;
+
+use std::{fmt, time::Duration};
+
+use crate::session::config::SyncConnectionSnapshot;
+
 use argon2::Argon2;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chacha20poly1305::{
@@ -10,33 +24,17 @@ use rand::{RngCore, rngs::OsRng};
 use reqwest::{Client, StatusCode, header};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use uuid::Uuid;
-
-use crate::session::config::Session;
 
 const SYNC_FILE_NAME: &str = "jshell-sync.json";
 const FORMAT_VERSION: u32 = 1;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(not(test))]
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const REQUEST_TIMEOUT: Duration = Duration::from_millis(100);
+pub const MAX_SYNC_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SyncPayload {
-    pub schema_version: u32,
-    pub revision: String,
-    pub updated_at: String,
-    pub device_id: String,
-    pub sessions: Vec<Session>,
-}
-
-impl SyncPayload {
-    pub fn new(device_id: String, sessions: Vec<Session>) -> Self {
-        Self {
-            schema_version: FORMAT_VERSION,
-            revision: Uuid::new_v4().to_string(),
-            updated_at: chrono::Utc::now().to_rfc3339(),
-            device_id,
-            sessions,
-        }
-    }
-}
+type SyncApiResult<T> = std::result::Result<T, SyncError>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct EncryptedEnvelope {
@@ -70,27 +68,149 @@ pub enum SyncBackendCredentials {
         secret_key: String,
         session_token: String,
     },
+    R2 {
+        account_id: String,
+        bucket: String,
+        object_key: String,
+        access_key_id: String,
+        secret_access_key: SecretString,
+    },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
+pub struct SyncOperationSnapshot {
+    pub(crate) credentials: SyncCredentials,
+    pub(crate) target_id: SyncTargetId,
+    pub(crate) connection: SyncConnectionSnapshot,
+}
+
+impl SyncOperationSnapshot {
+    pub(crate) fn new(credentials: SyncCredentials, connection: SyncConnectionSnapshot) -> Self {
+        let target_id = connection.target_id();
+        Self {
+            credentials,
+            target_id,
+            connection,
+        }
+    }
+}
+
+impl fmt::Debug for SyncOperationSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SyncOperationSnapshot")
+            .field("target_id", &self.target_id)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteObjectState {
+    Exists { etag: Option<String> },
+    Missing,
+}
+
+#[derive(Clone)]
 pub enum SyncResult {
+    Tested {
+        operation: SyncOperationSnapshot,
+        result: Result<RemoteObjectState, SyncError>,
+    },
     Uploaded {
-        etag: Option<String>,
+        operation: SyncOperationSnapshot,
+        payload: Box<SyncPayloadV2>,
+        result: Result<Option<String>, SyncError>,
     },
     Downloaded {
-        payload: SyncPayload,
-        etag: Option<String>,
+        operation: SyncOperationSnapshot,
+        result: Result<(DecodedSyncPayload, Option<String>), SyncError>,
     },
-    Failed(String),
+}
+
+impl fmt::Debug for SyncResult {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Tested { operation, result } => formatter
+                .debug_struct("Tested")
+                .field("operation", operation)
+                .field("result", result)
+                .finish(),
+            Self::Uploaded {
+                operation, result, ..
+            } => formatter
+                .debug_struct("Uploaded")
+                .field("operation", operation)
+                .field("result", result)
+                .finish(),
+            Self::Downloaded { operation, result } => formatter
+                .debug_struct("Downloaded")
+                .field("operation", operation)
+                .field("result", result)
+                .finish(),
+        }
+    }
+}
+
+pub async fn test_connection(credentials: SyncCredentials) -> SyncApiResult<RemoteObjectState> {
+    validate_credentials(&credentials)?;
+    let response = match &credentials.backend {
+        SyncBackendCredentials::WebDav {
+            endpoint,
+            username,
+            password,
+        } => sync_http_client()?
+            .head(sync_url(endpoint))
+            .basic_auth(username, Some(password))
+            .send()
+            .await
+            .map_err(map_reqwest_error)?,
+        backend @ (SyncBackendCredentials::S3 { .. } | SyncBackendCredentials::R2 { .. }) => {
+            let config = S3Config::from_backend(backend)?;
+            let url = s3_url(&config)?;
+            let headers = signed_s3_headers("HEAD", &url, &[], &config)?;
+            sync_http_client()?
+                .head(url)
+                .headers(headers)
+                .send()
+                .await
+                .map_err(map_reqwest_error)?
+        }
+    };
+
+    match response.status() {
+        StatusCode::OK => Ok(RemoteObjectState::Exists {
+            etag: response_etag(&response),
+        }),
+        StatusCode::NOT_FOUND => Ok(RemoteObjectState::Missing),
+        status => Err(map_http_status(status)),
+    }
+}
+
+pub async fn confirm_overwrite(
+    credentials: SyncCredentials,
+    payload: SyncPayloadV2,
+) -> SyncApiResult<Option<String>> {
+    let expected_etag = match test_connection(credentials.clone()).await? {
+        RemoteObjectState::Exists { etag: Some(etag) } => Some(etag),
+        RemoteObjectState::Exists { etag: None } => return Err(SyncError::Conflict),
+        RemoteObjectState::Missing => None,
+    };
+    upload(credentials, payload, expected_etag).await
 }
 
 pub async fn upload(
     credentials: SyncCredentials,
-    payload: SyncPayload,
+    payload: SyncPayloadV2,
     expected_etag: Option<String>,
-) -> Result<Option<String>> {
+) -> SyncApiResult<Option<String>> {
     validate_credentials(&credentials)?;
-    let body = encrypt_payload(&payload, &credentials.encryption_password)?;
+    let encryption_password = SecretString::new(credentials.encryption_password);
+    let body = encrypt_payload(&payload, encryption_password.expose_secret())?;
+    if body.len() > MAX_SYNC_PAYLOAD_BYTES {
+        return Err(SyncError::PayloadTooLarge {
+            limit: MAX_SYNC_PAYLOAD_BYTES,
+        });
+    }
     match credentials.backend {
         SyncBackendCredentials::WebDav {
             endpoint,
@@ -112,8 +232,26 @@ pub async fn upload(
                 bucket,
                 object_key,
                 access_key,
-                secret_key,
+                secret_key: SecretString::new(secret_key),
                 session_token,
+            };
+            upload_s3(&config, body, expected_etag).await
+        }
+        SyncBackendCredentials::R2 {
+            account_id,
+            bucket,
+            object_key,
+            access_key_id,
+            secret_access_key,
+        } => {
+            let config = S3Config {
+                endpoint: r2_endpoint(&account_id),
+                region: "auto".to_string(),
+                bucket,
+                object_key,
+                access_key: access_key_id,
+                secret_key: secret_access_key,
+                session_token: String::new(),
             };
             upload_s3(&config, body, expected_etag).await
         }
@@ -126,8 +264,8 @@ async fn upload_webdav(
     password: &str,
     body: Vec<u8>,
     expected_etag: Option<String>,
-) -> Result<Option<String>> {
-    let client = Client::new();
+) -> SyncApiResult<Option<String>> {
+    let client = sync_http_client()?;
     let mut request = client
         .put(sync_url(endpoint))
         .basic_auth(username, Some(password))
@@ -140,16 +278,9 @@ async fn upload_webdav(
         // it from silently replacing configuration uploaded by another device.
         request.header(header::IF_NONE_MATCH, "*")
     };
-    let response = request.send().await.context("send WebDAV upload")?;
-    if response.status() == StatusCode::PRECONDITION_FAILED
-        || response.status() == StatusCode::CONFLICT
-    {
-        return Err(anyhow!(
-            "remote configuration changed; download it before uploading"
-        ));
-    }
+    let response = request.send().await.map_err(map_reqwest_error)?;
     if !response.status().is_success() {
-        return Err(anyhow!("WebDAV upload failed: HTTP {}", response.status()));
+        return Err(map_http_status(response.status()));
     }
     Ok(response
         .headers()
@@ -158,9 +289,11 @@ async fn upload_webdav(
         .map(str::to_string))
 }
 
-pub async fn download(credentials: SyncCredentials) -> Result<(SyncPayload, Option<String>)> {
+pub async fn download(
+    credentials: SyncCredentials,
+) -> SyncApiResult<(DecodedSyncPayload, Option<String>)> {
     validate_credentials(&credentials)?;
-    let encryption_password = credentials.encryption_password;
+    let encryption_password = SecretString::new(credentials.encryption_password);
     let (body, etag) = match credentials.backend {
         SyncBackendCredentials::WebDav {
             endpoint,
@@ -182,13 +315,31 @@ pub async fn download(credentials: SyncCredentials) -> Result<(SyncPayload, Opti
                 bucket,
                 object_key,
                 access_key,
-                secret_key,
+                secret_key: SecretString::new(secret_key),
                 session_token,
             };
             download_s3(&config).await?
         }
+        SyncBackendCredentials::R2 {
+            account_id,
+            bucket,
+            object_key,
+            access_key_id,
+            secret_access_key,
+        } => {
+            let config = S3Config {
+                endpoint: r2_endpoint(&account_id),
+                region: "auto".to_string(),
+                bucket,
+                object_key,
+                access_key: access_key_id,
+                secret_key: secret_access_key,
+                session_token: String::new(),
+            };
+            download_s3(&config).await?
+        }
     };
-    let payload = decrypt_payload(&body, &encryption_password)?;
+    let payload = decrypt_payload(&body, encryption_password.expose_secret())?;
     Ok((payload, etag))
 }
 
@@ -196,45 +347,37 @@ async fn download_webdav(
     endpoint: &str,
     username: &str,
     password: &str,
-) -> Result<(Vec<u8>, Option<String>)> {
-    let response = Client::new()
+) -> SyncApiResult<(Vec<u8>, Option<String>)> {
+    let response = sync_http_client()?
         .get(sync_url(endpoint))
         .basic_auth(username, Some(password))
         .send()
         .await
-        .context("send WebDAV download")?;
-    if response.status() == StatusCode::NOT_FOUND {
-        return Err(anyhow!("no remote configuration exists yet"));
-    }
+        .map_err(map_reqwest_error)?;
     if !response.status().is_success() {
-        return Err(anyhow!(
-            "WebDAV download failed: HTTP {}",
-            response.status()
-        ));
+        return Err(map_http_status(response.status()));
     }
     let etag = response
         .headers()
         .get(header::ETAG)
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
-    let body = response
-        .bytes()
-        .await
-        .context("read WebDAV response")?
-        .to_vec();
+    let body = read_response_limited(response).await?;
     Ok((body, etag))
 }
 
-fn validate_credentials(credentials: &SyncCredentials) -> Result<()> {
-    if credentials.encryption_password.len() < 8 {
-        return Err(anyhow!(
-            "encryption password must contain at least 8 characters"
+pub(crate) fn validate_credentials(
+    credentials: &SyncCredentials,
+) -> std::result::Result<(), SyncError> {
+    if credentials.encryption_password.chars().count() < 8 {
+        return Err(SyncError::InvalidInput(
+            "encryption password must contain at least 8 characters".to_string(),
         ));
     }
     match &credentials.backend {
-        SyncBackendCredentials::WebDav { endpoint, .. } if endpoint.trim().is_empty() => {
-            Err(anyhow!("WebDAV endpoint is required"))
-        }
+        SyncBackendCredentials::WebDav { endpoint, .. } if endpoint.trim().is_empty() => Err(
+            SyncError::InvalidInput("WebDAV endpoint is required".to_string()),
+        ),
         SyncBackendCredentials::S3 {
             region,
             bucket,
@@ -246,12 +389,33 @@ fn validate_credentials(credentials: &SyncCredentials) -> Result<()> {
             || access_key.trim().is_empty()
             || secret_key.is_empty() =>
         {
-            Err(anyhow!(
-                "S3 region, bucket, access key and secret key are required"
+            Err(SyncError::InvalidInput(
+                "S3 region, bucket, access key and secret key are required".to_string(),
+            ))
+        }
+        SyncBackendCredentials::R2 {
+            account_id,
+            bucket,
+            object_key,
+            access_key_id,
+            secret_access_key,
+        } if account_id.len() != 32
+            || !account_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || bucket.trim().is_empty()
+            || object_key.trim().is_empty()
+            || access_key_id.trim().is_empty()
+            || secret_access_key.expose_secret().is_empty() =>
+        {
+            Err(SyncError::InvalidInput(
+                "R2 credentials are incomplete or invalid".to_string(),
             ))
         }
         _ => Ok(()),
     }
+}
+
+fn r2_endpoint(account_id: &str) -> String {
+    format!("https://{}.r2.cloudflarestorage.com", account_id.trim())
 }
 
 struct S3Config {
@@ -260,15 +424,57 @@ struct S3Config {
     bucket: String,
     object_key: String,
     access_key: String,
-    secret_key: String,
+    secret_key: SecretString,
     session_token: String,
+}
+
+impl S3Config {
+    fn from_backend(backend: &SyncBackendCredentials) -> std::result::Result<Self, SyncError> {
+        match backend {
+            SyncBackendCredentials::S3 {
+                endpoint,
+                region,
+                bucket,
+                object_key,
+                access_key,
+                secret_key,
+                session_token,
+            } => Ok(Self {
+                endpoint: endpoint.clone(),
+                region: region.clone(),
+                bucket: bucket.clone(),
+                object_key: object_key.clone(),
+                access_key: access_key.clone(),
+                secret_key: SecretString::new(secret_key.clone()),
+                session_token: session_token.clone(),
+            }),
+            SyncBackendCredentials::R2 {
+                account_id,
+                bucket,
+                object_key,
+                access_key_id,
+                secret_access_key,
+            } => Ok(Self {
+                endpoint: r2_endpoint(account_id),
+                region: "auto".to_string(),
+                bucket: bucket.clone(),
+                object_key: object_key.clone(),
+                access_key: access_key_id.clone(),
+                secret_key: secret_access_key.clone(),
+                session_token: String::new(),
+            }),
+            SyncBackendCredentials::WebDav { .. } => Err(SyncError::InvalidInput(
+                "WebDAV credentials are not S3-compatible".to_string(),
+            )),
+        }
+    }
 }
 
 async fn upload_s3(
     config: &S3Config,
     body: Vec<u8>,
     expected_etag: Option<String>,
-) -> Result<Option<String>> {
+) -> SyncApiResult<Option<String>> {
     let url = s3_url(config)?;
     let mut headers = signed_s3_headers("PUT", &url, &body, config)?;
     headers.insert(
@@ -280,24 +486,15 @@ async fn upload_s3(
     } else {
         headers.insert(header::IF_NONE_MATCH, header::HeaderValue::from_static("*"));
     }
-    let response = Client::new()
+    let response = sync_http_client()?
         .put(url)
         .headers(headers)
         .body(body)
         .send()
         .await
-        .context("send S3 upload")?;
-    if response.status() == StatusCode::PRECONDITION_FAILED
-        || response.status() == StatusCode::CONFLICT
-    {
-        return Err(anyhow!(
-            "remote configuration changed; download it before uploading"
-        ));
-    }
+        .map_err(map_reqwest_error)?;
     if !response.status().is_success() {
-        let status = response.status();
-        let detail = response.text().await.unwrap_or_default();
-        return Err(anyhow!("S3 upload failed: HTTP {status}: {detail}"));
+        return Err(map_http_status(response.status()));
     }
     Ok(response
         .headers()
@@ -306,33 +503,28 @@ async fn upload_s3(
         .map(str::to_string))
 }
 
-async fn download_s3(config: &S3Config) -> Result<(Vec<u8>, Option<String>)> {
+async fn download_s3(config: &S3Config) -> SyncApiResult<(Vec<u8>, Option<String>)> {
     let url = s3_url(config)?;
     let headers = signed_s3_headers("GET", &url, &[], config)?;
-    let response = Client::new()
+    let response = sync_http_client()?
         .get(url)
         .headers(headers)
         .send()
         .await
-        .context("send S3 download")?;
-    if response.status() == StatusCode::NOT_FOUND {
-        return Err(anyhow!("no remote configuration exists yet"));
-    }
+        .map_err(map_reqwest_error)?;
     if !response.status().is_success() {
-        let status = response.status();
-        let detail = response.text().await.unwrap_or_default();
-        return Err(anyhow!("S3 download failed: HTTP {status}: {detail}"));
+        return Err(map_http_status(response.status()));
     }
     let etag = response
         .headers()
         .get(header::ETAG)
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
-    let body = response.bytes().await.context("read S3 response")?.to_vec();
+    let body = read_response_limited(response).await?;
     Ok((body, etag))
 }
 
-fn s3_url(config: &S3Config) -> Result<reqwest::Url> {
+fn s3_url(config: &S3Config) -> SyncApiResult<reqwest::Url> {
     let endpoint = if config.endpoint.trim().is_empty() {
         format!("https://s3.{}.amazonaws.com", config.region.trim())
     } else {
@@ -349,7 +541,8 @@ fn s3_url(config: &S3Config) -> Result<reqwest::Url> {
         aws_uri_encode(config.bucket.trim(), true),
         aws_uri_encode(key, false)
     );
-    reqwest::Url::parse(&url).context("parse S3 object URL")
+    reqwest::Url::parse(&url)
+        .map_err(|_| SyncError::InvalidInput("invalid S3 object URL".to_string()))
 }
 
 fn signed_s3_headers(
@@ -357,13 +550,63 @@ fn signed_s3_headers(
     url: &reqwest::Url,
     body: &[u8],
     config: &S3Config,
-) -> Result<header::HeaderMap> {
-    let now = chrono::Utc::now();
+) -> SyncApiResult<header::HeaderMap> {
+    signed_s3_headers_at(method, url, body, config, chrono::Utc::now())
+}
+
+struct S3SigningMaterial {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "retained for deterministic SigV4 vector verification"
+        )
+    )]
+    canonical_request: String,
+    amz_date: String,
+    payload_hash: String,
+    authorization: String,
+}
+
+fn signed_s3_headers_at(
+    method: &str,
+    url: &reqwest::Url,
+    body: &[u8],
+    config: &S3Config,
+    now: chrono::DateTime<chrono::Utc>,
+) -> SyncApiResult<header::HeaderMap> {
+    let material = s3_signing_material(method, url, body, config, now)?;
+    let mut headers = header::HeaderMap::new();
+    headers.insert("x-amz-date", header_value(&material.amz_date, "S3 date")?);
+    headers.insert(
+        "x-amz-content-sha256",
+        header_value(&material.payload_hash, "S3 payload hash")?,
+    );
+    headers.insert(
+        header::AUTHORIZATION,
+        header_value(&material.authorization, "S3 authorization")?,
+    );
+    if !config.session_token.is_empty() {
+        headers.insert(
+            "x-amz-security-token",
+            header_value(config.session_token.trim(), "S3 session token")?,
+        );
+    }
+    Ok(headers)
+}
+
+fn s3_signing_material(
+    method: &str,
+    url: &reqwest::Url,
+    body: &[u8],
+    config: &S3Config,
+    now: chrono::DateTime<chrono::Utc>,
+) -> SyncApiResult<S3SigningMaterial> {
     let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
     let date = now.format("%Y%m%d").to_string();
     let host = url
         .host_str()
-        .ok_or_else(|| anyhow!("S3 endpoint has no host"))?;
+        .ok_or_else(|| SyncError::InvalidInput("S3 endpoint has no host".to_string()))?;
     let host = match url.port() {
         Some(port) => format!("{host}:{port}"),
         None => host.to_string(),
@@ -388,46 +631,38 @@ fn signed_s3_headers(
         "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
         hex_sha256(canonical_request.as_bytes())
     );
-    let date_key = hmac_sha256(
-        format!("AWS4{}", config.secret_key).as_bytes(),
-        date.as_bytes(),
-    )?;
-    let region_key = hmac_sha256(&date_key, config.region.trim().as_bytes())?;
-    let service_key = hmac_sha256(&region_key, b"s3")?;
-    let signing_key = hmac_sha256(&service_key, b"aws4_request")?;
-    let signature = hex::encode(hmac_sha256(&signing_key, string_to_sign.as_bytes())?);
+    let mut signing_secret = zeroize::Zeroizing::new(String::from("AWS4"));
+    signing_secret.push_str(config.secret_key.expose_secret());
+    let date_key = hmac_sha256(signing_secret.as_bytes(), date.as_bytes())?;
+    let region_key = hmac_sha256(date_key.as_slice(), config.region.trim().as_bytes())?;
+    let service_key = hmac_sha256(region_key.as_slice(), b"s3")?;
+    let signing_key = hmac_sha256(service_key.as_slice(), b"aws4_request")?;
+    let signature_bytes = hmac_sha256(signing_key.as_slice(), string_to_sign.as_bytes())?;
+    let signature = hex::encode(signature_bytes.as_slice());
     let authorization = format!(
         "AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed_headers}, Signature={signature}",
         config.access_key.trim()
     );
-    let mut headers = header::HeaderMap::new();
-    headers.insert("x-amz-date", header_value(&amz_date, "S3 date")?);
-    headers.insert(
-        "x-amz-content-sha256",
-        header_value(&payload_hash, "S3 payload hash")?,
-    );
-    headers.insert(
-        header::AUTHORIZATION,
-        header_value(&authorization, "S3 authorization")?,
-    );
-    if !config.session_token.is_empty() {
-        headers.insert(
-            "x-amz-security-token",
-            header_value(config.session_token.trim(), "S3 session token")?,
-        );
-    }
-    Ok(headers)
+    Ok(S3SigningMaterial {
+        canonical_request,
+        amz_date,
+        payload_hash,
+        authorization,
+    })
 }
 
-fn header_value(value: &str, name: &str) -> Result<header::HeaderValue> {
-    header::HeaderValue::from_str(value).with_context(|| format!("invalid {name}"))
+fn header_value(value: &str, _name: &str) -> SyncApiResult<header::HeaderValue> {
+    header::HeaderValue::from_str(value)
+        .map_err(|_| SyncError::InvalidInput("invalid sync request header".to_string()))
 }
 
-fn hmac_sha256(key: &[u8], value: &[u8]) -> Result<Vec<u8>> {
-    let mut mac =
-        <Hmac<Sha256> as Mac>::new_from_slice(key).map_err(|_| anyhow!("initialize S3 signer"))?;
+fn hmac_sha256(key: &[u8], value: &[u8]) -> SyncApiResult<zeroize::Zeroizing<Vec<u8>>> {
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key)
+        .map_err(|_| SyncError::InvalidInput("unable to initialize S3 signer".to_string()))?;
     mac.update(value);
-    Ok(mac.finalize().into_bytes().to_vec())
+    Ok(zeroize::Zeroizing::new(
+        mac.finalize().into_bytes().to_vec(),
+    ))
 }
 
 fn hex_sha256(value: &[u8]) -> String {
@@ -460,16 +695,78 @@ fn sync_url(endpoint: &str) -> String {
     }
 }
 
-fn encrypt_payload(payload: &SyncPayload, password: &str) -> Result<Vec<u8>> {
+fn sync_http_client() -> SyncApiResult<Client> {
+    Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .map_err(map_reqwest_error)
+}
+
+fn map_reqwest_error(error: reqwest::Error) -> SyncError {
+    if error.is_timeout() {
+        SyncError::Timeout
+    } else {
+        SyncError::Network("sync HTTP request failed".to_string())
+    }
+}
+
+fn map_http_status(status: StatusCode) -> SyncError {
+    match status {
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => SyncError::Unauthorized,
+        StatusCode::NOT_FOUND => SyncError::NotFound,
+        StatusCode::CONFLICT | StatusCode::PRECONDITION_FAILED => SyncError::Conflict,
+        StatusCode::PAYLOAD_TOO_LARGE => SyncError::PayloadTooLarge {
+            limit: MAX_SYNC_PAYLOAD_BYTES,
+        },
+        StatusCode::REQUEST_TIMEOUT => SyncError::Timeout,
+        _ => SyncError::Network(format!("remote HTTP status {}", status.as_u16())),
+    }
+}
+
+fn response_etag(response: &reqwest::Response) -> Option<String> {
+    response
+        .headers()
+        .get(header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+}
+
+async fn read_response_limited(mut response: reqwest::Response) -> SyncApiResult<Vec<u8>> {
+    if let Some(length) = response.content_length()
+        && length > MAX_SYNC_PAYLOAD_BYTES as u64
+    {
+        return Err(SyncError::PayloadTooLarge {
+            limit: MAX_SYNC_PAYLOAD_BYTES,
+        });
+    }
+
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(map_reqwest_error)? {
+        if body.len().saturating_add(chunk.len()) > MAX_SYNC_PAYLOAD_BYTES {
+            return Err(SyncError::PayloadTooLarge {
+                limit: MAX_SYNC_PAYLOAD_BYTES,
+            });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+fn encrypt_payload<T>(payload: &T, password: &str) -> SyncApiResult<Vec<u8>>
+where
+    T: Serialize + ?Sized,
+{
     let mut salt = [0u8; 16];
     let mut nonce = [0u8; 24];
     OsRng.fill_bytes(&mut salt);
     OsRng.fill_bytes(&mut nonce);
     let key = derive_key(password, &salt)?;
-    let plaintext = serde_json::to_vec(payload).context("serialize sync payload")?;
-    let ciphertext = XChaCha20Poly1305::new((&key).into())
+    let plaintext = serde_json::to_vec(payload)
+        .map_err(|_| SyncError::InvalidPayload("serialize sync payload".to_string()))?;
+    let ciphertext = XChaCha20Poly1305::new((&*key).into())
         .encrypt(XNonce::from_slice(&nonce), plaintext.as_ref())
-        .map_err(|_| anyhow!("encrypt sync payload"))?;
+        .map_err(|_| SyncError::InvalidPayload("encrypt sync payload".to_string()))?;
     serde_json::to_vec_pretty(&EncryptedEnvelope {
         format_version: FORMAT_VERSION,
         kdf: "argon2id".to_string(),
@@ -478,64 +775,738 @@ fn encrypt_payload(payload: &SyncPayload, password: &str) -> Result<Vec<u8>> {
         nonce: STANDARD.encode(nonce),
         payload: STANDARD.encode(ciphertext),
     })
-    .context("serialize encrypted sync envelope")
+    .map_err(|_| SyncError::InvalidPayload("serialize sync envelope".to_string()))
 }
 
-fn decrypt_payload(raw: &[u8], password: &str) -> Result<SyncPayload> {
-    let envelope: EncryptedEnvelope =
-        serde_json::from_slice(raw).context("parse encrypted sync envelope")?;
+fn decrypt_payload(raw: &[u8], password: &str) -> SyncApiResult<DecodedSyncPayload> {
+    let envelope: EncryptedEnvelope = serde_json::from_slice(raw)
+        .map_err(|_| SyncError::InvalidPayload("invalid encrypted sync envelope".to_string()))?;
     if envelope.format_version != FORMAT_VERSION
         || envelope.kdf != "argon2id"
         || envelope.cipher != "xchacha20poly1305"
     {
-        return Err(anyhow!("unsupported remote sync format"));
+        return Err(SyncError::InvalidPayload(
+            "unsupported remote sync format".to_string(),
+        ));
     }
-    let salt = STANDARD.decode(envelope.salt).context("decode sync salt")?;
+    let salt = STANDARD
+        .decode(envelope.salt)
+        .map_err(|_| SyncError::InvalidPayload("invalid sync salt".to_string()))?;
     let nonce = STANDARD
         .decode(envelope.nonce)
-        .context("decode sync nonce")?;
+        .map_err(|_| SyncError::InvalidPayload("invalid sync nonce".to_string()))?;
     if nonce.len() != 24 {
-        return Err(anyhow!("invalid sync nonce"));
+        return Err(SyncError::InvalidPayload("invalid sync nonce".to_string()));
     }
     let ciphertext = STANDARD
         .decode(envelope.payload)
-        .context("decode encrypted sync payload")?;
+        .map_err(|_| SyncError::InvalidPayload("invalid encrypted sync payload".to_string()))?;
     let key = derive_key(password, &salt)?;
-    let plaintext = XChaCha20Poly1305::new((&key).into())
+    let plaintext = XChaCha20Poly1305::new((&*key).into())
         .decrypt(XNonce::from_slice(&nonce), ciphertext.as_ref())
-        .map_err(|_| anyhow!("cannot decrypt remote configuration; check the password"))?;
-    let payload: SyncPayload =
-        serde_json::from_slice(&plaintext).context("parse decrypted sync payload")?;
-    if payload.schema_version != FORMAT_VERSION {
-        return Err(anyhow!("unsupported synchronized configuration version"));
-    }
-    Ok(payload)
+        .map_err(|_| SyncError::DecryptFailed)?;
+    payload::decode_payload(&plaintext)
+        .map_err(|_| SyncError::InvalidPayload("invalid synchronized configuration".to_string()))
 }
 
-fn derive_key(password: &str, salt: &[u8]) -> Result<[u8; 32]> {
-    let mut key = [0u8; 32];
+fn derive_key(password: &str, salt: &[u8]) -> SyncApiResult<zeroize::Zeroizing<[u8; 32]>> {
+    let mut key = zeroize::Zeroizing::new([0u8; 32]);
     Argon2::default()
-        .hash_password_into(password.as_bytes(), salt, &mut key)
-        .map_err(|err| anyhow!("derive encryption key: {err}"))?;
+        .hash_password_into(password.as_bytes(), salt, &mut *key)
+        .map_err(|_| SyncError::InvalidPayload("unable to derive encryption key".to_string()))?;
     Ok(key)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::HashMap, time::Duration};
+
     use super::*;
+    use crate::session::config::{ConfigFile, Session};
+    use crate::sync::payload::LegacySyncPayloadV1;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        task::JoinHandle,
+    };
+
+    #[derive(Debug)]
+    struct CapturedRequest {
+        method: String,
+        path: String,
+        headers: HashMap<String, String>,
+        body: Vec<u8>,
+    }
+
+    struct TestResponse {
+        head: String,
+        chunks: Vec<Vec<u8>>,
+        delay: Duration,
+    }
+
+    impl TestResponse {
+        fn empty(status: &str, headers: &[(&str, &str)]) -> Self {
+            let mut head = format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\n");
+            for (name, value) in headers {
+                head.push_str(&format!("{name}: {value}\r\n"));
+            }
+            head.push_str("Connection: close\r\n\r\n");
+            Self {
+                head,
+                chunks: Vec::new(),
+                delay: Duration::ZERO,
+            }
+        }
+
+        fn body(status: &str, headers: &[(&str, &str)], body: Vec<u8>) -> Self {
+            let mut head = format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\n", body.len());
+            for (name, value) in headers {
+                head.push_str(&format!("{name}: {value}\r\n"));
+            }
+            head.push_str("Connection: close\r\n\r\n");
+            Self {
+                head,
+                chunks: vec![body],
+                delay: Duration::ZERO,
+            }
+        }
+    }
+
+    async fn spawn_http_server(
+        responses: Vec<TestResponse>,
+    ) -> (String, JoinHandle<Vec<CapturedRequest>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let mut captured = Vec::with_capacity(responses.len());
+            for response in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut raw = Vec::new();
+                let header_end = loop {
+                    let mut buffer = [0_u8; 4096];
+                    let count = socket.read(&mut buffer).await.unwrap();
+                    assert!(count > 0, "connection closed before request headers");
+                    raw.extend_from_slice(&buffer[..count]);
+                    if let Some(position) = raw.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                        break position + 4;
+                    }
+                };
+                let header_text = String::from_utf8(raw[..header_end].to_vec()).unwrap();
+                let mut lines = header_text.split("\r\n");
+                let request_line = lines.next().unwrap();
+                let mut request_parts = request_line.split_whitespace();
+                let method = request_parts.next().unwrap().to_string();
+                let path = request_parts.next().unwrap().to_string();
+                let headers: HashMap<String, String> = lines
+                    .filter_map(|line| line.split_once(':'))
+                    .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_string()))
+                    .collect();
+                let content_length = headers
+                    .get("content-length")
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or_default();
+                while raw.len() - header_end < content_length {
+                    let mut buffer = [0_u8; 4096];
+                    let count = socket.read(&mut buffer).await.unwrap();
+                    assert!(count > 0, "connection closed before request body");
+                    raw.extend_from_slice(&buffer[..count]);
+                }
+                captured.push(CapturedRequest {
+                    method,
+                    path,
+                    headers,
+                    body: raw[header_end..header_end + content_length].to_vec(),
+                });
+
+                tokio::time::sleep(response.delay).await;
+                if socket.write_all(response.head.as_bytes()).await.is_err() {
+                    continue;
+                }
+                for chunk in response.chunks {
+                    if socket.write_all(&chunk).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            captured
+        });
+        (format!("http://{address}"), task)
+    }
+
+    fn secret_portable_config() -> PortableConfigV2 {
+        let mut session = Session::key(
+            "secret-host.example".to_string(),
+            22,
+            "secret-user".to_string(),
+            "Z:/external/key/path-sentinel".to_string(),
+            "inline-private-key-secret-sentinel".to_string(),
+            "private-key-passphrase-secret-sentinel".to_string(),
+        );
+        session.id = "session-id-sentinel".to_string();
+        session.password = "session-password-secret-sentinel".to_string();
+        session.proxy_type = "https".to_string();
+        session.proxy_host = "session-proxy.example".to_string();
+        session.proxy_port = Some(443);
+        session.proxy_user = "session-proxy-user-secret-sentinel".to_string();
+        session.proxy_password = "session-proxy-password-secret-sentinel".to_string();
+        let config = ConfigFile {
+            sessions: vec![session],
+            use_proxy: true,
+            global_proxy_type: "socks5".to_string(),
+            global_proxy_host: "global-proxy.example".to_string(),
+            global_proxy_port: Some(1080),
+            global_proxy_user: "global-proxy-user-secret-sentinel".to_string(),
+            global_proxy_password: "global-proxy-password-secret-sentinel".to_string(),
+            ..Default::default()
+        };
+        PortableConfigV2::from(&config)
+    }
+
+    fn r2_credentials(account_id: &str) -> SyncCredentials {
+        SyncCredentials {
+            backend: SyncBackendCredentials::R2 {
+                account_id: account_id.to_string(),
+                bucket: "sync-bucket".to_string(),
+                object_key: "configs/jshell-sync.json".to_string(),
+                access_key_id: "r2-access-key-sentinel".to_string(),
+                secret_access_key: SecretString::new("r2-secret-key-sentinel".to_string()),
+            },
+            encryption_password: "correct horse battery staple".to_string(),
+        }
+    }
+
+    fn s3_credentials(endpoint: String) -> SyncCredentials {
+        SyncCredentials {
+            backend: SyncBackendCredentials::S3 {
+                endpoint,
+                region: "test-region".to_string(),
+                bucket: "sync-bucket".to_string(),
+                object_key: "configs/jshell-sync.json".to_string(),
+                access_key: "s3-access-key-sentinel".to_string(),
+                secret_key: "s3-secret-key-sentinel".to_string(),
+                session_token: String::new(),
+            },
+            encryption_password: "correct horse battery staple".to_string(),
+        }
+    }
+
+    fn assert_secret_string(_: &SecretString) {}
 
     #[test]
-    fn encrypted_payload_round_trip() {
-        let payload = SyncPayload::new("test-device".into(), Vec::new());
+    fn s3_transport_keeps_secret_key_in_zeroizing_storage() {
+        let credentials = s3_credentials("https://s3.example.test".to_string());
+        let config = S3Config::from_backend(&credentials.backend).unwrap();
+
+        assert_secret_string(&config.secret_key);
+    }
+
+    fn assert_zeroizing_vec(_: &zeroize::Zeroizing<Vec<u8>>) {}
+
+    fn assert_zeroizing_key(_: &zeroize::Zeroizing<[u8; 32]>) {}
+
+    #[test]
+    fn derived_signing_and_encryption_keys_use_zeroizing_storage() {
+        let hmac_key = hmac_sha256(b"key", b"value").unwrap();
+        let encryption_key = derive_key("password", b"0123456789abcdef").unwrap();
+
+        assert_zeroizing_vec(&hmac_key);
+        assert_zeroizing_key(&encryption_key);
+    }
+
+    #[tokio::test]
+    async fn connection_test_sends_head_and_never_put() {
+        let (endpoint, server) = spawn_http_server(vec![TestResponse::empty(
+            "200 OK",
+            &[("ETag", "\"connection-etag\"")],
+        )])
+        .await;
+
+        let state = test_connection(s3_credentials(endpoint)).await.unwrap();
+        let requests = server.await.unwrap();
+
+        assert_eq!(
+            state,
+            RemoteObjectState::Exists {
+                etag: Some("\"connection-etag\"".to_string())
+            }
+        );
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "HEAD");
+        assert_eq!(requests[0].path, "/sync-bucket/configs/jshell-sync.json");
+        assert!(requests[0].body.is_empty());
+        assert!(requests[0].headers.contains_key("authorization"));
+    }
+
+    #[tokio::test]
+    async fn confirm_overwrite_heads_then_puts_with_the_observed_etag() {
+        let (endpoint, server) = spawn_http_server(vec![
+            TestResponse::empty("200 OK", &[("ETag", "\"observed-etag\"")]),
+            TestResponse::empty("200 OK", &[("ETag", "\"new-etag\"")]),
+        ])
+        .await;
+
+        let etag = confirm_overwrite(
+            s3_credentials(endpoint),
+            SyncPayloadV2::new(secret_portable_config()),
+        )
+        .await
+        .unwrap();
+        let requests = server.await.unwrap();
+
+        assert_eq!(etag.as_deref(), Some("\"new-etag\""));
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].method, "HEAD");
+        assert_eq!(requests[1].method, "PUT");
+        assert_eq!(
+            requests[1].headers.get("if-match").map(String::as_str),
+            Some("\"observed-etag\"")
+        );
+        assert!(!requests[1].headers.contains_key("if-none-match"));
+        assert!(!requests[1].body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn confirm_overwrite_returns_conflict_after_the_second_request_without_retrying() {
+        let (endpoint, server) = spawn_http_server(vec![
+            TestResponse::empty("200 OK", &[("ETag", "\"observed-etag\"")]),
+            TestResponse::empty("412 Precondition Failed", &[]),
+        ])
+        .await;
+
+        let result = confirm_overwrite(
+            s3_credentials(endpoint),
+            SyncPayloadV2::new(secret_portable_config()),
+        )
+        .await;
+        let requests = server.await.unwrap();
+
+        assert!(matches!(result, Err(SyncError::Conflict)));
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].method, "HEAD");
+        assert_eq!(requests[1].method, "PUT");
+        assert_eq!(
+            requests[1].headers.get("if-match").map(String::as_str),
+            Some("\"observed-etag\"")
+        );
+        assert!(!requests[1].headers.contains_key("if-none-match"));
+    }
+
+    #[tokio::test]
+    async fn first_upload_uses_if_none_match() {
+        let (endpoint, server) = spawn_http_server(vec![TestResponse::empty("200 OK", &[])]).await;
+
+        let etag = upload(
+            s3_credentials(endpoint),
+            SyncPayloadV2::new(secret_portable_config()),
+            None,
+        )
+        .await
+        .unwrap();
+        let requests = server.await.unwrap();
+
+        assert_eq!(etag, None);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "PUT");
+        assert_eq!(
+            requests[0].headers.get("if-none-match").map(String::as_str),
+            Some("*")
+        );
+        assert!(!requests[0].headers.contains_key("if-match"));
+    }
+
+    #[tokio::test]
+    async fn known_upload_uses_if_match() {
+        let (endpoint, server) = spawn_http_server(vec![TestResponse::empty("200 OK", &[])]).await;
+
+        upload(
+            s3_credentials(endpoint),
+            SyncPayloadV2::new(secret_portable_config()),
+            Some("\"known-etag\"".to_string()),
+        )
+        .await
+        .unwrap();
+        let requests = server.await.unwrap();
+
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "PUT");
+        assert_eq!(
+            requests[0].headers.get("if-match").map(String::as_str),
+            Some("\"known-etag\"")
+        );
+        assert!(!requests[0].headers.contains_key("if-none-match"));
+    }
+
+    #[tokio::test]
+    async fn oversized_encrypted_upload_is_rejected_before_transport() {
+        let mut portable = secret_portable_config();
+        portable.sessions[0].private_key_inline = "x".repeat(MAX_SYNC_PAYLOAD_BYTES);
+
+        let result = upload(
+            s3_credentials("http://127.0.0.1:0".to_string()),
+            SyncPayloadV2::new(portable),
+            None,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(SyncError::PayloadTooLarge {
+                limit: MAX_SYNC_PAYLOAD_BYTES
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn oversized_chunked_download_is_stopped_at_eight_mib() {
+        let response = TestResponse {
+            head: "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_string(),
+            chunks: vec![
+                vec![0_u8; 4 * 1024 * 1024],
+                vec![0_u8; 4 * 1024 * 1024],
+                vec![0_u8; 1],
+            ],
+            delay: Duration::ZERO,
+        };
+        let (endpoint, server) = spawn_http_server(vec![response]).await;
+
+        let result = download(s3_credentials(endpoint)).await;
+        let requests = server.await.unwrap();
+
+        assert!(matches!(
+            result,
+            Err(SyncError::PayloadTooLarge {
+                limit: MAX_SYNC_PAYLOAD_BYTES
+            })
+        ));
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "GET");
+    }
+
+    #[tokio::test]
+    async fn conflict_is_never_retried_without_confirmation() {
+        let (endpoint, server) =
+            spawn_http_server(vec![TestResponse::empty("412 Precondition Failed", &[])]).await;
+
+        let result = upload(
+            s3_credentials(endpoint),
+            SyncPayloadV2::new(secret_portable_config()),
+            None,
+        )
+        .await;
+        let requests = server.await.unwrap();
+
+        assert!(matches!(result, Err(SyncError::Conflict)));
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "PUT");
+    }
+
+    #[tokio::test]
+    async fn confirm_overwrite_missing_object_uses_if_none_match() {
+        let (endpoint, server) = spawn_http_server(vec![
+            TestResponse::empty("404 Not Found", &[]),
+            TestResponse::empty("200 OK", &[]),
+        ])
+        .await;
+
+        confirm_overwrite(
+            s3_credentials(endpoint),
+            SyncPayloadV2::new(secret_portable_config()),
+        )
+        .await
+        .unwrap();
+        let requests = server.await.unwrap();
+
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].method, "HEAD");
+        assert_eq!(requests[1].method, "PUT");
+        assert_eq!(
+            requests[1].headers.get("if-none-match").map(String::as_str),
+            Some("*")
+        );
+        assert!(!requests[1].headers.contains_key("if-match"));
+    }
+
+    #[tokio::test]
+    async fn unauthorized_http_status_is_typed() {
+        for status in ["401 Unauthorized", "403 Forbidden"] {
+            let (endpoint, server) =
+                spawn_http_server(vec![TestResponse::empty(status, &[])]).await;
+
+            let result = test_connection(s3_credentials(endpoint)).await;
+            let requests = server.await.unwrap();
+
+            assert!(matches!(result, Err(SyncError::Unauthorized)));
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].method, "HEAD");
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_connection_test_is_remote_missing() {
+        let (endpoint, server) =
+            spawn_http_server(vec![TestResponse::empty("404 Not Found", &[])]).await;
+
+        let result = test_connection(s3_credentials(endpoint)).await.unwrap();
+        let requests = server.await.unwrap();
+
+        assert_eq!(result, RemoteObjectState::Missing);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "HEAD");
+    }
+
+    #[tokio::test]
+    async fn missing_download_is_typed_not_found() {
+        let (endpoint, server) =
+            spawn_http_server(vec![TestResponse::empty("404 Not Found", &[])]).await;
+
+        let result = download(s3_credentials(endpoint)).await;
+        let requests = server.await.unwrap();
+
+        assert!(matches!(result, Err(SyncError::NotFound)));
+        assert_eq!(requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn slow_response_is_typed_timeout() {
+        let response = TestResponse {
+            head: "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+            chunks: Vec::new(),
+            delay: Duration::from_millis(300),
+        };
+        let (endpoint, server) = spawn_http_server(vec![response]).await;
+
+        let result = download(s3_credentials(endpoint)).await;
+        let requests = server.await.unwrap();
+
+        assert!(matches!(result, Err(SyncError::Timeout)));
+        assert_eq!(requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn wrong_password_is_typed_decrypt_failed() {
+        let encrypted = encrypt_payload(
+            &SyncPayloadV2::new(secret_portable_config()),
+            "server encryption password",
+        )
+        .unwrap();
+        let (endpoint, server) =
+            spawn_http_server(vec![TestResponse::body("200 OK", &[], encrypted)]).await;
+
+        let result = download(s3_credentials(endpoint)).await;
+        let requests = server.await.unwrap();
+
+        assert!(matches!(result, Err(SyncError::DecryptFailed)));
+        assert_eq!(requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn malformed_envelope_is_typed_invalid_payload() {
+        let sentinel = "response-secret-must-not-leak";
+        let (endpoint, server) = spawn_http_server(vec![TestResponse::body(
+            "200 OK",
+            &[],
+            format!("{{\"{sentinel}\":").into_bytes(),
+        )])
+        .await;
+
+        let result = download(s3_credentials(endpoint)).await;
+        let requests = server.await.unwrap();
+        let error = result.unwrap_err();
+
+        assert!(matches!(error, SyncError::InvalidPayload(_)));
+        assert!(!format!("{error} {error:?}").contains(sentinel));
+        assert_eq!(requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn decryptable_unknown_schema_is_typed_invalid_payload() {
+        let encrypted = encrypt_payload(
+            &serde_json::json!({
+                "schema_version": 99,
+                "secret": "decrypted-secret-must-not-leak"
+            }),
+            "correct horse battery staple",
+        )
+        .unwrap();
+        let (endpoint, server) =
+            spawn_http_server(vec![TestResponse::body("200 OK", &[], encrypted)]).await;
+
+        let result = download(s3_credentials(endpoint)).await;
+        let requests = server.await.unwrap();
+        let error = result.unwrap_err();
+
+        assert!(matches!(error, SyncError::InvalidPayload(_)));
+        assert!(!format!("{error} {error:?}").contains("decrypted-secret-must-not-leak"));
+        assert_eq!(requests.len(), 1);
+    }
+
+    #[test]
+    fn r2_endpoint_is_https_and_uses_region_auto() {
+        let credentials = r2_credentials("0123456789abcdef0123456789abcdef");
+        validate_credentials(&credentials).unwrap();
+        let config = S3Config::from_backend(&credentials.backend).unwrap();
+        let url = s3_url(&config).unwrap();
+        let headers = signed_s3_headers("HEAD", &url, &[], &config).unwrap();
+        let authorization = headers
+            .get(header::AUTHORIZATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+
+        assert_eq!(url.scheme(), "https");
+        assert_eq!(
+            url.as_str(),
+            "https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com/\
+             sync-bucket/configs/jshell-sync.json"
+                .replace(char::is_whitespace, "")
+        );
+        assert!(authorization.contains("/auto/s3/aws4_request"));
+        assert!(headers.get("x-amz-security-token").is_none());
+    }
+
+    #[test]
+    fn fixed_aws_sigv4_vector_matches_canonical_request_hash_and_authorization() {
+        let config = S3Config {
+            endpoint: "https://examplebucket.s3.amazonaws.com".to_string(),
+            region: "us-east-1".to_string(),
+            bucket: "examplebucket".to_string(),
+            object_key: "test.txt".to_string(),
+            access_key: "AKIAIOSFODNN7EXAMPLE".to_string(),
+            secret_key: SecretString::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
+            session_token: String::new(),
+        };
+        let url = reqwest::Url::parse("https://examplebucket.s3.amazonaws.com/test.txt").unwrap();
+        let now = chrono::DateTime::parse_from_rfc3339("2013-05-24T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let material = s3_signing_material("GET", &url, &[], &config, now).unwrap();
+        let headers = signed_s3_headers_at("GET", &url, &[], &config, now).unwrap();
+
+        let expected_canonical_request = concat!(
+            "GET\n",
+            "/test.txt\n",
+            "\n",
+            "host:examplebucket.s3.amazonaws.com\n",
+            "x-amz-content-sha256:",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n",
+            "x-amz-date:20130524T000000Z\n",
+            "\n",
+            "host;x-amz-content-sha256;x-amz-date\n",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(material.canonical_request, expected_canonical_request);
+        assert_eq!(
+            hex_sha256(material.canonical_request.as_bytes()),
+            "e155673fa5bcd4b855a77a15b98fce3d10f286f93a203d6d98d2eb51f885f9b7"
+        );
+        assert_eq!(
+            headers
+                .get(header::AUTHORIZATION)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            concat!(
+                "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/",
+                "20130524/us-east-1/s3/aws4_request, ",
+                "SignedHeaders=host;x-amz-content-sha256;x-amz-date, ",
+                "Signature=df548e2ce037944d03f3e68682813b093763996d597cf890ca3d9037fd231eb4"
+            )
+        );
+        assert_eq!(
+            headers.get("x-amz-content-sha256").unwrap(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(headers.get("x-amz-date").unwrap(), "20130524T000000Z");
+    }
+
+    #[test]
+    fn r2_account_id_must_be_exactly_32_ascii_hex_characters() {
+        for invalid in [
+            "0123456789abcdef0123456789abcde",
+            "0123456789abcdef0123456789abcdef0",
+            "0123456789abcdef0123456789abcdeg",
+            "0123456789abcdef0123456789abcdeé",
+        ] {
+            assert!(matches!(
+                validate_credentials(&r2_credentials(invalid)),
+                Err(SyncError::InvalidInput(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn encryption_password_minimum_length_counts_unicode_characters() {
+        let mut credentials = r2_credentials("0123456789abcdef0123456789abcdef");
+        credentials.encryption_password = "密码只有七位吗".to_string();
+
+        assert!(matches!(
+            validate_credentials(&credentials),
+            Err(SyncError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn v2_encrypted_payload_round_trip_is_decoded_as_v2() {
+        let payload = SyncPayloadV2::new(secret_portable_config());
         let encrypted = encrypt_payload(&payload, "correct horse battery staple").unwrap();
-        assert!(!String::from_utf8_lossy(&encrypted).contains("test-device"));
         let decrypted = decrypt_payload(&encrypted, "correct horse battery staple").unwrap();
+
+        let DecodedSyncPayload::V2(decrypted) = decrypted else {
+            panic!("expected schema v2 payload");
+        };
         assert_eq!(decrypted.revision, payload.revision);
+        assert_eq!(decrypted.schema_version, 2);
+        assert_eq!(decrypted.portable_config.sessions.len(), 1);
+    }
+
+    #[test]
+    fn legacy_v1_envelope_is_decoded_as_legacy_v1() {
+        let payload = LegacySyncPayloadV1 {
+            schema_version: 1,
+            revision: "legacy-revision".to_string(),
+            updated_at: "2026-08-01T00:00:00Z".to_string(),
+            device_id: "legacy-device-id".to_string(),
+            sessions: secret_portable_config().sessions,
+        };
+        let encrypted = encrypt_payload(&payload, "correct horse battery staple").unwrap();
+
+        let decrypted = decrypt_payload(&encrypted, "correct horse battery staple").unwrap();
+
+        let DecodedSyncPayload::LegacyV1(decrypted) = decrypted else {
+            panic!("expected legacy schema v1 payload");
+        };
+        assert_eq!(decrypted.revision, "legacy-revision");
+        assert_eq!(decrypted.device_id, "legacy-device-id");
+        assert_eq!(decrypted.sessions.len(), 1);
+    }
+
+    #[test]
+    fn encrypted_envelope_keeps_format_v1_and_contains_no_plaintext_secrets() {
+        let payload = SyncPayloadV2::new(secret_portable_config());
+        let encrypted = encrypt_payload(&payload, "correct horse battery staple").unwrap();
+        let envelope: serde_json::Value = serde_json::from_slice(&encrypted).unwrap();
+
+        assert_eq!(envelope["format_version"], 1);
+        assert_eq!(envelope["kdf"], "argon2id");
+        assert_eq!(envelope["cipher"], "xchacha20poly1305");
+        let serialized = String::from_utf8(encrypted).unwrap();
+        for secret in [
+            "session-password-secret-sentinel",
+            "inline-private-key-secret-sentinel",
+            "private-key-passphrase-secret-sentinel",
+            "session-proxy-user-secret-sentinel",
+            "session-proxy-password-secret-sentinel",
+            "global-proxy-user-secret-sentinel",
+            "global-proxy-password-secret-sentinel",
+        ] {
+            assert!(!serialized.contains(secret));
+        }
     }
 
     #[test]
     fn wrong_password_is_rejected() {
-        let payload = SyncPayload::new("test-device".into(), Vec::new());
+        let payload = SyncPayloadV2::new(secret_portable_config());
         let encrypted = encrypt_payload(&payload, "correct horse battery staple").unwrap();
         assert!(decrypt_payload(&encrypted, "incorrect password").is_err());
     }
@@ -560,7 +1531,7 @@ mod tests {
             bucket: "my-bucket".into(),
             object_key: "configs/my file.json".into(),
             access_key: "access".into(),
-            secret_key: "secret".into(),
+            secret_key: SecretString::new("secret".into()),
             session_token: String::new(),
         };
         assert_eq!(

@@ -16,7 +16,11 @@ use std::{
     collections::{HashMap, HashSet},
     ops::Range,
     rc::Rc,
-    sync::mpsc,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
     time::{Duration, Instant},
 };
 
@@ -61,6 +65,60 @@ pub(crate) fn format_window_title(
         .unwrap_or_else(|| "JShell".to_string())
 }
 
+struct GlobalProxyFormValues {
+    proxy_type: String,
+    host: String,
+    port: String,
+    user: String,
+    password: String,
+}
+
+fn global_proxy_form_values(config: &ConfigStore) -> GlobalProxyFormValues {
+    GlobalProxyFormValues {
+        proxy_type: config.global_proxy_type().to_string(),
+        host: config.global_proxy_host().to_string(),
+        port: config
+            .global_proxy_port()
+            .map(|port| port.to_string())
+            .unwrap_or_default(),
+        user: config.global_proxy_user().to_string(),
+        password: config.global_proxy_password().to_string(),
+    }
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct ConfigWriteCoordinator {
+    lock: Arc<Mutex<()>>,
+    latest_preference_sequence: Arc<AtomicU64>,
+}
+
+impl ConfigWriteCoordinator {
+    pub(crate) fn begin_preference_save(&self) -> u64 {
+        self.latest_preference_sequence
+            .fetch_add(1, Ordering::SeqCst)
+            + 1
+    }
+
+    pub(crate) fn run_preference_save<R>(
+        &self,
+        sequence: u64,
+        write: impl FnOnce() -> R,
+    ) -> Option<R> {
+        let _guard = self.lock.lock().unwrap_or_else(|error| error.into_inner());
+        if sequence < self.latest_preference_sequence.load(Ordering::SeqCst) {
+            return None;
+        }
+        Some(write())
+    }
+
+    pub(crate) fn run_exclusive<R>(&self, write: impl FnOnce() -> R) -> R {
+        self.latest_preference_sequence
+            .fetch_add(1, Ordering::SeqCst);
+        let _guard = self.lock.lock().unwrap_or_else(|error| error.into_inner());
+        write()
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct TabGroup {
     pub(crate) id: String,
@@ -72,7 +130,8 @@ pub(crate) struct TabGroup {
 
 #[cfg(test)]
 mod window_title_tests {
-    use super::format_window_title;
+    use super::{ConfigWriteCoordinator, format_window_title, global_proxy_form_values};
+    use crate::session::config::ConfigStore;
 
     #[test]
     fn document_title_uses_only_the_file_name_and_dirty_marker() {
@@ -89,6 +148,39 @@ mod window_title_tests {
             "JShell - production"
         );
         assert_eq!(format_window_title(None, None), "JShell");
+    }
+
+    #[test]
+    fn loaded_global_proxy_values_are_ready_to_refresh_the_settings_form() {
+        let mut config = ConfigStore::in_memory();
+        config.set_global_proxy_type("https".to_string());
+        config.set_global_proxy_host("proxy.example.test".to_string());
+        config.set_global_proxy_port(Some(8443));
+        config.set_global_proxy_user("proxy-user".to_string());
+        config.set_global_proxy_password("proxy-password".to_string());
+
+        let values = global_proxy_form_values(&config);
+
+        assert_eq!(values.proxy_type, "https");
+        assert_eq!(values.host, "proxy.example.test");
+        assert_eq!(values.port, "8443");
+        assert_eq!(values.user, "proxy-user");
+        assert_eq!(values.password, "proxy-password");
+    }
+
+    #[test]
+    fn exclusive_config_write_invalidates_an_older_preference_save() {
+        let coordinator = ConfigWriteCoordinator::default();
+        let stale_sequence = coordinator.begin_preference_save();
+        let writes = std::sync::Mutex::new(Vec::new());
+
+        coordinator.run_exclusive(|| writes.lock().unwrap().push("sync"));
+        let stale_result = coordinator.run_preference_save(stale_sequence, || {
+            writes.lock().unwrap().push("stale-preferences")
+        });
+
+        assert!(stale_result.is_none());
+        assert_eq!(*writes.lock().unwrap(), vec!["sync"]);
     }
 }
 
@@ -196,7 +288,15 @@ pub(crate) struct Ashell {
     pub(crate) sync_s3_access_key_input: Entity<InputState>,
     pub(crate) sync_s3_secret_key_input: Entity<InputState>,
     pub(crate) sync_s3_session_token_input: Entity<InputState>,
+    pub(crate) sync_r2_account_id_input: Entity<InputState>,
+    pub(crate) sync_r2_bucket_input: Entity<InputState>,
+    pub(crate) sync_r2_object_key_input: Entity<InputState>,
+    pub(crate) sync_r2_access_key_id_input: Entity<InputState>,
+    pub(crate) sync_r2_secret_access_key_input: Entity<InputState>,
     pub(crate) sync_encryption_password_input: Entity<InputState>,
+    pub(crate) sync_provider: String,
+    pub(crate) sync_remember_encryption_password: bool,
+    pub(crate) sync_ui_state: crate::app::config_sync::SyncUiState,
     pub(crate) sync_in_progress: bool,
     pub(crate) sync_status: SharedString,
     pub(crate) sftp_path_input: Entity<InputState>,
@@ -255,6 +355,7 @@ pub(crate) struct Ashell {
     pub(crate) pane_root: PaneLayout,
     pub(crate) focused_pane_path: Vec<usize>,
     pub(crate) terminal_panel_bounds: Option<Bounds<Pixels>>,
+    pub(crate) split_container_bounds: HashMap<Vec<usize>, Bounds<Pixels>>,
     pub(crate) terminal_bounds: HashMap<String, Bounds<Pixels>>,
     pub(crate) terminal_selecting: bool,
     pub(crate) dragging_splitter: Option<(Vec<usize>, usize)>, // (parent_path, child_index)
@@ -309,8 +410,7 @@ pub(crate) struct Ashell {
     pub(crate) hovered_url: Option<HoveredUrl>,
     pub(crate) terminal_link_ctrl_pressed: bool,
     pub(crate) _subscriptions: Vec<gpui::Subscription>,
-    pub(crate) save_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
-    pub(crate) save_latest_seq: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) config_writes: ConfigWriteCoordinator,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -408,6 +508,44 @@ impl Ashell {
             config,
             error: startup_config_error,
         } = startup_config;
+        let sync_provider = config.sync_backend().to_string();
+        let sync_remember_encryption_password = config.sync_remember_encryption_password();
+        let mut sync_r2_secret_access_key = String::new();
+        let mut sync_encryption_password = String::new();
+        let mut sync_credential_load_error = None;
+        if let Some(target_id) = config.sync_target_id() {
+            let credential_store = crate::sync::PlatformSyncCredentialStore::new();
+            if sync_provider == "r2" {
+                match crate::sync::SyncCredentialStore::load_r2_secret(
+                    &credential_store,
+                    &target_id,
+                ) {
+                    Ok(Some(secret)) => {
+                        sync_r2_secret_access_key = secret.expose_secret().to_string()
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        sync_credential_load_error =
+                            Some(crate::app::config_sync::sync_error_message(&error))
+                    }
+                }
+            }
+            if sync_remember_encryption_password {
+                match crate::sync::SyncCredentialStore::load_encryption_password(
+                    &credential_store,
+                    &target_id,
+                ) {
+                    Ok(Some(password)) => {
+                        sync_encryption_password = password.expose_secret().to_string()
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        sync_credential_load_error =
+                            Some(crate::app::config_sync::sync_error_message(&error))
+                    }
+                }
+            }
+        }
         let host_input = cx.new(|cx| InputState::new(window, cx).placeholder(t!("host")));
         let session_name_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("name (optional)"));
@@ -530,10 +668,37 @@ impl Ashell {
                 .placeholder(t!("sync_s3_session_token").to_string())
                 .masked(true)
         });
+        let sync_r2_account_id_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("R2 account ID")
+                .default_value(config.sync_r2_account_id())
+        });
+        let sync_r2_bucket_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("R2 bucket")
+                .default_value(config.sync_r2_bucket())
+        });
+        let sync_r2_object_key_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("jshell-sync.json")
+                .default_value(config.sync_r2_object_key())
+        });
+        let sync_r2_access_key_id_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("R2 access key ID")
+                .default_value(config.sync_r2_access_key_id())
+        });
+        let sync_r2_secret_access_key_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("R2 secret access key")
+                .masked(true)
+                .default_value(sync_r2_secret_access_key)
+        });
         let sync_encryption_password_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder(t!("sync_encryption_password").to_string())
                 .masked(true)
+                .default_value(sync_encryption_password)
         });
 
         let _subscriptions = vec![
@@ -566,6 +731,15 @@ impl Ashell {
             cx.subscribe_in(&sync_s3_access_key_input, window, Self::on_input_event),
             cx.subscribe_in(&sync_s3_secret_key_input, window, Self::on_input_event),
             cx.subscribe_in(&sync_s3_session_token_input, window, Self::on_input_event),
+            cx.subscribe_in(&sync_r2_account_id_input, window, Self::on_input_event),
+            cx.subscribe_in(&sync_r2_bucket_input, window, Self::on_input_event),
+            cx.subscribe_in(&sync_r2_object_key_input, window, Self::on_input_event),
+            cx.subscribe_in(&sync_r2_access_key_id_input, window, Self::on_input_event),
+            cx.subscribe_in(
+                &sync_r2_secret_access_key_input,
+                window,
+                Self::on_input_event,
+            ),
             cx.subscribe_in(
                 &sync_encryption_password_input,
                 window,
@@ -647,9 +821,19 @@ impl Ashell {
             sync_s3_access_key_input,
             sync_s3_secret_key_input,
             sync_s3_session_token_input,
+            sync_r2_account_id_input,
+            sync_r2_bucket_input,
+            sync_r2_object_key_input,
+            sync_r2_access_key_id_input,
+            sync_r2_secret_access_key_input,
             sync_encryption_password_input,
+            sync_provider,
+            sync_remember_encryption_password,
+            sync_ui_state: crate::app::config_sync::SyncUiState::default(),
             sync_in_progress: false,
-            sync_status: t!("sync_not_run").into(),
+            sync_status: sync_credential_load_error
+                .map(|error| format!("{}: {error}", t!("sync_failed")).into())
+                .unwrap_or_else(|| t!("sync_not_run").into()),
             sftp_path_input,
             ssh_auth_method: AuthMethod::Password,
             ssh_config_entries: crate::session::ssh_config::parse_ssh_config().unwrap_or_default(),
@@ -689,6 +873,7 @@ impl Ashell {
             pane_root: PaneLayout::empty(),
             focused_pane_path: Vec::new(),
             terminal_panel_bounds: None,
+            split_container_bounds: HashMap::new(),
             selector_selection: 0,
             workspace_panels,
             body_panels,
@@ -774,8 +959,7 @@ impl Ashell {
             hovered_url: None,
             terminal_link_ctrl_pressed: false,
             _subscriptions,
-            save_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
-            save_latest_seq: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            config_writes: ConfigWriteCoordinator::default(),
         };
 
         this.apply_theme_preferences(window, cx);
@@ -805,10 +989,23 @@ impl Ashell {
         self.show_hidden_files = self.config.show_hidden_files();
         self.sftp_panel_minimized = self.config.sftp_panel_minimized();
         self.sidebar_collapsed = self.config.sidebar_collapsed();
+        let locale = self.config.locale().to_string();
+        self.apply_runtime_display_language(&locale, window, cx);
         // Apply theme preferences
         self.apply_theme_preferences(window, cx);
 
         // Update inputs
+        let proxy = global_proxy_form_values(&self.config);
+        self.global_proxy_type = proxy.proxy_type;
+        Self::set_input_value(&self.global_proxy_host_input, proxy.host, window, cx);
+        Self::set_input_value(&self.global_proxy_port_input, proxy.port, window, cx);
+        Self::set_input_value(&self.global_proxy_user_input, proxy.user, window, cx);
+        Self::set_input_value(
+            &self.global_proxy_password_input,
+            proxy.password,
+            window,
+            cx,
+        );
         Self::set_input_value(
             &self.sync_endpoint_input,
             self.config.sync_endpoint().to_string(),
@@ -845,6 +1042,32 @@ impl Ashell {
             window,
             cx,
         );
+        Self::set_input_value(
+            &self.sync_r2_account_id_input,
+            self.config.sync_r2_account_id().to_string(),
+            window,
+            cx,
+        );
+        Self::set_input_value(
+            &self.sync_r2_bucket_input,
+            self.config.sync_r2_bucket().to_string(),
+            window,
+            cx,
+        );
+        Self::set_input_value(
+            &self.sync_r2_object_key_input,
+            self.config.sync_r2_object_key().to_string(),
+            window,
+            cx,
+        );
+        Self::set_input_value(
+            &self.sync_r2_access_key_id_input,
+            self.config.sync_r2_access_key_id().to_string(),
+            window,
+            cx,
+        );
+        self.sync_provider = self.config.sync_backend().to_string();
+        self.sync_remember_encryption_password = self.config.sync_remember_encryption_password();
 
         // Notify
         cx.notify();
@@ -857,6 +1080,10 @@ impl Ashell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if matches!(event, InputEvent::Change) && self.is_sync_input(input) {
+            crate::app::config_sync::invalidate_pending_sync_actions(&mut self.sync_ui_state);
+            self.sync_status = t!("sync_not_run").into();
+        }
         if input == &self.sftp_path_input {
             if let InputEvent::PressEnter { .. } = event {
                 let path = self
@@ -915,22 +1142,24 @@ impl Ashell {
     pub(crate) fn save_preferences_background(&mut self) {
         let local_config = self.config.cache.clone();
         let config_store = self.config.clone();
-        let latest_seq = self.save_latest_seq.clone();
-        let current_seq = latest_seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-        let save_lock = self.save_lock.clone();
+        let coordinator = self.config_writes.clone();
+        let current_seq = coordinator.begin_preference_save();
 
         self.runtime.spawn(async move {
-            let _guard = save_lock.lock().await;
-            if current_seq < latest_seq.load(std::sync::atomic::Ordering::SeqCst) {
-                return;
-            }
             let _ = tokio::task::spawn_blocking(move || {
-                if let Err(err) = config_store.save_merged_preferences(local_config) {
+                if let Some(Err(err)) = coordinator.run_preference_save(current_seq, || {
+                    config_store.save_merged_preferences(local_config)
+                }) {
                     tracing::error!("failed to save merged preferences in background: {err:#}");
                 }
             })
             .await;
         });
+    }
+
+    pub(crate) fn save_config_now(&mut self) -> anyhow::Result<()> {
+        let coordinator = self.config_writes.clone();
+        coordinator.run_exclusive(|| self.config.save())
     }
 
     pub(crate) fn start_event_pump(&self, cx: &mut Context<Self>) {
@@ -1332,35 +1561,15 @@ impl Ashell {
                     }
                 }
                 BackendEvent::SyncFinished(result) => {
-                    self.sync_in_progress = false;
-                    match result {
-                        crate::sync::SyncResult::Uploaded { etag } => {
-                            if etag.is_some() {
-                                self.config.set_sync_etag(etag);
-                            }
-                            self.sync_status = t!("sync_upload_complete").into();
-                            let _ = self.config.save();
-                        }
-                        crate::sync::SyncResult::Downloaded { payload, etag } => {
-                            self.config.replace_sessions(payload.sessions);
-                            self.config.set_sync_etag(etag);
-                            match self.config.save() {
-                                Ok(()) => self.sync_status = t!("sync_download_complete").into(),
-                                Err(err) => {
-                                    self.sync_status =
-                                        format!("{}: {err:#}", t!("sync_failed")).into()
-                                }
-                            }
-                        }
-                        crate::sync::SyncResult::Failed(error) => {
-                            self.sync_status = format!("{}: {error}", t!("sync_failed")).into();
-                        }
-                    }
+                    self.handle_sync_finished(*result);
                 }
             }
         }
         if transfers_changed {
             self.config.set_transfers(self.transfers.clone());
+            if let Err(err) = self.save_config_now() {
+                tracing::error!("failed to save transfers: {err:#}");
+            }
         }
         changed
     }
@@ -1451,6 +1660,9 @@ impl Ashell {
     pub(crate) fn remove_transfer(&mut self, transfer_id: &str, cx: &mut Context<Self>) {
         self.transfers.retain(|t| t.info.id != transfer_id);
         self.config.set_transfers(self.transfers.clone());
+        if let Err(err) = self.save_config_now() {
+            tracing::error!("failed to save transfers: {err:#}");
+        }
         cx.notify();
     }
 
@@ -1622,8 +1834,6 @@ impl Ashell {
         };
         let size = bounds.size;
         if size.width.as_f32() > 400.0 && size.height.as_f32() > 300.0 {
-            self.save_latest_seq
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let mut config = self.config.clone();
             let saved_bounds = match current_bounds {
                 gpui::WindowBounds::Fullscreen(b) => {
@@ -1703,7 +1913,8 @@ impl Ashell {
             config.set_layout_state(Some(saved_bounds), Some(workspace_sizes), Some(body_sizes));
             config.set_sidebar_collapsed(self.sidebar_collapsed);
             config.set_sftp_panel_minimized(self.sftp_panel_minimized);
-            let _ = config.save();
+            let coordinator = self.config_writes.clone();
+            let _ = coordinator.run_exclusive(|| config.save());
         } else {
             tracing::warn!(
                 "[ui] window size is too small ({:?}), skipping save layout state to prevent corrupting saved bounds.",

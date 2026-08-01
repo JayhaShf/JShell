@@ -47,6 +47,10 @@ fn open_completed_download_target(target: &str) {
     }
 }
 
+fn about_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
 impl Ashell {
     pub(crate) fn show_window_close_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let documents: Vec<(String, String)> = self
@@ -1908,6 +1912,11 @@ impl Ashell {
                         let sync_s3_access_key_input = view.read(cx).sync_s3_access_key_input.clone();
                         let sync_s3_secret_key_input = view.read(cx).sync_s3_secret_key_input.clone();
                         let sync_s3_session_token_input = view.read(cx).sync_s3_session_token_input.clone();
+                        let sync_r2_account_id_input = view.read(cx).sync_r2_account_id_input.clone();
+                        let sync_r2_bucket_input = view.read(cx).sync_r2_bucket_input.clone();
+                        let sync_r2_object_key_input = view.read(cx).sync_r2_object_key_input.clone();
+                        let sync_r2_access_key_id_input = view.read(cx).sync_r2_access_key_id_input.clone();
+                        let sync_r2_secret_access_key_input = view.read(cx).sync_r2_secret_access_key_input.clone();
                         let sync_encryption_password_input = view.read(cx).sync_encryption_password_input.clone();
 
                         let focus_handle = view.read(cx).focus_handle.clone();
@@ -2591,59 +2600,147 @@ impl Ashell {
                                                     let s3_region = sync_s3_region_input.clone();
                                                     let s3_bucket = sync_s3_bucket_input.clone();
                                                     let s3_object_key = sync_s3_object_key_input.clone();
-                                                    let s3_access_key = sync_s3_access_key_input.clone();
-                                                    let s3_secret_key = sync_s3_secret_key_input.clone();
-                                                    let s3_session_token = sync_s3_session_token_input.clone();
-                                                    let encryption_password = sync_encryption_password_input.clone();
-                                                    move |_, window, cx| {
-                                                        let in_progress = view.read(cx).sync_in_progress;
-                                                        let status = view.read(cx).sync_status.clone();
-                                                        let is_s3 = view.read(cx).config.sync_backend() == "s3";
-                                                        v_flex()
-                                                            .w_full()
-                                                            .gap_3()
-                                                            .child(
-                                                                h_flex()
-                                                                    .gap_2()
-                                                                    .child(
-                                                                        Button::new("sync-backend-webdav")
-                                                                            .small()
-                                                                            .label("WebDAV")
-                                                                            .when(!is_s3, |button| button.primary())
-                                                                            .on_click(window.listener_for(&view, |this, _, _, cx| this.set_sync_backend("webdav", cx)))
-                                                                    )
-                                                                    .child(
-                                                                        Button::new("sync-backend-s3")
-                                                                            .small()
-                                                                            .label("S3")
-                                                                            .when(is_s3, |button| button.primary())
-                                                                            .on_click(window.listener_for(&view, |this, _, _, cx| this.set_sync_backend("s3", cx)))
-                                                                    )
-                                                            )
-                                                            .when(!is_s3, |this| this
-                                                                .child(v_flex().gap_1().child(div().text_sm().child(t!("sync_endpoint").to_string())).child(Input::new(&endpoint).w_full()))
-                                                                .child(v_flex().gap_1().child(div().text_sm().child(t!("sync_username").to_string())).child(Input::new(&username).w_full()))
-                                                                .child(v_flex().gap_1().child(div().text_sm().child(t!("sync_webdav_password").to_string())).child(Input::new(&webdav_password).w_full())))
-                                                            .when(is_s3, |this| this
-                                                                .child(v_flex().gap_1().child(div().text_sm().child(t!("sync_s3_endpoint").to_string())).child(Input::new(&s3_endpoint).w_full()))
-                                                                .child(h_flex().gap_2()
-                                                                    .child(v_flex().flex_1().gap_1().child(div().text_sm().child(t!("sync_s3_region").to_string())).child(Input::new(&s3_region).w_full()))
-                                                                    .child(v_flex().flex_1().gap_1().child(div().text_sm().child(t!("sync_s3_bucket").to_string())).child(Input::new(&s3_bucket).w_full())))
-                                                                .child(v_flex().gap_1().child(div().text_sm().child(t!("sync_s3_object_key").to_string())).child(Input::new(&s3_object_key).w_full()))
-                                                                .child(v_flex().gap_1().child(div().text_sm().child(t!("sync_s3_access_key").to_string())).child(Input::new(&s3_access_key).w_full()))
-                                                                .child(v_flex().gap_1().child(div().text_sm().child(t!("sync_s3_secret_key").to_string())).child(Input::new(&s3_secret_key).w_full()))
-                                                                .child(v_flex().gap_1().child(div().text_sm().child(t!("sync_s3_session_token").to_string())).child(Input::new(&s3_session_token).w_full())))
-                                                            .child(v_flex().gap_1().child(div().text_sm().child(t!("sync_encryption_password").to_string())).child(Input::new(&encryption_password).w_full()))
-                                                            .child(div().text_sm().text_color(cx.theme().muted_foreground).child(t!("sync_security_hint").to_string()))
-                                                            .child(
-                                                                h_flex()
-                                                                    .gap_2()
-                                                                    .child(Button::new("sync-download").small().disabled(in_progress).label(t!("sync_download").to_string()).on_click(window.listener_for(&view, |this, _, _, cx| this.download_sync_config(cx))))
-                                                                    .child(Button::new("sync-upload").small().disabled(in_progress).label(t!("sync_upload").to_string()).on_click(window.listener_for(&view, |this, _, _, cx| this.upload_sync_config(cx)))),
-                                                            )
-                                                            .child(div().text_sm().text_color(cx.theme().muted_foreground).child(status))
-                                                    }
-                                                }))
+                                                     let s3_access_key = sync_s3_access_key_input.clone();
+                                                     let s3_secret_key = sync_s3_secret_key_input.clone();
+                                                     let s3_session_token = sync_s3_session_token_input.clone();
+                                                     let r2_account_id = sync_r2_account_id_input.clone();
+                                                     let r2_bucket = sync_r2_bucket_input.clone();
+                                                     let r2_object_key = sync_r2_object_key_input.clone();
+                                                     let r2_access_key_id = sync_r2_access_key_id_input.clone();
+                                                     let r2_secret_access_key = sync_r2_secret_access_key_input.clone();
+                                                     let encryption_password = sync_encryption_password_input.clone();
+                                                     move |_, window, cx| {
+                                                         let (in_progress, provider, remember, status, has_conflict, preview) = {
+                                                             let state = view.read(cx);
+                                                             (
+                                                                 state.sync_in_progress,
+                                                                 state.sync_provider.clone(),
+                                                                 state.sync_remember_encryption_password,
+                                                                 state.sync_status.clone(),
+                                                                 state.sync_ui_state.pending_sync_upload_conflict.is_some(),
+                                                                 state.sync_ui_state.pending_sync_download.as_ref().map(|pending| pending.preview.clone()),
+                                                             )
+                                                         };
+                                                         let is_webdav = provider == "webdav";
+                                                         let is_s3 = provider == "s3";
+                                                         let is_r2 = provider == "r2";
+                                                         v_flex()
+                                                             .w_full()
+                                                             .gap_2()
+                                                             .child(
+                                                                 h_flex()
+                                                                     .w_full()
+                                                                     .gap_1()
+                                                                     .child(
+                                                                         Button::new("sync-backend-webdav")
+                                                                             .small()
+                                                                             .label("WebDAV")
+                                                                             .disabled(in_progress)
+                                                                             .when(is_webdav, |button| button.primary())
+                                                                             .on_click(window.listener_for(&view, |this, _, _, cx| this.set_sync_backend("webdav", cx)))
+                                                                     )
+                                                                     .child(
+                                                                         Button::new("sync-backend-s3")
+                                                                             .small()
+                                                                             .label("S3")
+                                                                             .disabled(in_progress)
+                                                                             .when(is_s3, |button| button.primary())
+                                                                             .on_click(window.listener_for(&view, |this, _, _, cx| this.set_sync_backend("s3", cx)))
+                                                                     )
+                                                                     .child(
+                                                                         Button::new("sync-backend-r2")
+                                                                             .small()
+                                                                             .label("Cloudflare R2")
+                                                                             .disabled(in_progress)
+                                                                             .when(is_r2, |button| button.primary())
+                                                                             .on_click(window.listener_for(&view, |this, _, _, cx| this.set_sync_backend("r2", cx)))
+                                                                     )
+                                                             )
+                                                             .when(is_webdav, |this| this
+                                                                 .child(v_flex().gap_1().child(div().text_size(rems(0.833)).child(t!("sync_endpoint").to_string())).child(Input::new(&endpoint).small().w_full().disabled(in_progress)))
+                                                                 .child(v_flex().gap_1().child(div().text_size(rems(0.833)).child(t!("sync_username").to_string())).child(Input::new(&username).small().w_full().disabled(in_progress)))
+                                                                 .child(v_flex().gap_1().child(div().text_size(rems(0.833)).child(t!("sync_webdav_password").to_string())).child(Input::new(&webdav_password).small().w_full().disabled(in_progress))))
+                                                             .when(is_s3, |this| this
+                                                                 .child(v_flex().gap_1().child(div().text_size(rems(0.833)).child(t!("sync_s3_endpoint").to_string())).child(Input::new(&s3_endpoint).small().w_full().disabled(in_progress)))
+                                                                 .child(h_flex().gap_2()
+                                                                     .child(v_flex().flex_1().gap_1().child(div().text_size(rems(0.833)).child(t!("sync_s3_region").to_string())).child(Input::new(&s3_region).small().w_full().disabled(in_progress)))
+                                                                     .child(v_flex().flex_1().gap_1().child(div().text_size(rems(0.833)).child(t!("sync_s3_bucket").to_string())).child(Input::new(&s3_bucket).small().w_full().disabled(in_progress))))
+                                                                 .child(v_flex().gap_1().child(div().text_size(rems(0.833)).child(t!("sync_s3_object_key").to_string())).child(Input::new(&s3_object_key).small().w_full().disabled(in_progress)))
+                                                                 .child(v_flex().gap_1().child(div().text_size(rems(0.833)).child(t!("sync_s3_access_key").to_string())).child(Input::new(&s3_access_key).small().w_full().disabled(in_progress)))
+                                                                 .child(v_flex().gap_1().child(div().text_size(rems(0.833)).child(t!("sync_s3_secret_key").to_string())).child(Input::new(&s3_secret_key).small().w_full().disabled(in_progress)))
+                                                                 .child(v_flex().gap_1().child(div().text_size(rems(0.833)).child(t!("sync_s3_session_token").to_string())).child(Input::new(&s3_session_token).small().w_full().disabled(in_progress))))
+                                                             .when(is_r2, |this| this
+                                                                 .child(v_flex().gap_1().child(div().text_size(rems(0.833)).child(t!("sync_r2_account_id").to_string())).child(Input::new(&r2_account_id).small().w_full().disabled(in_progress)))
+                                                                 .child(v_flex().gap_1().child(div().text_size(rems(0.833)).child(t!("sync_r2_bucket").to_string())).child(Input::new(&r2_bucket).small().w_full().disabled(in_progress)))
+                                                                 .child(v_flex().gap_1().child(div().text_size(rems(0.833)).child(t!("sync_r2_object_key").to_string())).child(Input::new(&r2_object_key).small().w_full().disabled(in_progress)))
+                                                                 .child(v_flex().gap_1().child(div().text_size(rems(0.833)).child(t!("sync_r2_access_key_id").to_string())).child(Input::new(&r2_access_key_id).small().w_full().disabled(in_progress)))
+                                                                 .child(v_flex().gap_1().child(div().text_size(rems(0.833)).child(t!("sync_r2_secret_access_key").to_string())).child(Input::new(&r2_secret_access_key).small().w_full().disabled(in_progress))))
+                                                             .child(v_flex().gap_1().child(div().text_size(rems(0.833)).child(t!("sync_encryption_password").to_string())).child(Input::new(&encryption_password).small().w_full().disabled(in_progress)))
+                                                             .child(
+                                                                 h_flex()
+                                                                     .w_full()
+                                                                     .justify_between()
+                                                                     .child(div().text_size(rems(0.833)).child(t!("sync_remember_encryption_password").to_string()))
+                                                                     .child(
+                                                                         Switch::new("sync-remember-encryption-password")
+                                                                             .small()
+                                                                             .checked(remember)
+                                                                             .disabled(in_progress)
+                                                                             .on_click(window.listener_for(&view, |this, checked, _, cx| {
+                                                                                 this.set_sync_remember_encryption_password(*checked, cx);
+                                                                             }))
+                                                                     )
+                                                             )
+                                                             .child(div().text_size(rems(0.75)).text_color(cx.theme().muted_foreground).child(t!("sync_security_hint").to_string()))
+                                                             .child(
+                                                                 h_flex()
+                                                                     .gap_2()
+                                                                     .child(Button::new("sync-test").small().disabled(in_progress).label(t!("sync_test_connection").to_string()).on_click(window.listener_for(&view, |this, _, _, cx| this.test_sync_connection(cx))))
+                                                                     .child(Button::new("sync-download").small().disabled(in_progress).label(t!("sync_download").to_string()).on_click(window.listener_for(&view, |this, _, _, cx| this.download_sync_config(cx))))
+                                                                     .child(Button::new("sync-upload").small().disabled(in_progress).label(t!("sync_upload").to_string()).on_click(window.listener_for(&view, |this, _, _, cx| this.upload_sync_config(cx)))),
+                                                             )
+                                                             .child(div().text_size(rems(0.75)).text_color(cx.theme().muted_foreground).child(status))
+                                                             .when(has_conflict, |this| this.child(
+                                                                 v_flex()
+                                                                     .w_full()
+                                                                     .gap_1()
+                                                                     .border_t_1()
+                                                                     .border_color(cx.theme().border)
+                                                                     .pt_2()
+                                                                     .child(div().text_size(rems(0.833)).font_weight(FontWeight::BOLD).child(t!("sync_conflict_title").to_string()))
+                                                                     .child(div().text_size(rems(0.75)).text_color(cx.theme().muted_foreground).child(t!("sync_conflict_description").to_string()))
+                                                                     .child(
+                                                                         h_flex()
+                                                                             .gap_2()
+                                                                             .child(Button::new("sync-conflict-download").small().disabled(in_progress).label(t!("sync_conflict_download_preview").to_string()).on_click(window.listener_for(&view, |this, _, _, cx| this.download_pending_sync_conflict(cx))))
+                                                                             .child(Button::new("sync-conflict-overwrite").small().disabled(in_progress).label(t!("sync_conflict_confirm_overwrite").to_string()).on_click(window.listener_for(&view, |this, _, _, cx| this.confirm_overwrite_sync_config(cx))))
+                                                                             .child(Button::new("sync-conflict-cancel").small().disabled(in_progress).label(t!("sync_cancel").to_string()).on_click(window.listener_for(&view, |this, _, _, cx| this.cancel_sync_conflict(cx))))
+                                                                     )
+                                                             ))
+                                                             .when_some(preview, |this, preview| this.child(
+                                                                 v_flex()
+                                                                     .w_full()
+                                                                     .gap_1()
+                                                                     .border_t_1()
+                                                                     .border_color(cx.theme().border)
+                                                                     .pt_2()
+                                                                     .child(div().text_size(rems(0.833)).font_weight(FontWeight::BOLD).child(t!("sync_preview_title").to_string()))
+                                                                     .child(h_flex().justify_between().child(div().text_size(rems(0.75)).text_color(cx.theme().muted_foreground).child(t!("sync_preview_updated_at").to_string())).child(div().text_size(rems(0.75)).child(preview.updated_at)))
+                                                                     .child(h_flex().justify_between().child(div().text_size(rems(0.75)).text_color(cx.theme().muted_foreground).child(t!("sync_preview_schema").to_string())).child(div().text_size(rems(0.75)).child(preview.schema_version.to_string())))
+                                                                     .child(h_flex().justify_between().child(div().text_size(rems(0.75)).text_color(cx.theme().muted_foreground).child(t!("sync_preview_session_count").to_string())).child(div().text_size(rems(0.75)).child(preview.session_count.to_string())))
+                                                                     .child(h_flex().justify_between().child(div().text_size(rems(0.75)).text_color(cx.theme().muted_foreground).child(t!("sync_preview_folder_count").to_string())).child(div().text_size(rems(0.75)).child(preview.folder_count.to_string())))
+                                                                     .child(h_flex().justify_between().child(div().text_size(rems(0.75)).text_color(cx.theme().muted_foreground).child(t!("sync_preview_preference_category_count").to_string())).child(div().text_size(rems(0.75)).child(preview.preference_category_count.to_string())))
+                                                                     .child(h_flex().justify_between().child(div().text_size(rems(0.75)).text_color(cx.theme().muted_foreground).child(t!("sync_preview_external_private_key_path_count").to_string())).child(div().text_size(rems(0.75)).child(preview.external_private_key_path_count.to_string())))
+                                                                     .child(div().text_size(rems(0.75)).font_weight(FontWeight::BOLD).child(t!("sync_preview_replace_warning").to_string()))
+                                                                     .child(
+                                                                         h_flex()
+                                                                             .gap_2()
+                                                                             .child(Button::new("sync-preview-restore").small().disabled(in_progress).label(t!("sync_restore").to_string()).on_click(window.listener_for(&view, |this, _, window, cx| this.apply_sync_preview(window, cx))))
+                                                                             .child(Button::new("sync-preview-cancel").small().disabled(in_progress).label(t!("sync_cancel").to_string()).on_click(window.listener_for(&view, |this, _, _, cx| this.cancel_sync_preview(cx))))
+                                                                     )
+                                                             ))
+                                                     }
+                                                 }))
                                         )
                                 )
                                 .page(
@@ -2786,10 +2883,6 @@ impl Ashell {
                                     page
                                 })
                                 .page(
-                                    SettingPage::new(t!("settings_help").to_string())
-                                        .icon(IconName::BookOpen)
-                                )
-                                .page(
                                     SettingPage::new(t!("settings_about").to_string())
                                         .icon(IconName::Info)
                                         .group(
@@ -2797,60 +2890,23 @@ impl Ashell {
                                                 .item(SettingItem::render(move |_, _window, cx| {
                                                     v_flex()
                                                         .gap_1()
-                                                        .child(div().text_size(rems(1.35)).font_weight(FontWeight::BOLD).child("JShell"))
                                                         .child(
                                                             div()
-                                                                .text_size(rems(0.833))
-                                                                .text_color(cx.theme().muted_foreground)
-                                                                .child(t!("about_edition")),
+                                                                .text_size(rems(1.35))
+                                                                .font_weight(FontWeight::BOLD)
+                                                                .child(format!("JShell {}", about_version())),
                                                         )
                                                         .child(
                                                             div()
                                                                 .mt_2()
                                                                 .text_size(rems(0.9))
                                                                 .text_color(cx.theme().muted_foreground)
-                                                                .child(t!("about_summary")),
-                                                        )
-                                                }))
-                                        )
-                                        .group(
-                                            SettingGroup::new()
-                                                .title(t!("about_compared_to_upstream").to_string())
-                                                .item(SettingItem::render(move |_, _window, cx| {
-                                                    v_flex()
-                                                        .gap_2()
-                                                        .child(
-                                                            div()
-                                                                .text_size(rems(0.833))
-                                                                .text_color(cx.theme().muted_foreground)
-                                                                .child(t!("about_comparison_features")),
-                                                        )
-                                                        .child(
-                                                            div()
-                                                                .text_size(rems(0.833))
-                                                                .text_color(cx.theme().muted_foreground)
-                                                                .child(t!("about_comparison_interface")),
-                                                        )
-                                                        .child(
-                                                            div()
-                                                                .text_size(rems(0.833))
-                                                                .text_color(cx.theme().muted_foreground)
-                                                                .child(t!("about_upstream_foundation")),
-                                                        )
-                                                }))
-                                        )
-                                        .group(
-                                            SettingGroup::new()
-                                                .title(t!("about_project").to_string())
-                                                .item(SettingItem::render(move |_, _window, cx| {
-                                                    v_flex()
-                                                        .gap_3()
-                                                        .child(
-                                                            div()
-                                                                .text_size(rems(0.833))
-                                                                .text_color(cx.theme().muted_foreground)
                                                                 .child(t!("about_acknowledgement")),
                                                         )
+                                                }))
+                                                .item(SettingItem::render(move |_, _window, _cx| {
+                                                    v_flex()
+                                                        .gap_3()
                                                         .child(
                                                             h_flex()
                                                                 .gap_2()
@@ -2872,12 +2928,6 @@ impl Ashell {
                                                                         }),
                                                                 ),
                                                         )
-                                                        .child(
-                                                            div()
-                                                                .text_size(rems(0.75))
-                                                                .text_color(cx.theme().muted_foreground)
-                                                                .child(t!("about_feedback_hint")),
-                                                        )
                                                 }))
                                         )
                                 )
@@ -2891,7 +2941,112 @@ impl Ashell {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
+
+    fn assert_locale_value(key: &str, value: &str) {
+        assert_ne!(value, key, "missing translation for {key}");
+        assert!(!value.trim().is_empty(), "empty translation for {key}");
+    }
+
+    fn about_locale_keys(yaml: &str) -> BTreeSet<&str> {
+        yaml.lines()
+            .filter_map(|line| line.split_once(':').map(|(key, _)| key.trim()))
+            .filter(|key| key.starts_with("about_"))
+            .collect()
+    }
+
+    #[test]
+    fn about_version_comes_from_cargo_package_version() {
+        assert_eq!(about_version(), env!("CARGO_PKG_VERSION"));
+        assert!(!include_str!("../../locales/zh-CN.yml").contains("0.1 Beta"));
+        assert!(!include_str!("../../locales/en.yml").contains("0.1 Beta"));
+    }
+
+    #[test]
+    fn about_locale_keys_match_between_chinese_and_english() {
+        let chinese = about_locale_keys(include_str!("../../locales/zh-CN.yml"));
+        let english = about_locale_keys(include_str!("../../locales/en.yml"));
+
+        assert_eq!(chinese, english);
+        assert_eq!(
+            chinese,
+            BTreeSet::from([
+                "about_acknowledgement",
+                "about_project_home",
+                "about_upstream_project",
+                "about_version",
+            ])
+        );
+    }
+
+    #[test]
+    fn about_acknowledgement_names_upstream_author_maintainers_and_contributors() {
+        let chinese = t!("about_acknowledgement", locale = "zh-CN");
+        assert!(chinese.contains("rust-kotlin/ashell"));
+        assert!(chinese.contains("TomZz"));
+        assert!(chinese.contains("维护者"));
+        assert!(chinese.contains("贡献者"));
+
+        let english = t!("about_acknowledgement", locale = "en");
+        assert!(english.contains("rust-kotlin/ashell"));
+        assert!(english.contains("TomZz"));
+        assert!(english.contains("maintainer"));
+        assert!(english.contains("contributor"));
+    }
+
+    #[test]
+    fn sync_locale_keys_resolve_in_chinese_and_english() {
+        macro_rules! assert_sync_locale {
+            ($key:literal) => {
+                assert_locale_value($key, &t!($key, locale = "zh-CN"));
+                assert_locale_value($key, &t!($key, locale = "en"));
+            };
+        }
+
+        assert_sync_locale!("sync_r2_account_id");
+        assert_sync_locale!("sync_r2_bucket");
+        assert_sync_locale!("sync_r2_object_key");
+        assert_sync_locale!("sync_r2_access_key_id");
+        assert_sync_locale!("sync_r2_secret_access_key");
+        assert_sync_locale!("sync_remember_encryption_password");
+        assert_sync_locale!("sync_test_connection");
+        assert_sync_locale!("sync_testing_connection");
+        assert_sync_locale!("sync_connection_succeeded");
+        assert_sync_locale!("sync_remote_exists");
+        assert_sync_locale!("sync_remote_missing");
+        assert_sync_locale!("sync_conflict_title");
+        assert_sync_locale!("sync_conflict_description");
+        assert_sync_locale!("sync_conflict_download_preview");
+        assert_sync_locale!("sync_conflict_confirm_overwrite");
+        assert_sync_locale!("sync_preview_title");
+        assert_sync_locale!("sync_preview_updated_at");
+        assert_sync_locale!("sync_preview_schema");
+        assert_sync_locale!("sync_preview_session_count");
+        assert_sync_locale!("sync_preview_folder_count");
+        assert_sync_locale!("sync_preview_preference_category_count");
+        assert_sync_locale!("sync_preview_external_private_key_path_count");
+        assert_sync_locale!("sync_preview_replace_warning");
+        assert_sync_locale!("sync_preview_ready");
+        assert_sync_locale!("sync_restore");
+        assert_sync_locale!("sync_confirm");
+        assert_sync_locale!("sync_cancel");
+        assert_sync_locale!("sync_error_invalid_input");
+        assert_sync_locale!("sync_error_network");
+        assert_sync_locale!("sync_error_timeout");
+        assert_sync_locale!("sync_error_unauthorized");
+        assert_sync_locale!("sync_error_not_found");
+        assert_sync_locale!("sync_error_conflict");
+        assert_sync_locale!("sync_error_payload_too_large");
+        assert_sync_locale!("sync_error_decrypt");
+        assert_sync_locale!("sync_error_invalid_payload");
+        assert_sync_locale!("sync_error_credential_store");
+        assert_sync_locale!("sync_error_local_save");
+        assert_sync_locale!("sync_remote_succeeded_credential_store_failed");
+        assert_sync_locale!("sync_remote_succeeded_local_state_failed");
+        assert_sync_locale!("sync_local_applied_credential_store_failed");
+    }
 
     #[test]
     fn completed_download_target_is_forwarded_to_platform_opener() {

@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::config_key::{ConfigKeyProvider, MasterKey, PlatformKeyProvider};
+use crate::sync::{DecodedSyncPayload, PortableConfigV2, SyncTargetId};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -268,6 +269,8 @@ pub struct ConfigFile {
     #[serde(default)]
     pub sync_etag: Option<String>,
     #[serde(default)]
+    pub sync_etag_target: String,
+    #[serde(default)]
     pub sync_device_id: String,
     #[serde(default)]
     pub sync_backend: String,
@@ -281,6 +284,16 @@ pub struct ConfigFile {
     pub sync_s3_bucket: String,
     #[serde(default = "default_s3_object_key")]
     pub sync_s3_object_key: String,
+    #[serde(default)]
+    pub sync_r2_account_id: String,
+    #[serde(default)]
+    pub sync_r2_bucket: String,
+    #[serde(default = "default_s3_object_key")]
+    pub sync_r2_object_key: String,
+    #[serde(default)]
+    pub sync_r2_access_key_id: String,
+    #[serde(default)]
+    pub sync_remember_encryption_password: bool,
     #[serde(default)]
     pub use_proxy: bool,
     #[serde(default = "default_read_env_proxy")]
@@ -430,6 +443,7 @@ impl Default for ConfigFile {
             sync_endpoint: String::new(),
             sync_username: String::new(),
             sync_etag: None,
+            sync_etag_target: String::new(),
             sync_device_id: String::new(),
             sync_backend: String::new(),
             sync_etag_backend: String::new(),
@@ -437,6 +451,11 @@ impl Default for ConfigFile {
             sync_s3_region: default_s3_region(),
             sync_s3_bucket: String::new(),
             sync_s3_object_key: default_s3_object_key(),
+            sync_r2_account_id: String::new(),
+            sync_r2_bucket: String::new(),
+            sync_r2_object_key: default_s3_object_key(),
+            sync_r2_access_key_id: String::new(),
+            sync_remember_encryption_password: false,
             use_proxy: false,
             read_env_proxy: true,
             global_proxy_type: default_global_proxy_type(),
@@ -460,6 +479,15 @@ fn atomic_write_config_with(
     path: &Path,
     bytes: &[u8],
     persist: impl FnOnce(tempfile::NamedTempFile, &Path) -> Result<File>,
+) -> Result<()> {
+    atomic_write_config_with_post_commit(path, bytes, persist, sync_committed_config)
+}
+
+fn atomic_write_config_with_post_commit(
+    path: &Path,
+    bytes: &[u8],
+    persist: impl FnOnce(tempfile::NamedTempFile, &Path) -> Result<File>,
+    post_commit: impl FnOnce(&File, &Path) -> Result<()>,
 ) -> Result<()> {
     let parent = path
         .parent()
@@ -505,21 +533,165 @@ fn atomic_write_config_with(
 
     let persisted = persist(staged, path)
         .with_context(|| format!("failed to atomically replace {}", path.display()))?;
-    persisted
-        .sync_all()
-        .with_context(|| format!("failed to sync persisted configuration {}", path.display()))?;
-
-    #[cfg(unix)]
-    File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .with_context(|| {
-            format!(
-                "failed to sync configuration directory {}",
-                parent.display()
-            )
-        })?;
+    if post_commit(&persisted, parent).is_err() {
+        tracing::warn!("configuration committed but post-commit durability sync failed");
+    }
 
     Ok(())
+}
+
+fn sync_committed_config(persisted: &File, _parent: &Path) -> Result<()> {
+    persisted
+        .sync_all()
+        .context("failed to sync persisted configuration")?;
+
+    #[cfg(unix)]
+    File::open(_parent)
+        .and_then(|directory| directory.sync_all())
+        .context("failed to sync configuration directory")?;
+
+    Ok(())
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub enum SyncConnectionProvider {
+    WebDav {
+        endpoint: String,
+        username: String,
+    },
+    S3 {
+        endpoint: String,
+        region: String,
+        bucket: String,
+        object_key: String,
+    },
+    R2 {
+        account_id: String,
+        bucket: String,
+        object_key: String,
+        access_key_id: String,
+    },
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct SyncConnectionSnapshot {
+    provider: SyncConnectionProvider,
+    remember_encryption_password: bool,
+}
+
+impl SyncConnectionSnapshot {
+    pub fn webdav(endpoint: String, username: String, remember_encryption_password: bool) -> Self {
+        Self {
+            provider: SyncConnectionProvider::WebDav { endpoint, username },
+            remember_encryption_password,
+        }
+    }
+
+    pub fn s3(
+        endpoint: String,
+        region: String,
+        bucket: String,
+        object_key: String,
+        remember_encryption_password: bool,
+    ) -> Self {
+        Self {
+            provider: SyncConnectionProvider::S3 {
+                endpoint,
+                region,
+                bucket,
+                object_key,
+            },
+            remember_encryption_password,
+        }
+    }
+
+    pub fn r2(
+        account_id: String,
+        bucket: String,
+        object_key: String,
+        access_key_id: String,
+        remember_encryption_password: bool,
+    ) -> Self {
+        Self {
+            provider: SyncConnectionProvider::R2 {
+                account_id,
+                bucket,
+                object_key,
+                access_key_id,
+            },
+            remember_encryption_password,
+        }
+    }
+
+    pub fn remember_encryption_password(&self) -> bool {
+        self.remember_encryption_password
+    }
+
+    #[cfg(test)]
+    pub fn with_remember_encryption_password(&self, remember: bool) -> Self {
+        let mut connection = self.clone();
+        connection.remember_encryption_password = remember;
+        connection
+    }
+
+    pub fn matches_remote(&self, other: &Self) -> bool {
+        self.provider == other.provider
+    }
+
+    pub fn target_id(&self) -> SyncTargetId {
+        match &self.provider {
+            SyncConnectionProvider::WebDav { endpoint, username } => {
+                SyncTargetId::for_webdav(endpoint, username)
+            }
+            SyncConnectionProvider::S3 {
+                endpoint,
+                region,
+                bucket,
+                object_key,
+            } => SyncTargetId::for_s3(endpoint, region, bucket, object_key),
+            SyncConnectionProvider::R2 {
+                account_id,
+                bucket,
+                object_key,
+                ..
+            } => SyncTargetId::for_r2(account_id, bucket, object_key),
+        }
+    }
+
+    fn apply_to(&self, candidate: &mut ConfigFile) {
+        match &self.provider {
+            SyncConnectionProvider::WebDav { endpoint, username } => {
+                candidate.sync_backend = "webdav".to_string();
+                candidate.sync_endpoint.clone_from(endpoint);
+                candidate.sync_username.clone_from(username);
+            }
+            SyncConnectionProvider::S3 {
+                endpoint,
+                region,
+                bucket,
+                object_key,
+            } => {
+                candidate.sync_backend = "s3".to_string();
+                candidate.sync_s3_endpoint.clone_from(endpoint);
+                candidate.sync_s3_region.clone_from(region);
+                candidate.sync_s3_bucket.clone_from(bucket);
+                candidate.sync_s3_object_key.clone_from(object_key);
+            }
+            SyncConnectionProvider::R2 {
+                account_id,
+                bucket,
+                object_key,
+                access_key_id,
+            } => {
+                candidate.sync_backend = "r2".to_string();
+                candidate.sync_r2_account_id.clone_from(account_id);
+                candidate.sync_r2_bucket.clone_from(bucket);
+                candidate.sync_r2_object_key.clone_from(object_key);
+                candidate.sync_r2_access_key_id.clone_from(access_key_id);
+            }
+        }
+        candidate.sync_remember_encryption_password = self.remember_encryption_password;
+    }
 }
 
 #[derive(Clone)]
@@ -720,6 +892,10 @@ impl ConfigStore {
         &self.cache.sessions
     }
 
+    pub fn portable_config(&self) -> PortableConfigV2 {
+        PortableConfigV2::from(&self.cache)
+    }
+
     pub fn session_folders(&self) -> &[SessionFolder] {
         &self.cache.session_folders
     }
@@ -747,6 +923,7 @@ impl ConfigStore {
             .collect()
     }
 
+    #[cfg(test)]
     pub fn replace_sessions(&mut self, sessions: Vec<Session>) {
         self.cache.sessions = sessions;
     }
@@ -759,26 +936,34 @@ impl ConfigStore {
         &self.cache.sync_username
     }
 
+    #[cfg(test)]
     pub fn sync_etag(&self) -> Option<&str> {
-        (self.cache.sync_etag_backend == self.sync_backend())
+        let target = self.current_sync_target()?;
+        self.sync_etag_for_target(&target)
+    }
+
+    pub fn sync_etag_for_target(&self, target: &SyncTargetId) -> Option<&str> {
+        (self.cache.sync_etag_target == target.as_str())
             .then_some(self.cache.sync_etag.as_deref())
             .flatten()
     }
 
-    pub fn sync_device_id(&self) -> &str {
-        &self.cache.sync_device_id
-    }
-
     pub fn sync_backend(&self) -> &str {
-        if self.cache.sync_backend == "s3" {
-            "s3"
-        } else {
-            "webdav"
+        match self.cache.sync_backend.as_str() {
+            "s3" => "s3",
+            "r2" => "r2",
+            _ => "webdav",
         }
     }
 
+    #[cfg(test)]
     pub fn set_sync_backend(&mut self, backend: &str) {
-        self.cache.sync_backend = if backend == "s3" { "s3" } else { "webdav" }.to_string();
+        self.cache.sync_backend = match backend {
+            "s3" => "s3",
+            "r2" => "r2",
+            _ => "webdav",
+        }
+        .to_string();
     }
 
     pub fn sync_s3_endpoint(&self) -> &str {
@@ -805,11 +990,45 @@ impl ConfigStore {
         }
     }
 
+    pub fn sync_r2_account_id(&self) -> &str {
+        &self.cache.sync_r2_account_id
+    }
+
+    pub fn sync_r2_bucket(&self) -> &str {
+        &self.cache.sync_r2_bucket
+    }
+
+    pub fn sync_r2_object_key(&self) -> &str {
+        if self.cache.sync_r2_object_key.is_empty() {
+            "jshell-sync.json"
+        } else {
+            &self.cache.sync_r2_object_key
+        }
+    }
+
+    pub fn sync_r2_access_key_id(&self) -> &str {
+        &self.cache.sync_r2_access_key_id
+    }
+
+    pub fn sync_remember_encryption_password(&self) -> bool {
+        self.cache.sync_remember_encryption_password
+    }
+
+    pub fn set_sync_remember_encryption_password(&mut self, remember: bool) {
+        self.cache.sync_remember_encryption_password = remember;
+    }
+
+    pub fn sync_target_id(&self) -> Option<SyncTargetId> {
+        self.current_sync_target()
+    }
+
+    #[cfg(test)]
     pub fn set_sync_connection(&mut self, endpoint: String, username: String) {
         self.cache.sync_endpoint = endpoint;
         self.cache.sync_username = username;
     }
 
+    #[cfg(test)]
     pub fn set_sync_s3_connection(
         &mut self,
         endpoint: String,
@@ -823,9 +1042,75 @@ impl ConfigStore {
         self.cache.sync_s3_object_key = object_key;
     }
 
+    #[cfg(test)]
     pub fn set_sync_etag(&mut self, etag: Option<String>) {
-        self.cache.sync_etag = etag;
-        self.cache.sync_etag_backend = self.sync_backend().to_string();
+        if let Some(target) = self.current_sync_target() {
+            self.cache.sync_etag = etag;
+            self.cache.sync_etag_target = target.to_string();
+        } else {
+            self.cache.sync_etag = None;
+            self.cache.sync_etag_target.clear();
+        }
+    }
+
+    pub fn persist_sync_connection(
+        &mut self,
+        connection: &SyncConnectionSnapshot,
+        etag: Option<String>,
+    ) -> Result<()> {
+        self.persist_sync_connection_with_persist(connection, etag, atomic_write_config)
+    }
+
+    fn persist_sync_connection_with_persist<F>(
+        &mut self,
+        connection: &SyncConnectionSnapshot,
+        etag: Option<String>,
+        persist: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(&Path, &[u8]) -> Result<()>,
+    {
+        let mut candidate = self.cache.clone();
+        connection.apply_to(&mut candidate);
+        candidate.sync_etag = etag;
+        candidate.sync_etag_target = connection.target_id().to_string();
+        candidate.sync_etag_backend = candidate.sync_backend.clone();
+
+        let encrypted_bytes = encrypt_config_v2(&candidate, &self.master_key)?;
+        if !self.path.as_os_str().is_empty() {
+            persist(&self.path, &encrypted_bytes)
+                .context("persist synchronized connection candidate")?;
+        }
+        self.cache = candidate;
+        Ok(())
+    }
+
+    fn current_sync_target(&self) -> Option<SyncTargetId> {
+        match self.sync_backend() {
+            "webdav" if !self.cache.sync_endpoint.trim().is_empty() => Some(
+                SyncTargetId::for_webdav(&self.cache.sync_endpoint, &self.cache.sync_username),
+            ),
+            "s3" if !self.sync_s3_region().trim().is_empty()
+                && !self.cache.sync_s3_bucket.trim().is_empty() =>
+            {
+                Some(SyncTargetId::for_s3(
+                    &self.cache.sync_s3_endpoint,
+                    self.sync_s3_region(),
+                    &self.cache.sync_s3_bucket,
+                    self.sync_s3_object_key(),
+                ))
+            }
+            "r2" if !self.cache.sync_r2_account_id.trim().is_empty()
+                && !self.cache.sync_r2_bucket.trim().is_empty() =>
+            {
+                Some(SyncTargetId::for_r2(
+                    &self.cache.sync_r2_account_id,
+                    &self.cache.sync_r2_bucket,
+                    &self.cache.sync_r2_object_key,
+                ))
+            }
+            _ => None,
+        }
     }
 
     pub fn follow_system_theme(&self) -> bool {
@@ -917,9 +1202,6 @@ impl ConfigStore {
 
     pub fn set_transfers(&mut self, transfers: Vec<crate::terminal::Transfer>) {
         self.cache.transfers = transfers;
-        if let Err(err) = self.save() {
-            tracing::error!("failed to save config: {err:#}");
-        }
     }
 
     pub fn set_layout_state(
@@ -1191,6 +1473,145 @@ impl ConfigStore {
             .collect()
     }
 
+    #[cfg(test)]
+    pub fn apply_decoded_sync_payload(
+        &mut self,
+        payload: &DecodedSyncPayload,
+        target: &SyncTargetId,
+        etag: Option<String>,
+    ) -> Result<()> {
+        self.apply_decoded_sync_payload_with_persist(payload, target, etag, atomic_write_config)
+    }
+
+    #[cfg(test)]
+    fn apply_decoded_sync_payload_with_persist<F>(
+        &mut self,
+        payload: &DecodedSyncPayload,
+        target: &SyncTargetId,
+        etag: Option<String>,
+        persist: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(&Path, &[u8]) -> Result<()>,
+    {
+        let mut candidate = self.cache.clone();
+        Self::apply_decoded_sync_payload_to_candidate(&mut candidate, payload);
+        candidate.sync_etag = etag;
+        candidate.sync_etag_target = target.to_string();
+
+        self.persist_sync_candidate(candidate, persist)
+    }
+
+    pub fn apply_decoded_sync_payload_with_connection(
+        &mut self,
+        payload: &DecodedSyncPayload,
+        connection: &SyncConnectionSnapshot,
+        etag: Option<String>,
+    ) -> Result<()> {
+        self.apply_decoded_sync_payload_with_connection_with_persist(
+            payload,
+            connection,
+            etag,
+            atomic_write_config,
+        )
+    }
+
+    fn apply_decoded_sync_payload_with_connection_with_persist<F>(
+        &mut self,
+        payload: &DecodedSyncPayload,
+        connection: &SyncConnectionSnapshot,
+        etag: Option<String>,
+        persist: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(&Path, &[u8]) -> Result<()>,
+    {
+        let mut candidate = self.cache.clone();
+        Self::apply_decoded_sync_payload_to_candidate(&mut candidate, payload);
+        connection.apply_to(&mut candidate);
+        candidate.sync_etag = etag;
+        candidate.sync_etag_target = connection.target_id().to_string();
+        candidate.sync_etag_backend = candidate.sync_backend.clone();
+
+        self.persist_sync_candidate(candidate, persist)
+    }
+
+    fn apply_decoded_sync_payload_to_candidate(
+        candidate: &mut ConfigFile,
+        payload: &DecodedSyncPayload,
+    ) {
+        match payload {
+            DecodedSyncPayload::LegacyV1(payload) => {
+                candidate.sessions = payload.sessions.clone();
+                Self::normalize_candidate_session_folders(candidate);
+            }
+            DecodedSyncPayload::V2(payload) => {
+                Self::apply_portable_config(candidate, &payload.portable_config);
+            }
+        }
+    }
+
+    fn persist_sync_candidate<F>(&mut self, candidate: ConfigFile, persist: F) -> Result<()>
+    where
+        F: FnOnce(&Path, &[u8]) -> Result<()>,
+    {
+        let encrypted_bytes = encrypt_config_v2(&candidate, &self.master_key)?;
+        if !self.path.as_os_str().is_empty() {
+            persist(&self.path, &encrypted_bytes)
+                .context("persist synchronized configuration candidate")?;
+        }
+        self.cache = candidate;
+        Ok(())
+    }
+
+    fn apply_portable_config(candidate: &mut ConfigFile, portable: &PortableConfigV2) {
+        candidate.sessions = portable.sessions.clone();
+        candidate.session_folders = portable.session_folders.clone();
+
+        candidate.follow_system_theme = portable.preferences.follow_system_theme;
+        candidate.theme_mode = portable.preferences.theme_mode.clone();
+        candidate.light_theme_name = portable.preferences.light_theme_name.clone();
+        candidate.dark_theme_name = portable.preferences.dark_theme_name.clone();
+        candidate.locale = portable.preferences.locale.clone();
+        candidate.terminal_font_size = portable.preferences.terminal_font_size;
+        candidate.ui_font_size = portable.preferences.ui_font_size;
+        candidate.right_click_copy_paste = portable.preferences.right_click_copy_paste;
+        candidate.keyword_highlight = portable.preferences.keyword_highlight;
+        candidate.editor_soft_wrap = portable.preferences.editor_soft_wrap;
+        candidate.history_completion_plugin_enabled =
+            portable.preferences.history_completion_plugin_enabled;
+        candidate.ui_font_family = portable.preferences.ui_font_family.clone();
+        candidate.terminal_font_family = portable.preferences.terminal_font_family.clone();
+        candidate.cursor_style = portable.preferences.cursor_style;
+        candidate.show_hidden_files = portable.preferences.show_hidden_files;
+        candidate.lock_layout = portable.preferences.lock_layout;
+        candidate.monitoring_position = portable.preferences.monitoring_position.clone();
+
+        candidate.key_bindings = portable.key_bindings.clone();
+
+        candidate.use_proxy = portable.proxy.use_proxy;
+        candidate.read_env_proxy = portable.proxy.read_env_proxy;
+        candidate.global_proxy_type = portable.proxy.global_proxy_type.clone();
+        candidate.global_proxy_host = portable.proxy.global_proxy_host.clone();
+        candidate.global_proxy_port = portable.proxy.global_proxy_port;
+        candidate.global_proxy_user = portable.proxy.global_proxy_user.clone();
+        candidate.global_proxy_password = portable.proxy.global_proxy_password.clone();
+    }
+
+    fn normalize_candidate_session_folders(candidate: &mut ConfigFile) {
+        let known_ids: std::collections::HashSet<String> = candidate
+            .sessions
+            .iter()
+            .map(|session| session.id.clone())
+            .collect();
+        for folder in &mut candidate.session_folders {
+            let mut seen = std::collections::HashSet::new();
+            folder.session_ids.retain(|session_id| {
+                known_ids.contains(session_id) && seen.insert(session_id.clone())
+            });
+        }
+    }
+
     pub fn save(&self) -> Result<()> {
         if self.path.as_os_str().is_empty() {
             return Ok(());
@@ -1237,6 +1658,16 @@ impl ConfigStore {
         disk_config.monitoring_position = local_config.monitoring_position;
         disk_config.sidebar_collapsed = local_config.sidebar_collapsed;
         disk_config.sftp_panel_minimized = local_config.sftp_panel_minimized;
+        disk_config.key_bindings = local_config.key_bindings;
+        disk_config.use_proxy = local_config.use_proxy;
+        disk_config.read_env_proxy = local_config.read_env_proxy;
+        disk_config.global_proxy_type = local_config.global_proxy_type;
+        disk_config.global_proxy_host = local_config.global_proxy_host;
+        disk_config.global_proxy_port = local_config.global_proxy_port;
+        disk_config.global_proxy_user = local_config.global_proxy_user;
+        disk_config.global_proxy_password = local_config.global_proxy_password;
+        disk_config.sync_remember_encryption_password =
+            local_config.sync_remember_encryption_password;
 
         let encrypted_bytes = encrypt_config_v2(&disk_config, &self.master_key)?;
         atomic_write_config(&self.path, &encrypted_bytes)
@@ -1950,6 +2381,145 @@ mod tests {
             self.key.replace(Some(key.clone()));
             Ok(key)
         }
+    }
+
+    fn portable_apply_session(id: &str, host: &str) -> Session {
+        let mut session = Session::password(
+            host.to_string(),
+            22,
+            "remote-user".to_string(),
+            format!("password-{id}"),
+        );
+        session.id = id.to_string();
+        session.name = format!("Remote {id}");
+        session
+    }
+
+    fn portable_apply_remote_config() -> ConfigFile {
+        ConfigFile {
+            follow_system_theme: false,
+            theme_mode: "remote-dark".to_string(),
+            light_theme_name: "remote-light-theme".to_string(),
+            dark_theme_name: "remote-dark-theme".to_string(),
+            locale: "remote-locale".to_string(),
+            terminal_font_size: 21.0,
+            ui_font_size: 17.0,
+            right_click_copy_paste: true,
+            keyword_highlight: true,
+            editor_soft_wrap: true,
+            history_completion_plugin_enabled: false,
+            ui_font_family: "Remote UI Font".to_string(),
+            terminal_font_family: "Remote Terminal Font".to_string(),
+            cursor_style: CursorStyle::BeamBlink,
+            sessions: vec![
+                portable_apply_session("remote-a", "a.remote.test"),
+                portable_apply_session("remote-b", "b.remote.test"),
+            ],
+            session_folders: vec![SessionFolder {
+                id: "remote-folder".to_string(),
+                name: "Remote Folder".to_string(),
+                session_ids: vec!["remote-b".to_string(), "remote-a".to_string()],
+            }],
+            show_hidden_files: true,
+            lock_layout: true,
+            monitoring_position: "RemoteStatusBar".to_string(),
+            key_bindings: std::collections::HashMap::from([
+                ("Copy".to_string(), "remote-copy".to_string()),
+                ("Paste".to_string(), "remote-paste".to_string()),
+            ]),
+            use_proxy: true,
+            read_env_proxy: false,
+            global_proxy_type: "https".to_string(),
+            global_proxy_host: "remote-proxy.test".to_string(),
+            global_proxy_port: Some(9443),
+            global_proxy_user: "remote-proxy-user".to_string(),
+            global_proxy_password: "remote-proxy-password".to_string(),
+            ..ConfigFile::default()
+        }
+    }
+
+    fn portable_apply_local_config() -> ConfigFile {
+        ConfigFile {
+            font_defaults_version: 77,
+            window_bounds: Some(SavedWindowBounds::Windowed {
+                x: 10_001.0,
+                y: 10_002.0,
+                width: 10_003.0,
+                height: 10_004.0,
+            }),
+            workspace_panels: Some(vec![20_001.0, 20_002.0]),
+            body_panels: Some(vec![30_001.0, 30_002.0]),
+            transfers: vec![crate::terminal::Transfer {
+                tab_id: "local-transfer-tab".to_string(),
+                generation: 42,
+                tab_title: "Local Transfer".to_string(),
+                info: crate::terminal::TransferInfo {
+                    id: "local-transfer-id".to_string(),
+                    name: "local-transfer-name".to_string(),
+                    source: "local-transfer-source".to_string(),
+                    target: "local-transfer-target".to_string(),
+                    kind: crate::terminal::TransferType::Download,
+                    total_bytes: Some(12_345),
+                },
+                transferred: 1_234,
+                total: Some(12_345),
+                state: crate::terminal::TransferState::Paused,
+            }],
+            sidebar_collapsed: true,
+            sftp_panel_minimized: true,
+            sync_endpoint: "https://local-webdav.test/config".to_string(),
+            sync_username: "local-webdav-user".to_string(),
+            sync_etag: Some("old-etag".to_string()),
+            sync_etag_target: "old-target".to_string(),
+            sync_device_id: "local-device-id".to_string(),
+            sync_backend: "r2".to_string(),
+            sync_etag_backend: "legacy-backend".to_string(),
+            sync_s3_endpoint: "https://local-s3.test".to_string(),
+            sync_s3_region: "local-region".to_string(),
+            sync_s3_bucket: "local-s3-bucket".to_string(),
+            sync_s3_object_key: "local-s3-key.json".to_string(),
+            sync_r2_account_id: "local-r2-account".to_string(),
+            sync_r2_bucket: "local-r2-bucket".to_string(),
+            sync_r2_object_key: "local-r2-key.json".to_string(),
+            sync_r2_access_key_id: "local-r2-access-key-id".to_string(),
+            sync_remember_encryption_password: true,
+            ..ConfigFile::default()
+        }
+    }
+
+    fn portable_apply_local_only_snapshot(config: &ConfigFile) -> serde_json::Value {
+        serde_json::json!({
+            "font_defaults_version": config.font_defaults_version,
+            "window_bounds": &config.window_bounds,
+            "workspace_panels": &config.workspace_panels,
+            "body_panels": &config.body_panels,
+            "transfers": &config.transfers,
+            "sidebar_collapsed": config.sidebar_collapsed,
+            "sftp_panel_minimized": config.sftp_panel_minimized,
+            "sync_endpoint": &config.sync_endpoint,
+            "sync_username": &config.sync_username,
+            "sync_device_id": &config.sync_device_id,
+            "sync_backend": &config.sync_backend,
+            "sync_etag_backend": &config.sync_etag_backend,
+            "sync_s3_endpoint": &config.sync_s3_endpoint,
+            "sync_s3_region": &config.sync_s3_region,
+            "sync_s3_bucket": &config.sync_s3_bucket,
+            "sync_s3_object_key": &config.sync_s3_object_key,
+            "sync_r2_account_id": &config.sync_r2_account_id,
+            "sync_r2_bucket": &config.sync_r2_bucket,
+            "sync_r2_object_key": &config.sync_r2_object_key,
+            "sync_r2_access_key_id": &config.sync_r2_access_key_id,
+            "sync_remember_encryption_password": config.sync_remember_encryption_password,
+        })
+    }
+
+    fn portable_apply_preferences_snapshot(config: &ConfigFile) -> serde_json::Value {
+        let portable = crate::sync::PortableConfigV2::from(config);
+        serde_json::json!({
+            "preferences": portable.preferences,
+            "key_bindings": portable.key_bindings,
+            "proxy": portable.proxy,
+        })
     }
 
     #[test]
@@ -2753,6 +3323,137 @@ mod tests {
     }
 
     #[test]
+    fn sync_target_fields_are_backward_compatible() {
+        let legacy_config: ConfigFile = serde_json::from_str("{}").unwrap();
+
+        assert!(legacy_config.sync_etag_target.is_empty());
+        assert!(legacy_config.sync_r2_account_id.is_empty());
+        assert!(legacy_config.sync_r2_bucket.is_empty());
+        assert_eq!(legacy_config.sync_r2_object_key, "jshell-sync.json");
+        assert!(legacy_config.sync_r2_access_key_id.is_empty());
+        assert!(!legacy_config.sync_remember_encryption_password);
+    }
+
+    #[test]
+    fn sync_etag_matches_only_the_current_webdav_target() {
+        let mut store = ConfigStore::in_memory();
+        store.set_sync_backend("webdav");
+        store.set_sync_connection(
+            "https://dav.example.test/config/".to_string(),
+            "alice".to_string(),
+        );
+
+        store.set_sync_etag(Some("webdav-etag".to_string()));
+
+        assert_eq!(store.sync_etag(), Some("webdav-etag"));
+        assert_eq!(
+            store.cache.sync_etag_target,
+            crate::sync::SyncTargetId::for_webdav(
+                "https://dav.example.test/config/jshell-sync.json",
+                "alice",
+            )
+            .to_string()
+        );
+
+        store.cache.sync_endpoint = "https://dav.example.test/other".to_string();
+        assert_eq!(store.sync_etag(), None);
+    }
+
+    #[test]
+    fn sync_etag_does_not_cross_bucket_key_or_provider_boundaries() {
+        let mut store = ConfigStore::in_memory();
+        store.set_sync_backend("s3");
+        store.set_sync_s3_connection(
+            "https://objects.example.test/".to_string(),
+            "auto".to_string(),
+            "bucket-a".to_string(),
+            "/config-a.json".to_string(),
+        );
+        store.set_sync_etag(Some("s3-etag".to_string()));
+        assert_eq!(store.sync_etag(), Some("s3-etag"));
+
+        store.cache.sync_s3_bucket = "bucket-b".to_string();
+        assert_eq!(store.sync_etag(), None);
+
+        store.cache.sync_s3_bucket = "bucket-a".to_string();
+        store.cache.sync_s3_object_key = "config-b.json".to_string();
+        assert_eq!(store.sync_etag(), None);
+
+        store.cache.sync_s3_object_key = "config-a.json".to_string();
+        store.cache.sync_r2_account_id = "objects.example.test".to_string();
+        store.cache.sync_r2_bucket = "bucket-a".to_string();
+        store.cache.sync_r2_object_key = "config-a.json".to_string();
+        store.set_sync_backend("r2");
+        assert_eq!(store.sync_backend(), "r2");
+        assert_eq!(store.sync_etag(), None);
+    }
+
+    #[test]
+    fn legacy_sync_etag_backend_never_authorizes_an_etag_match() {
+        let mut store = ConfigStore::in_memory();
+        store.set_sync_backend("webdav");
+        store.set_sync_connection(
+            "https://dav.example.test/config".to_string(),
+            "alice".to_string(),
+        );
+        store.cache.sync_etag = Some("legacy-etag".to_string());
+        store.cache.sync_etag_backend = "webdav".to_string();
+        store.cache.sync_etag_target.clear();
+
+        assert_eq!(store.sync_etag(), None);
+    }
+
+    #[test]
+    fn setting_sync_etag_without_a_valid_target_clears_the_binding() {
+        let mut store = ConfigStore::in_memory();
+        store.cache.sync_etag = Some("stale-etag".to_string());
+        store.cache.sync_etag_target = "stale-target".to_string();
+        store.set_sync_backend("r2");
+
+        store.set_sync_etag(Some("new-etag".to_string()));
+
+        assert_eq!(store.sync_etag(), None);
+        assert_eq!(store.cache.sync_etag, None);
+        assert!(store.cache.sync_etag_target.is_empty());
+    }
+
+    #[test]
+    fn sync_connection_persist_failure_preserves_cache_and_disk() {
+        let root = std::env::temp_dir().join(format!("jshell-sync-connection-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("sessions.json");
+        let master_key = MasterKey::from_secret(vec![73; 32]).unwrap();
+        let mut store = ConfigStore {
+            path: path.clone(),
+            cache: portable_apply_local_config(),
+            master_key,
+        };
+        store.save().unwrap();
+        let cache_before = serde_json::to_value(&store.cache).unwrap();
+        let disk_before = fs::read(&path).unwrap();
+        let connection = SyncConnectionSnapshot::r2(
+            "0123456789abcdef0123456789abcdef".to_string(),
+            "new-bucket".to_string(),
+            "new-object.json".to_string(),
+            "new-access-key".to_string(),
+            true,
+        );
+
+        let error = store
+            .persist_sync_connection_with_persist(
+                &connection,
+                Some("new-etag".to_string()),
+                |_path, _bytes| Err(anyhow::anyhow!("simulated sync connection failure")),
+            )
+            .expect_err("persist failure must abort the connection candidate");
+
+        assert!(format!("{error:#}").contains("simulated sync connection failure"));
+        assert_eq!(serde_json::to_value(&store.cache).unwrap(), cache_before);
+        assert_eq!(fs::read(&path).unwrap(), disk_before);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn legacy_font_preferences_migrate_to_system_monospace() {
         let mut config = ConfigFile {
             ui_font_family: "Noto Sans Mono CJK SC".to_string(),
@@ -3142,6 +3843,218 @@ mod tests {
     }
 
     #[test]
+    fn portable_apply_v2_replaces_portable_fields_and_preserves_local_only_state() {
+        let root =
+            std::env::temp_dir().join(format!("jshell-portable-apply-v2-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("sessions.json");
+        let master_key = MasterKey::from_secret(vec![67; 32]).unwrap();
+        let local_config = portable_apply_local_config();
+        let local_only_before = portable_apply_local_only_snapshot(&local_config);
+        let mut store = ConfigStore {
+            path: path.clone(),
+            cache: local_config,
+            master_key: master_key.clone(),
+        };
+        store.save().unwrap();
+
+        let remote_portable = crate::sync::PortableConfigV2::from(&portable_apply_remote_config());
+        let payload = crate::sync::DecodedSyncPayload::V2(Box::new(
+            crate::sync::SyncPayloadV2::new(remote_portable.clone()),
+        ));
+        let target = crate::sync::SyncTargetId::for_r2(
+            "download-account",
+            "download-bucket",
+            "download-key.json",
+        );
+
+        store
+            .apply_decoded_sync_payload(&payload, &target, Some("download-etag".to_string()))
+            .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(store.portable_config()).unwrap(),
+            serde_json::to_value(&remote_portable).unwrap()
+        );
+        assert_eq!(
+            portable_apply_local_only_snapshot(&store.cache),
+            local_only_before
+        );
+        assert_eq!(store.cache.sync_etag.as_deref(), Some("download-etag"));
+        assert_eq!(store.cache.sync_etag_target, target.to_string());
+
+        let persisted = decrypt_config_v2(&fs::read(&path).unwrap(), &master_key).unwrap();
+        assert_eq!(
+            serde_json::to_value(crate::sync::PortableConfigV2::from(&persisted)).unwrap(),
+            serde_json::to_value(&remote_portable).unwrap()
+        );
+        assert_eq!(
+            portable_apply_local_only_snapshot(&persisted),
+            local_only_before
+        );
+        assert_eq!(persisted.sync_etag.as_deref(), Some("download-etag"));
+        assert_eq!(persisted.sync_etag_target, target.to_string());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn portable_apply_v1_replaces_only_sessions_and_normalizes_local_folders() {
+        let mut store = ConfigStore::in_memory();
+        store.cache = ConfigFile {
+            follow_system_theme: false,
+            theme_mode: "local-theme".to_string(),
+            locale: "local-locale".to_string(),
+            terminal_font_size: 19.0,
+            ui_font_size: 13.0,
+            key_bindings: std::collections::HashMap::from([(
+                "Copy".to_string(),
+                "local-copy".to_string(),
+            )]),
+            use_proxy: true,
+            global_proxy_host: "local-proxy.test".to_string(),
+            sessions: vec![portable_apply_session("old-session", "old.local.test")],
+            session_folders: vec![SessionFolder {
+                id: "local-folder".to_string(),
+                name: "Local Folder".to_string(),
+                session_ids: vec![
+                    "new-b".to_string(),
+                    "unknown".to_string(),
+                    "new-b".to_string(),
+                    "new-a".to_string(),
+                    "new-a".to_string(),
+                ],
+            }],
+            ..ConfigFile::default()
+        };
+        let preferences_before = portable_apply_preferences_snapshot(&store.cache);
+        let folders_before = store.cache.session_folders.clone();
+        let payload = crate::sync::DecodedSyncPayload::LegacyV1(crate::sync::LegacySyncPayloadV1 {
+            schema_version: 1,
+            revision: "legacy-revision".to_string(),
+            updated_at: "2026-08-01T00:00:00Z".to_string(),
+            device_id: "legacy-device".to_string(),
+            sessions: vec![
+                portable_apply_session("new-a", "a.new.test"),
+                portable_apply_session("new-b", "b.new.test"),
+            ],
+        });
+        let target =
+            crate::sync::SyncTargetId::for_webdav("https://dav.test/config", "legacy-user");
+
+        store
+            .apply_decoded_sync_payload(&payload, &target, Some("legacy-etag".to_string()))
+            .unwrap();
+
+        assert_eq!(
+            store
+                .sessions()
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["new-a", "new-b"]
+        );
+        assert_eq!(
+            portable_apply_preferences_snapshot(&store.cache),
+            preferences_before
+        );
+        assert_eq!(store.cache.session_folders[0].id, folders_before[0].id);
+        assert_eq!(store.cache.session_folders[0].name, folders_before[0].name);
+        assert_eq!(
+            store.cache.session_folders[0].session_ids,
+            vec!["new-b".to_string(), "new-a".to_string()]
+        );
+    }
+
+    #[test]
+    fn portable_apply_persist_failure_preserves_cache_disk_and_etag_binding() {
+        let root =
+            std::env::temp_dir().join(format!("jshell-portable-apply-failure-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("sessions.json");
+        let master_key = MasterKey::from_secret(vec![71; 32]).unwrap();
+        let mut store = ConfigStore {
+            path: path.clone(),
+            cache: portable_apply_local_config(),
+            master_key,
+        };
+        store.save().unwrap();
+        let cache_before = serde_json::to_value(&store.cache).unwrap();
+        let disk_before = fs::read(&path).unwrap();
+        let etag_before = store.cache.sync_etag.clone();
+        let target_before = store.cache.sync_etag_target.clone();
+        let remote_portable = crate::sync::PortableConfigV2::from(&portable_apply_remote_config());
+        let payload = crate::sync::DecodedSyncPayload::V2(Box::new(
+            crate::sync::SyncPayloadV2::new(remote_portable),
+        ));
+        let target = crate::sync::SyncTargetId::for_s3(
+            "https://download-s3.test",
+            "download-region",
+            "download-bucket",
+            "download-key.json",
+        );
+
+        let error = store
+            .apply_decoded_sync_payload_with_persist(
+                &payload,
+                &target,
+                Some("new-etag".to_string()),
+                |_path, _bytes| Err(anyhow::anyhow!("simulated portable persist failure")),
+            )
+            .expect_err("persist failure must abort the candidate application");
+
+        assert!(format!("{error:#}").contains("simulated portable persist failure"));
+        assert_eq!(serde_json::to_value(&store.cache).unwrap(), cache_before);
+        assert_eq!(fs::read(&path).unwrap(), disk_before);
+        assert_eq!(store.cache.sync_etag, etag_before);
+        assert_eq!(store.cache.sync_etag_target, target_before);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn portable_apply_with_connection_persist_failure_preserves_cache_and_disk() {
+        let root = std::env::temp_dir().join(format!(
+            "jshell-portable-connection-apply-failure-{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("sessions.json");
+        let master_key = MasterKey::from_secret(vec![79; 32]).unwrap();
+        let mut store = ConfigStore {
+            path: path.clone(),
+            cache: portable_apply_local_config(),
+            master_key,
+        };
+        store.save().unwrap();
+        let cache_before = serde_json::to_value(&store.cache).unwrap();
+        let disk_before = fs::read(&path).unwrap();
+        let payload =
+            crate::sync::DecodedSyncPayload::V2(Box::new(crate::sync::SyncPayloadV2::new(
+                crate::sync::PortableConfigV2::from(&portable_apply_remote_config()),
+            )));
+        let connection = SyncConnectionSnapshot::r2(
+            "0123456789abcdef0123456789abcdef".to_string(),
+            "download-bucket".to_string(),
+            "download-key.json".to_string(),
+            "download-access-key".to_string(),
+            true,
+        );
+
+        let error = store
+            .apply_decoded_sync_payload_with_connection_with_persist(
+                &payload,
+                &connection,
+                Some("download-etag".to_string()),
+                |_path, _bytes| Err(anyhow::anyhow!("simulated combined persist failure")),
+            )
+            .expect_err("combined candidate persistence must be atomic");
+
+        assert!(format!("{error:#}").contains("simulated combined persist failure"));
+        assert_eq!(serde_json::to_value(&store.cache).unwrap(), cache_before);
+        assert_eq!(fs::read(&path).unwrap(), disk_before);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn atomic_config_write_replaces_existing_file() {
         let root =
             std::env::temp_dir().join(format!("jshell-atomic-config-write-{}", Uuid::new_v4()));
@@ -3173,6 +4086,35 @@ mod tests {
 
         assert!(format!("{error:#}").contains("simulated atomic replace failure"));
         assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn atomic_config_write_treats_post_commit_sync_failure_as_committed() {
+        let root =
+            std::env::temp_dir().join(format!("jshell-atomic-config-write-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("sessions.json");
+        fs::write(&path, b"previous complete config").unwrap();
+
+        let result = atomic_write_config_with_post_commit(
+            &path,
+            b"replacement complete config",
+            |staged, target| {
+                staged
+                    .persist(target)
+                    .map_err(|err| anyhow::Error::new(err.error))
+            },
+            |_persisted, _parent| {
+                Err(anyhow::anyhow!(
+                    "simulated post-commit sync failure with secret-sentinel"
+                ))
+            },
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(fs::read(&path).unwrap(), b"replacement complete config");
         assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
         fs::remove_dir_all(root).unwrap();
     }
@@ -3232,6 +4174,18 @@ mod tests {
             ui_font_size: 18.0,
             terminal_font_size: 20.0,
             show_hidden_files: true,
+            key_bindings: std::collections::HashMap::from([(
+                "OpenSettings".to_string(),
+                "ctrl-shift-,".to_string(),
+            )]),
+            use_proxy: true,
+            read_env_proxy: true,
+            global_proxy_type: "https".to_string(),
+            global_proxy_host: "proxy.example.test".to_string(),
+            global_proxy_port: Some(8443),
+            global_proxy_user: "proxy-user".to_string(),
+            global_proxy_password: "proxy-password".to_string(),
+            sync_remember_encryption_password: true,
             ..ConfigFile::default()
         };
 
@@ -3243,6 +4197,21 @@ mod tests {
         assert_eq!(decrypted.ui_font_size, 18.0);
         assert_eq!(decrypted.terminal_font_size, 20.0);
         assert!(decrypted.show_hidden_files);
+        assert_eq!(
+            decrypted
+                .key_bindings
+                .get("OpenSettings")
+                .map(String::as_str),
+            Some("ctrl-shift-,")
+        );
+        assert!(decrypted.use_proxy);
+        assert!(decrypted.read_env_proxy);
+        assert_eq!(decrypted.global_proxy_type, "https");
+        assert_eq!(decrypted.global_proxy_host, "proxy.example.test");
+        assert_eq!(decrypted.global_proxy_port, Some(8443));
+        assert_eq!(decrypted.global_proxy_user, "proxy-user");
+        assert_eq!(decrypted.global_proxy_password, "proxy-password");
+        assert!(decrypted.sync_remember_encryption_password);
 
         assert_eq!(decrypted.sessions.len(), 1);
         assert_eq!(decrypted.sessions[0].name, "Test Session");
