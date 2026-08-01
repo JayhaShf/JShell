@@ -27,6 +27,7 @@ use crate::{
         COLLAPSED_SIDEBAR_WIDTH, COMPACT_ICON_SIZE, SFTP_STATUS_HEIGHT, SFTP_TOOLBAR_HEIGHT,
         SIDEBAR_PRIMARY_ACTION_HEIGHT, SIDEBAR_SECTION_HEIGHT, SIDEBAR_WIDTH, TAB_BAR_HEIGHT,
         TERMINAL_KEY_CONTEXT, TERMINAL_PADDING_X, TERMINAL_PADDING_Y, TERMINAL_SCROLLBAR_GUTTER,
+        TITLE_BAR_BRAND_WIDTH,
     },
     app::workspace_tabs::{
         WorkspaceTabColorRole, WorkspaceTabKeyboardAction, WorkspaceTabStatus,
@@ -42,6 +43,13 @@ use crate::{
     system::format_bytes,
     terminal,
 };
+
+fn pane_flex_child(weight: f32) -> gpui::Div {
+    div()
+        .flex_grow(weight)
+        .flex_shrink_1()
+        .flex_basis(relative(0.))
+}
 
 #[derive(Clone)]
 enum WorkspaceCloseTarget {
@@ -2992,14 +3000,13 @@ impl Ashell {
             .border_color(cx.theme().border)
             .child(
                 h_flex()
-                    .w(px(SIDEBAR_WIDTH))
+                    .w(px(TITLE_BAR_BRAND_WIDTH))
                     .h_full()
-                    .px_3()
-                    .gap_2()
                     .items_center()
+                    .justify_center()
+                    .window_control_area(gpui::WindowControlArea::Drag)
                     .text_color(cx.theme().foreground)
-                    .child(Icon::new(IconName::SquareTerminal).size(px(16.)))
-                    .child(div().font_weight(FontWeight::MEDIUM).child("JShell")),
+                    .child(Icon::new(IconName::SquareTerminal).size(px(16.))),
             )
             .child(
                 div()
@@ -3062,6 +3069,9 @@ impl Ashell {
                         div()
                             .flex_1()
                             .min_h(px(0.))
+                            .on_mouse_move(cx.listener(Self::on_pane_mouse_move))
+                            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_pane_mouse_up))
+                            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_pane_mouse_up))
                             .on_prepaint(move |bounds, _window, cx| {
                                 view.update(cx, |this, cx| {
                                     if this.terminal_panel_bounds != Some(bounds) {
@@ -3380,8 +3390,16 @@ impl Ashell {
                 wrapper.into_any_element()
             }
             PaneLayout::Horizontal(children, ratio) => {
+                let split_path = path.to_vec();
+                let view = cx.entity();
                 v_flex()
                     .size_full()
+                    .on_prepaint(move |bounds, _window, cx| {
+                        view.update(cx, |this, _| {
+                            this.split_container_bounds
+                                .insert(split_path.clone(), bounds);
+                        });
+                    })
                     .children(children.iter().enumerate().flat_map(|(i, child)| {
                         let mut items: Vec<gpui::AnyElement> = Vec::new();
                         if i > 0 {
@@ -3414,58 +3432,65 @@ impl Ashell {
                         let mut child_path = path.to_vec();
                         child_path.push(i);
                         items.push(
-                            div()
-                                .flex_grow(if children.len() == 2 {
-                                    if i == 0 { *ratio } else { 1.0 - *ratio }
-                                } else {
-                                    1.0
-                                })
-                                .min_h(px(0.))
-                                .overflow_hidden()
-                                .child(Self::render_pane_tree(this, child, &child_path, window, cx))
-                                .into_any_element(),
+                            pane_flex_child(if children.len() == 2 {
+                                if i == 0 { *ratio } else { 1.0 - *ratio }
+                            } else {
+                                1.0
+                            })
+                            .min_h(px(0.))
+                            .overflow_hidden()
+                            .child(Self::render_pane_tree(this, child, &child_path, window, cx))
+                            .into_any_element(),
                         );
                         items
                     }))
                     .into_any_element()
             }
-            PaneLayout::Vertical(children, ratio) => h_flex()
-                .items_stretch()
-                .size_full()
-                .children(children.iter().enumerate().flat_map(|(i, child)| {
-                    let mut items: Vec<gpui::AnyElement> = Vec::new();
-                    if i > 0 {
-                        let splitter_path = path.to_vec(); // path to the CONTAINER that has the ratio
+            PaneLayout::Vertical(children, ratio) => {
+                let split_path = path.to_vec();
+                let view = cx.entity();
+                h_flex()
+                    .items_stretch()
+                    .size_full()
+                    .on_prepaint(move |bounds, _window, cx| {
+                        view.update(cx, |this, _| {
+                            this.split_container_bounds
+                                .insert(split_path.clone(), bounds);
+                        });
+                    })
+                    .children(children.iter().enumerate().flat_map(|(i, child)| {
+                        let mut items: Vec<gpui::AnyElement> = Vec::new();
+                        if i > 0 {
+                            let splitter_path = path.to_vec(); // path to the CONTAINER that has the ratio
+                            items.push(
+                                div()
+                                    .w(px(4.))
+                                    .h_full()
+                                    .flex_none()
+                                    .cursor_col_resize()
+                                    .bg(cx.theme().border)
+                                    .hover(|s| s.bg(cx.theme().accent))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, event, window, cx| {
+                                            window.prevent_default();
+                                            cx.stop_propagation();
+                                            this.start_drag_split(
+                                                splitter_path.clone(),
+                                                i,
+                                                event,
+                                                window,
+                                                cx,
+                                            );
+                                        }),
+                                    )
+                                    .into_any_element(),
+                            );
+                        }
+                        let mut child_path = path.to_vec();
+                        child_path.push(i);
                         items.push(
-                            div()
-                                .w(px(4.))
-                                .h_full()
-                                .flex_none()
-                                .cursor_col_resize()
-                                .bg(cx.theme().border)
-                                .hover(|s| s.bg(cx.theme().accent))
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, event, window, cx| {
-                                        window.prevent_default();
-                                        cx.stop_propagation();
-                                        this.start_drag_split(
-                                            splitter_path.clone(),
-                                            i,
-                                            event,
-                                            window,
-                                            cx,
-                                        );
-                                    }),
-                                )
-                                .into_any_element(),
-                        );
-                    }
-                    let mut child_path = path.to_vec();
-                    child_path.push(i);
-                    items.push(
-                        div()
-                            .flex_grow(if children.len() == 2 {
+                            pane_flex_child(if children.len() == 2 {
                                 if i == 0 { *ratio } else { 1.0 - *ratio }
                             } else {
                                 1.0
@@ -3474,10 +3499,11 @@ impl Ashell {
                             .overflow_hidden()
                             .child(Self::render_pane_tree(this, child, &child_path, window, cx))
                             .into_any_element(),
-                    );
-                    items
-                }))
-                .into_any_element(),
+                        );
+                        items
+                    }))
+                    .into_any_element()
+            }
         }
     }
 
@@ -3939,5 +3965,20 @@ impl Render for Ashell {
                     });
                 }
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pane_flex_child_uses_zero_basis_for_exact_ratios() {
+        let mut child = pane_flex_child(0.25);
+        let style = child.style();
+
+        assert_eq!(style.flex_grow, Some(0.25));
+        assert_eq!(style.flex_shrink, Some(1.0));
+        assert_eq!(style.flex_basis, Some(relative(0.).into()));
     }
 }

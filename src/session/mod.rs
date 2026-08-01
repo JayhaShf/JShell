@@ -6,7 +6,7 @@ pub mod ssh_keys;
 
 use gpui::{
     AppContext as _, Context, Entity, Focusable as _, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, SharedString, Window, px,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Size, Window, px,
 };
 use gpui_component::{Theme, WindowExt as _, input::InputState};
 use rust_i18n::t;
@@ -46,6 +46,47 @@ pub(crate) fn proxy_type_for_policy(current: &str, policy: SessionProxyPolicy) -
             _ => "socks5".to_string(),
         },
     }
+}
+
+fn split_drag_ratio_delta(
+    layout: &PaneLayout,
+    parent_path: &[usize],
+    origin: Point<Pixels>,
+    position: Point<Pixels>,
+    viewport: Size<Pixels>,
+) -> Option<f32> {
+    let is_horizontal = Ashell::is_layout_horizontal_at(layout, parent_path);
+    let delta: f32 = if is_horizontal {
+        (position.y - origin.y).into()
+    } else {
+        (position.x - origin.x).into()
+    };
+    if delta.abs() < 5.0 {
+        return None;
+    }
+
+    let total_size: f32 = if is_horizontal {
+        viewport.height.into()
+    } else {
+        viewport.width.into()
+    };
+    (total_size > 0.0).then_some(delta / total_size)
+}
+
+fn split_drag_viewport_size(
+    split_viewport: Option<Size<Pixels>>,
+    pane_viewport: Option<Size<Pixels>>,
+    window_viewport: Size<Pixels>,
+) -> Size<Pixels> {
+    split_viewport.or(pane_viewport).unwrap_or(window_viewport)
+}
+
+fn clear_split_drag_state(
+    dragging_splitter: &mut Option<(Vec<usize>, usize)>,
+    drag_split_origin: &mut Option<Point<Pixels>>,
+) {
+    *dragging_splitter = None;
+    *drag_split_origin = None;
 }
 
 pub(crate) fn supported_proxy_protocol(proxy_type: &str) -> Option<String> {
@@ -239,7 +280,7 @@ impl Ashell {
             session.last_used = existing_last_used;
 
             self.config.upsert(session.clone());
-            if let Err(err) = self.config.save() {
+            if let Err(err) = self.save_config_now() {
                 tracing::warn!("failed to save config: {err:#}");
             }
 
@@ -347,7 +388,7 @@ impl Ashell {
             proxy_password,
         );
         self.config.upsert(session.clone());
-        if let Err(err) = self.config.save() {
+        if let Err(err) = self.save_config_now() {
             tracing::warn!("failed to save config: {err:#}");
         }
 
@@ -824,7 +865,7 @@ impl Ashell {
             SessionFolder::new(name, session_ids)
         };
         self.config.upsert_session_folder(folder);
-        if let Err(err) = self.config.save() {
+        if let Err(err) = self.save_config_now() {
             tracing::warn!("failed to save session folders: {err:#}");
             self.status = "failed to save session folder".into();
             cx.notify();
@@ -841,7 +882,7 @@ impl Ashell {
 
     pub(crate) fn remove_session_folder(&mut self, folder_id: String, cx: &mut Context<Self>) {
         self.config.remove_session_folder(&folder_id);
-        if let Err(err) = self.config.save() {
+        if let Err(err) = self.save_config_now() {
             tracing::warn!("failed to remove session folder: {err:#}");
             self.status = "failed to remove session folder".into();
         } else {
@@ -876,7 +917,7 @@ impl Ashell {
             cx.notify();
             return;
         }
-        if let Err(err) = self.config.save() {
+        if let Err(err) = self.save_config_now() {
             tracing::warn!("failed to update session folder membership: {err:#}");
             self.status = "failed to update session folder".into();
             cx.notify();
@@ -1116,7 +1157,7 @@ impl Ashell {
 
     pub(crate) fn remove_saved_session(&mut self, session_id: String, cx: &mut Context<Self>) {
         self.config.remove(&session_id);
-        if let Err(err) = self.config.save() {
+        if let Err(err) = self.save_config_now() {
             tracing::warn!("failed to save config: {err:#}");
         }
         self.status = "session removed".into();
@@ -2007,30 +2048,60 @@ impl Ashell {
         let Some(origin) = self.drag_split_origin else {
             return;
         };
-        let total = window.viewport_size();
-        let is_horizontal = Self::is_layout_horizontal_at(&self.pane_root, parent_path);
-        let delta: f32 = if is_horizontal {
-            (event.position.y - origin.y).into()
-        } else {
-            (event.position.x - origin.x).into()
+        let Some(ratio_delta) = split_drag_ratio_delta(
+            &self.pane_root,
+            parent_path,
+            origin,
+            event.position,
+            split_drag_viewport_size(
+                self.split_container_bounds
+                    .get(parent_path)
+                    .map(|bounds| bounds.size),
+                self.terminal_panel_bounds
+                    .as_ref()
+                    .map(|bounds| bounds.size),
+                window.viewport_size(),
+            ),
+        ) else {
+            return;
         };
-        let total_size: f32 = if is_horizontal {
-            total.height.into()
-        } else {
-            total.width.into()
-        };
-        if delta.abs() < 5.0 {
-            return; // dead zone
-        }
-        let ratio_delta = delta / total_size;
         Self::adjust_split_ratio(&mut self.pane_root, parent_path, child_idx, ratio_delta);
         self.drag_split_origin = Some(event.position);
         self.sync_pane_root_to_group();
     }
 
+    pub(crate) fn on_pane_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.dragging_splitter.is_none() {
+            return;
+        }
+        if event.pressed_button == Some(MouseButton::Left) {
+            self.on_split_drag_move(event, window, cx);
+        } else {
+            self.end_drag_split();
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn on_pane_mouse_up(
+        &mut self,
+        _event: &MouseUpEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.dragging_splitter.is_none() && self.drag_split_origin.is_none() {
+            return;
+        }
+        self.end_drag_split();
+        cx.notify();
+    }
+
     pub(crate) fn end_drag_split(&mut self) {
-        self.dragging_splitter = None;
-        self.drag_split_origin = None;
+        clear_split_drag_state(&mut self.dragging_splitter, &mut self.drag_split_origin);
     }
 
     fn is_layout_horizontal_at(layout: &PaneLayout, path: &[usize]) -> bool {
@@ -2082,6 +2153,204 @@ mod tests {
         );
         session.id = id.to_string();
         session
+    }
+
+    #[test]
+    fn split_drag_uses_the_layout_axis_and_preserves_the_dead_zone() {
+        let horizontal = PaneLayout::Horizontal(
+            vec![PaneLayout::terminal("top"), PaneLayout::terminal("bottom")],
+            0.5,
+        );
+        let origin = gpui::point(px(100.0), px(100.0));
+        let viewport = gpui::size(px(1000.0), px(400.0));
+
+        assert_eq!(
+            split_drag_ratio_delta(
+                &horizontal,
+                &[],
+                origin,
+                gpui::point(px(400.0), px(104.0)),
+                viewport,
+            ),
+            None
+        );
+        assert_eq!(
+            split_drag_ratio_delta(
+                &horizontal,
+                &[],
+                origin,
+                gpui::point(px(400.0), px(120.0)),
+                viewport,
+            ),
+            Some(0.05)
+        );
+
+        let vertical = PaneLayout::Vertical(
+            vec![PaneLayout::terminal("left"), PaneLayout::terminal("right")],
+            0.5,
+        );
+        assert_eq!(
+            split_drag_ratio_delta(
+                &vertical,
+                &[],
+                origin,
+                gpui::point(px(104.0), px(300.0)),
+                viewport,
+            ),
+            None
+        );
+        assert_eq!(
+            split_drag_ratio_delta(
+                &vertical,
+                &[],
+                origin,
+                gpui::point(px(150.0), px(300.0)),
+                viewport,
+            ),
+            Some(0.05)
+        );
+    }
+
+    #[test]
+    fn split_drag_uses_pane_root_size_instead_of_window_size() {
+        let layout = PaneLayout::Horizontal(
+            vec![PaneLayout::terminal("top"), PaneLayout::terminal("bottom")],
+            0.5,
+        );
+        let pane_viewport = split_drag_viewport_size(
+            None,
+            Some(gpui::size(px(100.0), px(200.0))),
+            gpui::size(px(1000.0), px(1000.0)),
+        );
+
+        let delta = split_drag_ratio_delta(
+            &layout,
+            &[],
+            gpui::point(px(10.0), px(20.0)),
+            gpui::point(px(10.0), px(40.0)),
+            pane_viewport,
+        )
+        .unwrap();
+
+        assert!((delta - 0.1).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn nested_split_drag_uses_its_own_container_size() {
+        let layout = PaneLayout::Vertical(
+            vec![PaneLayout::terminal("left"), PaneLayout::terminal("right")],
+            0.5,
+        );
+        let nested_viewport = split_drag_viewport_size(
+            Some(gpui::size(px(200.0), px(400.0))),
+            Some(gpui::size(px(1000.0), px(800.0))),
+            gpui::size(px(1600.0), px(900.0)),
+        );
+
+        let delta = split_drag_ratio_delta(
+            &layout,
+            &[],
+            gpui::point(px(100.0), px(100.0)),
+            gpui::point(px(120.0), px(100.0)),
+            nested_viewport,
+        )
+        .unwrap();
+
+        assert!((delta - 0.1).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn split_drag_clamps_ratio_at_both_limits() {
+        let mut layout = PaneLayout::Vertical(
+            vec![PaneLayout::terminal("left"), PaneLayout::terminal("right")],
+            0.85,
+        );
+
+        Ashell::adjust_split_ratio(&mut layout, &[], 1, 0.2);
+        assert!(matches!(layout, PaneLayout::Vertical(_, ratio) if ratio == 0.9));
+
+        Ashell::adjust_split_ratio(&mut layout, &[], 1, -1.0);
+        assert!(matches!(layout, PaneLayout::Vertical(_, ratio) if ratio == 0.1));
+    }
+
+    #[test]
+    fn split_drag_nested_path_uses_the_target_layout_axis() {
+        let layout = PaneLayout::Horizontal(
+            vec![
+                PaneLayout::Vertical(
+                    vec![PaneLayout::terminal("left"), PaneLayout::terminal("right")],
+                    0.4,
+                ),
+                PaneLayout::Horizontal(
+                    vec![PaneLayout::terminal("top"), PaneLayout::terminal("bottom")],
+                    0.7,
+                ),
+            ],
+            0.6,
+        );
+        let origin = gpui::point(px(100.0), px(100.0));
+        let viewport = gpui::size(px(1000.0), px(400.0));
+
+        assert_eq!(
+            split_drag_ratio_delta(
+                &layout,
+                &[0],
+                origin,
+                gpui::point(px(200.0), px(104.0)),
+                viewport,
+            ),
+            Some(0.1)
+        );
+        assert_eq!(
+            split_drag_ratio_delta(
+                &layout,
+                &[1],
+                origin,
+                gpui::point(px(104.0), px(140.0)),
+                viewport,
+            ),
+            Some(0.1)
+        );
+    }
+
+    #[test]
+    fn split_drag_nested_ratio_update_leaves_other_levels_unchanged() {
+        let mut layout = PaneLayout::Horizontal(
+            vec![
+                PaneLayout::Vertical(
+                    vec![PaneLayout::terminal("left"), PaneLayout::terminal("right")],
+                    0.5,
+                ),
+                PaneLayout::Horizontal(
+                    vec![PaneLayout::terminal("top"), PaneLayout::terminal("bottom")],
+                    0.75,
+                ),
+            ],
+            0.625,
+        );
+
+        Ashell::adjust_split_ratio(&mut layout, &[0], 1, 0.125);
+
+        let PaneLayout::Horizontal(children, root_ratio) = layout else {
+            panic!("expected horizontal root");
+        };
+        assert_eq!(root_ratio, 0.625);
+        assert!(matches!(children[0], PaneLayout::Vertical(_, ratio) if ratio == 0.625));
+        assert!(matches!(children[1], PaneLayout::Horizontal(_, ratio) if ratio == 0.75));
+    }
+
+    #[test]
+    fn split_drag_state_clear_removes_both_values_and_is_idempotent() {
+        let mut dragging_splitter = Some((vec![0, 1], 1));
+        let mut drag_split_origin = Some(gpui::point(px(120.0), px(80.0)));
+
+        clear_split_drag_state(&mut dragging_splitter, &mut drag_split_origin);
+        assert_eq!(dragging_splitter, None);
+        assert_eq!(drag_split_origin, None);
+
+        clear_split_drag_state(&mut dragging_splitter, &mut drag_split_origin);
+        assert_eq!(dragging_splitter, None);
+        assert_eq!(drag_split_origin, None);
     }
 
     #[test]

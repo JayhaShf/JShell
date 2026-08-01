@@ -3,8 +3,8 @@ use std::ops::Range;
 use alacritty_terminal::index::Side;
 use alacritty_terminal::selection::SelectionType;
 use gpui::{
-    Context, Focusable as _, KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Point, ScrollDelta, ScrollWheelEvent, Window, px,
+    Context, Focusable as _, KeyDownEvent, KeyUpEvent, Modifiers, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollDelta, ScrollWheelEvent, Window, px,
 };
 
 use crate::{
@@ -14,6 +14,24 @@ use crate::{
 
 thread_local! {
     static LAST_DRAG_SCROLL: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+}
+
+fn terminal_zoom_modifier(modifiers: &Modifiers) -> bool {
+    modifiers.secondary()
+}
+
+fn terminal_zoom_delta(accumulator: &mut f32, delta: f32) -> Option<f32> {
+    const SCROLL_PER_STEP: f32 = 20.0;
+    const FONT_SIZE_PER_STEP: f32 = 0.5;
+
+    *accumulator += delta;
+    let zoom_steps = (*accumulator / SCROLL_PER_STEP).trunc();
+    if zoom_steps == 0.0 {
+        return None;
+    }
+
+    *accumulator -= zoom_steps * SCROLL_PER_STEP;
+    Some(zoom_steps * FONT_SIZE_PER_STEP)
 }
 
 impl Ashell {
@@ -312,18 +330,10 @@ impl Ashell {
     pub(crate) fn on_terminal_mouse_move(
         &mut self,
         event: &MouseMoveEvent,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Handle split drag
         if self.dragging_splitter.is_some() {
-            if event.pressed_button == Some(MouseButton::Left) {
-                self.on_split_drag_move(event, window, cx);
-                cx.notify();
-            } else {
-                self.end_drag_split();
-                cx.notify();
-            }
             return;
         }
 
@@ -418,7 +428,7 @@ impl Ashell {
         cx: &mut Context<Self>,
     ) {
         if self.dragging_splitter.is_some() {
-            self.end_drag_split();
+            return;
         }
         self.terminal_selecting = false;
         cx.notify();
@@ -466,18 +476,16 @@ impl Ashell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Platform modifier (Cmd on macOS, Ctrl on Windows/Linux) + scroll → zoom terminal font size
-        if event.modifiers.platform {
+        // Cmd on macOS, Ctrl on Windows/Linux + scroll zooms the terminal font.
+        if terminal_zoom_modifier(&event.modifiers) {
             let delta = match event.delta {
                 ScrollDelta::Lines(point) => point.y * 20.0,
                 ScrollDelta::Pixels(point) => point.y.as_f32(),
             };
-            self.terminal_zoom_accumulator += delta;
-            let step = 20.0;
-            if self.terminal_zoom_accumulator.abs() >= step {
-                let zoom_steps = (self.terminal_zoom_accumulator / step).trunc();
-                self.terminal_zoom_accumulator -= zoom_steps * step;
-                self.change_terminal_font_size(zoom_steps * 0.5, cx);
+            if let Some(font_delta) =
+                terminal_zoom_delta(&mut self.terminal_zoom_accumulator, delta)
+            {
+                self.change_terminal_font_size(font_delta, cx);
             }
             window.prevent_default();
             cx.stop_propagation();
@@ -564,5 +572,40 @@ impl Ashell {
             cx.stop_propagation();
             cx.notify();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::Modifiers;
+
+    use super::{terminal_zoom_delta, terminal_zoom_modifier};
+
+    #[test]
+    fn terminal_zoom_uses_the_platform_secondary_modifier() {
+        assert!(terminal_zoom_modifier(&Modifiers::secondary_key()));
+        assert!(!terminal_zoom_modifier(&Modifiers::none()));
+        assert!(!terminal_zoom_modifier(&Modifiers::alt()));
+        assert!(!terminal_zoom_modifier(&Modifiers::shift()));
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert!(terminal_zoom_modifier(&Modifiers::control()));
+            assert!(!terminal_zoom_modifier(&Modifiers::windows()));
+        }
+
+        #[cfg(target_os = "macos")]
+        assert!(terminal_zoom_modifier(&Modifiers::command()));
+    }
+
+    #[test]
+    fn terminal_zoom_accumulates_partial_wheel_motion_and_preserves_remainder() {
+        let mut accumulator = 0.0;
+        assert_eq!(terminal_zoom_delta(&mut accumulator, 8.0), None);
+        assert_eq!(terminal_zoom_delta(&mut accumulator, 15.0), Some(0.5));
+        assert_eq!(accumulator, 3.0);
+
+        assert_eq!(terminal_zoom_delta(&mut accumulator, -45.0), Some(-1.0));
+        assert_eq!(accumulator, -2.0);
     }
 }

@@ -2,6 +2,7 @@ pub(crate) const DEFAULT_COLS: u16 = 100;
 pub(crate) const DEFAULT_ROWS: u16 = 30;
 pub(crate) const SIDEBAR_WIDTH: f32 = 220.0;
 pub(crate) const COLLAPSED_SIDEBAR_WIDTH: f32 = 40.0;
+pub(crate) const TITLE_BAR_BRAND_WIDTH: f32 = COLLAPSED_SIDEBAR_WIDTH;
 pub(crate) const COMPACT_ICON_SIZE: f32 = 14.0;
 pub(crate) const SIDEBAR_SECTION_HEIGHT: f32 = 30.0;
 pub(crate) const SIDEBAR_PRIMARY_ACTION_HEIGHT: f32 = 32.0;
@@ -42,6 +43,11 @@ mod tests {
         assert_eq!(SIDEBAR_PRIMARY_ACTION_HEIGHT, 32.0);
         assert_eq!(SFTP_TOOLBAR_HEIGHT, 32.0);
         assert_eq!(SFTP_STATUS_HEIGHT, 26.0);
+    }
+
+    #[test]
+    fn title_bar_brand_matches_the_compact_workspace_rail() {
+        assert_eq!(TITLE_BAR_BRAND_WIDTH, COLLAPSED_SIDEBAR_WIDTH);
     }
 
     #[test]

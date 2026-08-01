@@ -43,6 +43,20 @@ pub(crate) fn validated_theme_name(name: &str, is_dark: bool) -> &'static str {
     }
 }
 
+fn resolved_display_locale(configured: &str, system_locale: Option<&str>) -> String {
+    match configured {
+        "zh-CN" => "zh-CN".to_string(),
+        "en" => "en".to_string(),
+        _ => {
+            if system_locale.is_some_and(|locale| locale.starts_with("zh")) {
+                "zh-CN".to_string()
+            } else {
+                "en".to_string()
+            }
+        }
+    }
+}
+
 fn pick_installed_font(installed: &[String], preferred: &[&str], fallback: &str) -> String {
     preferred
         .iter()
@@ -261,18 +275,20 @@ impl Ashell {
         cx: &mut Context<Self>,
     ) {
         self.config.set_locale(locale);
-        let mut active_locale = locale.to_string();
-        if active_locale == "system" {
-            active_locale = sys_locale::get_locale().unwrap_or_else(|| "en".to_string());
-            if active_locale.starts_with("zh") {
-                active_locale = "zh-CN".to_string();
-            } else {
-                active_locale = "en".to_string();
-            }
-        }
+        self.apply_runtime_display_language(locale, window, cx);
+        self.save_preferences_background();
+    }
+
+    pub(crate) fn apply_runtime_display_language(
+        &mut self,
+        locale: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let system_locale = sys_locale::get_locale();
+        let active_locale = resolved_display_locale(locale, system_locale.as_deref());
         rust_i18n::set_locale(&active_locale);
         gpui_component::set_locale(&active_locale);
-        self.save_preferences_background();
         window.refresh();
         cx.notify();
     }
@@ -336,6 +352,18 @@ mod tests {
         assert_eq!(validated_theme_name("Ashell Light", false), "JShell Light");
         assert_eq!(validated_theme_name("Tokyo Night", true), "JShell Dark");
         assert_eq!(validated_theme_name("Solarized", false), "JShell Light");
+    }
+
+    #[test]
+    fn display_locale_resolves_system_language_and_preserves_explicit_choices() {
+        assert_eq!(
+            resolved_display_locale("system", Some("zh-Hans-CN")),
+            "zh-CN"
+        );
+        assert_eq!(resolved_display_locale("system", Some("en-US")), "en");
+        assert_eq!(resolved_display_locale("system", None), "en");
+        assert_eq!(resolved_display_locale("zh-CN", Some("en-US")), "zh-CN");
+        assert_eq!(resolved_display_locale("en", Some("zh-CN")), "en");
     }
 
     #[test]
