@@ -1,157 +1,95 @@
-# JShell 代理链路与审计基线报告
+# JShell 项目审计报告
 
-> 状态更新（2026-07-31）：本文主体保留 2026-07-29 的历史审计证据。当时记录的 `RUSTSEC-2023-0071` 和 7 条维护性告警已经在 `0.1.0-beta.2` 依赖维护中消除；当前结论与验证命令见 `docs/RELEASE_AUDIT_0.1.0-beta.2.md`。
+- 审计日期：2026-08-01
+- 审计对象：`0.1.0-beta.2` 本地发布候选
+- 审计范围：当前修改涉及的分屏、配置写入、R2 手动同步、凭据保护、载荷校验、发布工作流、文档与 Release 产物
+- 范围说明：本轮按用户要求只复审当前修改及其直接依赖，不重新审计未改动的全部业务模块。
 
-审计日期：2026-07-29
-审计范围：`D:\Git\ashell`
-范围约束：本轮仅修改 `src/backend/ssh.rs` 与 `AUDIT_REPORT.md`，未改 `.github`、发布流程、脚本或安装包配置，本轮未执行 `push`
+## 1. 审计结论
 
-## 1. 本轮结论
+当前修改范围内未发现仍未处理的 P0 或 P1 问题。此前审查发现的嵌套分屏比例、配置并发写盘、同步凭据部分提交、旧预览/冲突误用、非法快捷键载荷崩溃风险和 Release 工作流权限过宽均已修复并加入回归测试。
 
-本轮完成了 SSH 代理链路状态文本与审计基线刷新：
+`RUSTSEC-2023-0071` 对应的 RustCrypto `rsa` crate 不在最终锁定依赖图中。2026-08-01 获取的 RustSec 官方公告库提交 `685d32fd681b540aa64019820639613c5a4fd922` 已用于本地审计，1177 条公告扫描 1024 个锁定依赖后返回成功。
 
-1. SSH 连接状态现在明确显示实际路由：
-   - 无代理时显示 `DIRECT`
-   - SOCKS5 代理时显示 `SOCKS5`
-   - HTTP 代理时显示 `HTTP`
-   - HTTPS 代理时显示 `HTTPS`
-2. 连接状态文本仅包含协议、主机、端口，不包含代理密码、`Basic` 值、`Proxy-Authorization` 头或完整 CONNECT 请求。
-3. `connect_and_authenticate` 使用 `active_proxy(...)` 的实际解析结果生成状态文本，状态展示与真实连接路线一致。
-4. 本轮未发现新的高危问题；`cargo audit` 仍有 1 条已知漏洞和 7 条维护性告警，退出码为 1，原因符合预期。
+本地 Release 已重新构建并通过隔离配置启动冒烟。当前仍未执行的是分批提交、推送后的 GitHub Actions、`v0.1.0-beta.2` 标签和 GitHub Release；因此本报告将该版本判定为“本地发布候选已通过门禁，待推送与托管发布验证”，不声明已经发布。
 
-## 2. 代码变更结论
+## 2. 本轮修复
 
-### 2.1 SSH 状态文本
+### 2.1 分屏与界面状态
 
-`src/backend/ssh.rs` 新增：
+- 每个嵌套 split 容器记录自己的实际 Bounds，拖动比例不再错误使用整个 pane 根区域。
+- 回归场景固定为：根宽 1000、嵌套宽 200、水平拖动 20 像素，ratio 变化 10%。
+- 保留 5 像素死区、10%-90% 限制、释放鼠标后清理拖动状态。
 
-- `proxy_connection_status(target, proxy)` 统一生成连接状态文本。
+### 2.2 配置写入一致性
 
-实际行为：
+- 新增统一的配置写入协调器，后台偏好保存与会话、文件夹、传输记录、导入配置、窗口布局和同步写盘共用串行锁与版本屏障。
+- 同步或其他直接写入会淘汰更早排队的偏好快照，避免旧快照覆盖新 sessions、ETag 或偏好。
+- 所有生产路径中的直接 `ConfigStore::save()` 已接入统一协调器；初始化迁移和单元测试除外。
 
-- `proxy_connection_status("host:22", None)` 返回包含 `DIRECT`
-- `proxy_connection_status("host:22", Some(("socks5", ...)))` 返回包含 `SOCKS5`
-- `proxy_connection_status("host:22", Some(("http", ...)))` 返回包含 `HTTP`
-- `proxy_connection_status("host:22", Some(("https", ...)))` 返回包含 `HTTPS`
+### 2.3 R2、凭据与预览事务
 
-### 2.2 脱敏边界
+- 上传成功和下载确认先验证并更新系统凭据库，再原子写入本地配置；任一步失败都会保留或恢复旧状态。
+- 本地配置写入失败时恢复先前的同步密码和 R2 Secret；先前不存在的条目会被删除，不留下孤儿凭据。
+- 关闭“记住同步密码”时，删除失败不会把本地标记写成关闭。
+- 下载预览采用确认时的当前“记住密码”选择。
+- provider 或同步表单发生变化时，旧下载预览和上传冲突操作立即失效。
+- 预览和覆盖确认同时校验目标指纹与完整远端连接快照；R2 Access Key ID 改变时，即使桶和对象路径相同，也不能应用旧预览。
 
-本轮核对 `src/backend/ssh.rs` 后确认：
+### 2.4 同步载荷校验
 
-1. 状态函数只接收 `proxy_type`、`host`、`port`。
-2. `connect_and_authenticate` 不把 `proxy.password`、`Session.proxy_password` 传给状态函数。
-3. 本文件未新增对 `Basic`、`Proxy-Authorization` 或完整 CONNECT 请求的日志输出。
-4. 允许暴露的信息仍限于协议、主机、端口和用户名。
+- v1/v2 Session 和 v2 SessionFolder 使用 `deny_unknown_fields` 的严格 DTO，再显式转换为运行时类型。
+- 快捷键 action 仅允许应用实际支持的动作；按键序列逐 stroke 使用 GPUI `Keystroke::parse` 校验。
+- 合法 chord、空字符串和 `none` 保持兼容；未知动作、非法语法和仅空白值会被拒绝，不再进入可能 panic 的运行时绑定路径。
+- 预览中的偏好类别数改为与当前本地配置比较后的实际变化数，不再固定显示 3。
 
-## 3. 代理与 TLS 审计基线
+### 2.5 发布工作流
 
-根据当前代码与本轮复核结果：
+- CI 和 Release 顶层权限收紧为 `contents: read`，仅发布 job 使用 `contents: write`。
+- 所有 checkout 均设置 `persist-credentials: false`。
+- 18 个 Action 引用全部固定到 40 位提交 SHA，并已根据官方 ref 复核。
+- `cargo-audit` 固定为 `0.22.0`。
+- Release 使用固定 RustSec 公告库提交并加 `--no-fetch`，历史标签重跑不会因公告库漂移而改变结果；日常 CI 仍检查当前公告库。
 
-1. 环境代理支持 `SOCKS5`、`HTTP`、`HTTPS`。
-2. 会话显式选择 `direct` 时，会绕过环境代理与全局代理，并显式走 `DIRECT`。
-3. HTTPS 代理通过系统根证书建立 TLS，执行证书链与主机名校验。
-4. HTTPS 代理握手失败或 CONNECT 失败时，不会降级为直连。
-5. 现有测试继续覆盖：
-   - HTTPS 代理可信证书建立隧道
-   - 不可信证书拒绝
-   - 主机名不匹配拒绝
-   - CONNECT 非成功状态拒绝
-   - TLS / CONNECT 失败不回退直连
-   - 错误消息不泄露 `Basic` 和 `Proxy-Authorization`
+## 3. 最终本地验证
 
-## 4. TDD 证据
+以下命令均在 `D:\Git\ashell` 的最终工作树执行：
 
-### RED
-
-先新增测试 `proxy_connection_status_reports_route_without_credentials` 后执行：
-
-```text
-cargo test --locked --quiet proxy_connection_status_reports_route_without_credentials
-```
-
-得到预期失败，原因是生产函数尚不存在：
-
-```text
-cannot find function `proxy_connection_status` in module `super`
-```
-
-报错位置为 `src/backend/ssh.rs:856` 与 `src/backend/ssh.rs:868`。
-
-### GREEN
-
-实现 `proxy_connection_status(...)` 并在 `connect_and_authenticate(...)` 中接入后，再执行同一测试：
-
-```text
-running 1 test
-.
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 149 filtered out
-```
-
-## 5. 本轮实际验证结果
-
-以下结果均来自本轮在 `D:\Git\ashell` 的实际执行：
-
-| 命令 | 实际结果 |
+| 检查 | 结果 |
 |---|---|
-| `cargo fmt --check` | 通过 |
-| `cargo test --locked --quiet` | 通过，150 passed，0 failed，0 ignored，0 measured，0 filtered out |
+| `cargo fmt --all -- --check` | 通过 |
+| `cargo test --locked --quiet` | 316 passed，0 failed |
 | `cargo check --locked --all-targets` | 通过 |
 | `cargo clippy --locked --all-targets --all-features -- -D warnings` | 通过 |
-| `cargo build` | 通过 |
-| `cargo audit` | 退出码 1，实际为 1 条漏洞 + 7 条维护性告警 |
+| `cargo audit --deny warnings --file Cargo.lock --db <clean-db> --no-fetch` | 通过；1177 条公告，1024 个依赖 |
+| `cargo tree -i rsa --locked` | 未匹配到 `rsa` crate |
+| GitHub Actions YAML 与固定 SHA 静态检查 | 通过 |
 | `git diff --check` | 通过 |
+| `cargo build --locked --release` | 通过 |
+| 隔离 HOME/USERPROFILE 启动冒烟 | 通过，测试进程已关闭 |
 
-补充说明：
+最终 Windows 产物：
 
-1. `cargo check` 与 `cargo clippy` 均提示 `proc-macro-error2 v2.0.1` 存在 future-incompatibility 提示，但未导致失败。
-2. `cargo build` 与单测链接阶段出现 Windows 链接器标准提示，未导致构建失败。
+- 路径：`D:\Git\ashell\target\release\jshell.exe`
+- 大小：79,746,560 字节
+- SHA-256：`F8BF82325F1F74D90F02AEB27BF981FA563F50CE1118A4CFBA5FB5DFD4A2FA11`
+- 构建时间：2026-08-01 18:55:52（Asia/Shanghai）
 
-## 6. `cargo audit` 实际基线
+启动冒烟前后，用户现有配置文件 SHA-256 均为：
 
-本轮 `cargo audit` 输出显示：
+`B6D937EA3591FCBE1C52465BCD8808F94491F7C9E7BDFBB4572FCA6A69872461`
 
-- 锁定依赖总数：`1032`
-- 已确认漏洞：`1`
-- 维护性告警：`7`
-- 退出码：`1`
+测试结束后不存在由本轮启动而残留的 JShell 进程。
 
-### 6.1 已知漏洞
+## 4. 已知边界与发布前事项
 
-1. `RUSTSEC-2023-0071`
-   - Crate：`rsa 0.10.0-rc.16`
-   - 标题：`Marvin Attack: potential key recovery through timing sidechannels`
-   - 严重级别：`5.9 (medium)`
-   - 状态：`No fixed upgrade is available!`
-   - 结论：本轮保持记录，不新增 ignore 规则
+- 系统凭据库与配置文件属于两个独立存储，代码已对可报告错误执行补偿回滚；若操作系统在两次存储操作之间被强制终止，仍可能需要用户重新输入同步凭据。
+- 本轮未使用真实 Cloudflare R2 账户写入对象；网络语义由本地 HTTP/AWS SigV4 集成测试验证，GUI 已验证 provider 切换、窄窗口布局和错误状态。
+- 真实 Linux SSH/SFTP 上传、删除、断线恢复以及远端编辑冲突仍建议在非生产测试主机上做发布前人工复核。
+- 推送后必须等待 CI 全部通过，再创建 `v0.1.0-beta.2` 标签；旧标签 `v0.1.0-beta.1` 不移动、不覆盖。
 
-### 6.2 维护性告警
+## 5. 发布判定
 
-本轮实际告警如下：
+当前判定：**本地发布候选门禁通过，可以分批提交并推送 `main`；托管 CI 通过后进入标签和 Release 流程。**
 
-1. `RUSTSEC-2025-0052`：`async-std 1.13.2` 已停止维护
-2. `RUSTSEC-2024-0384`：`instant 0.1.13` 已停止维护
-3. `RUSTSEC-2024-0436`：`paste 1.0.15` 已停止维护
-4. `RUSTSEC-2026-0173`：`proc-macro-error2 2.0.1` 已停止维护
-5. `RUSTSEC-2025-0134`：`rustls-pemfile 2.2.0` 已停止维护
-6. `RUSTSEC-2026-0206`：`rustybuzz 0.20.1` 已停止维护
-7. `RUSTSEC-2026-0192`：`ttf-parser 0.25.1` 已停止维护
-
-与此前报告相比，基线仍为“1 条漏洞 + 7 条维护性告警”，但本轮按实际输出精确更新了公告编号与条目。
-
-## 7. 手动 Debug 冒烟
-
-本轮未阻塞在手动 Debug 窗口验证。
-
-原因与限制：
-
-1. 本任务目标是状态文本、脱敏和审计基线，不依赖 GUI 交互才能确认。
-2. 若启动 Debug 窗口，自动验证其显示内容的可靠性不足，不能稳定证明状态栏文案。
-3. 因已有单元测试与全量构建验证，本轮未额外启动长期运行实例。
-
-## 8. 事实状态
-
-1. 当前工作仅形成本地改动与本地提交，本轮未 `push`。
-2. 审计报告已与本轮实测一致，不再保留“已推送”或“已同步远端”表述。
-3. 本轮仅应存在以下改动文件：
-   - `src/backend/ssh.rs`
-   - `AUDIT_REPORT.md`
+详细清单见 [JShell v0.1.0-beta.2 发布候选审计与验收记录](docs/RELEASE_AUDIT_0.1.0-beta.2.md)。

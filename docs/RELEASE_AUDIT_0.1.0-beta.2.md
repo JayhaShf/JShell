@@ -1,75 +1,97 @@
-# JShell v0.1.0-beta.2 发布审计与任务完成记录
+# JShell v0.1.0-beta.2 发布候选审计与验收记录
 
-审计日期：2026-07-31
-审计范围：当前分支相对 `v0.1.0-beta.1` 的依赖、安全、品牌和发布收尾修改
-审计原则：复核本轮修改及此前对话要求的落地状态，不重新审计无关模块
+- 记录日期：2026-08-01
+- 候选版本：`0.1.0-beta.2`
+- 当前状态：本地门禁通过，待分批提交、推送、托管 CI、标签和 GitHub Release
+- 审查范围：相对当前 `origin/main` 的本地功能、安全、品牌、文档与发布收尾修改
 
-## 1. 结论
+## 1. 发布状态
 
-此前对话要求的代码、中文文档、品牌资源和构建流程均已落地。`RUSTSEC-2023-0071` 对应的 RustCrypto `rsa` crate 已从最终依赖图移除，`cargo audit` 当前无漏洞或维护性告警。旧标签 `v0.1.0-beta.1` 保持不动，本轮版本递增为 `0.1.0-beta.2`。
+本文件记录 `v0.1.0-beta.2` 发布候选，不是已发布声明。旧标签 `v0.1.0-beta.1` 保持不动；只有本地提交推送后 GitHub Actions 全部通过，才创建并推送 `v0.1.0-beta.2` 标签。
 
-## 2. 功能完成度
+## 2. 候选功能状态
 
-| 范围 | 当前状态 |
-|---|---|
-| P0 主机密钥校验、P1 配置凭据保护与原子保存 | 已实现并有回归测试 |
-| SSH 直连、全局代理、自定义代理和统一 SOCKS5/SOCKS5H/HTTP/HTTPS 入口 | 已实现并有路由、TLS 与失败关闭测试 |
-| 命令输入显示开关移到底部，保留大文件分页按钮 | 已实现；分页按钮位于大文件底部工具栏 |
-| B1 标签方案和全部标签状态色带 | 已实现；终端、文件、警告、错误和离线状态语义有测试 |
-| Linux 文件权限、删除、单击聚焦、复选框选择、双击目录/文件 | 已实现并有 SFTP 操作测试 |
-| SFTP 连接监视、退避重连和副作用操作不自动重放 | 已实现并有连接代次与重放策略测试 |
-| 终端/编辑器混合分屏、编辑器独立窗口、自动换行持久化 | 已实现并有布局与窗口状态测试 |
-| 断线保留编辑内容、保存状态、冲突和结果未知语义 | 已实现；断线不自动保存、不盲目重试 |
-| 混合工作区标题只显示当前文件名，Windows 任务栏动态标题 | 已实现并有窗口标题测试 |
-| Tree-sitter 多语言语法着色与 Shiki 评估 | 已完成；Shiki 不接入原生 GPUI 热路径 |
-| SSH 终端 Ctrl+滚轮缩放 | 已接入终端滚轮事件，按 0.5 px 步进并持久化字体设置 |
-| JShell 名称、PNG/ICO/ICNS、Windows 版本资源和三平台发布流程 | 已统一；旧 `ashell` 路径仅保留配置迁移和远端临时文件兼容用途 |
-| 双语 README 重写、中文默认文档和项目致谢 | 已完成；README 截图已替换为脱敏 JShell 窗口图 |
+| 范围 | 状态 | 证据或后续要求 |
+|---|---|---|
+| P0 主机密钥校验、配置凭据保护和原子保存 | 已实现 | 全量测试、Clippy、审计通过 |
+| SSH 直连、继承代理、自定义 SOCKS5/SOCKS5H/HTTP/HTTPS | 已实现 | 路由、TLS、失败关闭测试通过 |
+| Linux SFTP 权限、上传、删除、双击目录和连接监视 | 已实现 | 自动测试通过；发布前建议真实 Linux 主机复核 |
+| 远程编辑器、独立窗口、终端/编辑器分屏、自动换行和保存状态 | 已实现 | 布局与状态测试通过；发布前建议真实远端文件复核 |
+| 嵌套分屏拖动 | 已修复 | 使用每个 split 的实际 Bounds；专项测试通过 |
+| Cloudflare R2 手动配置同步 | 已实现 | SigV4、HEAD、条件 PUT、限长下载和冲突测试通过 |
+| 同步载荷 v1/v2、严格 DTO 和快捷键校验 | 已实现 | 21 条 payload 专项测试通过 |
+| 配置写入串行化和凭据补偿 | 已实现 | 并发版本屏障、失败回滚测试通过 |
+| 下载预览与冲突失效 | 已实现 | 完整连接快照、当前 remember 选择和表单变化测试通过 |
+| 动态偏好变化计数 | 已实现 | 相同配置显示 0，按类别准确计数 |
+| B1 标签色带、动态窗口标题、终端 `Ctrl+滚轮` 缩放 | 已实现 | 自动测试及既有桌面验收通过 |
+| JShell 品牌、三平台资源和 README | 已更新 | README 使用中文默认入口和真实 Release 截图 |
+| 关于页和原项目致谢 | 已更新 | 版本来自 Cargo，中英文键集合测试通过 |
 
-## 3. RSA 安全修复
+## 3. 安全与依赖
 
-JShell 继续支持读取 RSA 私钥和 RSA 用户认证，但只允许 `rsa-sha2-512` 与 `rsa-sha2-256`：
+- 锁定依赖图中不存在 RustCrypto `rsa` crate，`RUSTSEC-2023-0071` 不再适用。
+- JShell 仍支持 RSA 用户密钥，但只允许 `rsa-sha2-512` 与 `rsa-sha2-256`，不启用 `ssh-rsa`/SHA-1 回退。
+- SSH 依赖固定到公开、可复现的提交：
+  - `JayhaShf/RustCrypto-SSH@5455fc09fc2508d09a59bd60879bb05111a9d013`
+  - `JayhaShf/russh@705e92dfb551e458d376016ecc83f43be71b0aa1`
+- 2026-08-01 的 RustSec 官方公告库 HEAD 为 `685d32fd681b540aa64019820639613c5a4fd922`；1177 条公告扫描 1024 个依赖，无 deny-warning 结果。
+- CI 使用固定 `cargo-audit@0.22.0` 检查当前公告库；Release 使用固定公告库提交和 `--no-fetch`，保证历史标签重跑可复现。
 
-- 禁止 `ssh-rsa`/SHA-1 默认、回退、签名和验签路径。
-- 删除 RSA 密钥生成所需的易受攻击 RustCrypto `rsa` 后端。
-- `russh` 与 `RustCrypto-SSH` 均固定到公开、可复现的完整提交。
+## 4. 最终自动化复验
 
-固定来源：
+- [x] `cargo fmt --all -- --check`
+- [x] `cargo test --locked --quiet`：316 passed，0 failed
+- [x] `cargo check --locked --all-targets`
+- [x] `cargo clippy --locked --all-targets --all-features -- -D warnings`
+- [x] `cargo audit --deny warnings --file Cargo.lock --db <clean-db> --no-fetch`
+- [x] `cargo tree -i rsa --locked`：未匹配到 `rsa`
+- [x] GitHub Actions YAML、最小权限、checkout 凭据和 40 位 Action SHA 静态检查
+- [x] `git diff --check`
+- [x] `cargo build --locked --release`
+- [x] 隔离 HOME/USERPROFILE 启动最终 Windows EXE
+- [x] README 截图来自 Release 和隔离配置环境，不含真实主机、账号或路径
+- [ ] 推送后的 GitHub CI 与 Release workflow 托管验证
 
-- `JayhaShf/RustCrypto-SSH@5455fc09fc2508d09a59bd60879bb05111a9d013`
-- `JayhaShf/russh@705e92dfb551e458d376016ecc83f43be71b0aa1`
+最终本地产物：
 
-专项验证：RustCrypto-SSH RSA 测试 `36/36`，russh 测试 `82/82`，JShell 测试 `197/197`。
+```text
+D:\Git\ashell\target\release\jshell.exe
+79,746,560 bytes
+SHA-256 F8BF82325F1F74D90F02AEB27BF981FA563F50CE1118A4CFBA5FB5DFD4A2FA11
+```
 
-## 4. 最终验证
+## 5. GUI 与真实环境验收
 
-| 命令或检查 | 结果 |
-|---|---|
-| `cargo fmt --check` | 通过 |
-| `cargo test --locked --quiet` | 通过，197 passed，0 failed |
-| `cargo check --locked --all-targets` | 通过 |
-| `cargo clippy --locked --all-targets --all-features -- -D warnings` | 通过 |
-| `cargo build --locked --release` | 通过 |
-| `cargo audit` | 通过；扫描 1023 个依赖，无公告输出 |
-| `cargo tree -i rsa --locked` | 未找到 `rsa` 包，符合预期 |
-| `git diff --check` | 通过 |
+- [x] WebDAV/S3/R2 provider 可切换
+- [x] 960×700 窄窗口可滚动到全部同步操作按钮
+- [x] 空凭据测试显示同步参数错误，不写远端对象
+- [x] 下载、冲突、凭据失败和本地写盘失败通过自动故障注入验证为“不改配置或补偿回滚”
+- [x] 隔离启动前后用户配置 SHA-256 保持 `B6D937EA3591FCBE1C52465BCD8808F94491F7C9E7BDFBB4572FCA6A69872461`
+- [x] 关于页、版本、中文/英文致谢和项目链接已验收
+- [ ] 使用非生产 Linux SSH/SFTP 主机复核权限、上传、删除和静默断线恢复
+- [ ] 使用非生产远端文件复核编辑冲突、结果未知和断线保留内容
+- [ ] 如提供测试 R2 账户，执行一次真实对象上传、下载预览和条件覆盖；当前发布不依赖该账户
 
-Windows Release 产物：
+## 6. 工作流安全
 
-- 路径：`target/release/jshell.exe`
-- 大小：79,115,264 字节
-- 版本：`0.1.0-beta.2`
-- `ProductName` / `FileDescription` / `InternalName`：`JShell`
-- SHA-256：`BD476B94CE06F79AB09E7FB71E708E63299FB4507DFC5B9F81A8E3ABA43F28C7`
+- 顶层默认权限为 `contents: read`。
+- 仅 `publish` job 使用 `contents: write`。
+- 所有 checkout 均禁用凭据持久化。
+- 18 个 Action 调用均固定到完整提交 SHA。
+- Release 审计数据库固定为 `685d32fd681b540aa64019820639613c5a4fd922`。
+- `publish` 仅在 tag ref 上运行，并依赖已通过 quality gate 的多平台 build。
 
-测试和构建中的唯一提示是 MSVC 链接器创建导入库的标准输出，不是代码告警或失败。
+## 7. 发布顺序
 
-## 5. 人工验收边界
+1. 按“分屏与配置一致性 / R2 与载荷安全 / 关于页与文档资源 / 工作流与审计”分批提交。
+2. 再次核对远端 `main` 无分叉后推送。
+3. 等待托管 CI 全部通过。
+4. 创建并推送 `v0.1.0-beta.2` 标签。
+5. 等待 Release workflow 完成，核对 Windows、Linux 和 macOS 产物。
+6. 发布后记录 GitHub 产物哈希；本地哈希不替代托管发布产物哈希。
 
-自动化已覆盖状态机、布局、权限格式、保存决策、连接代次和构建结果。以下项目仍属于发布前的真实环境冒烟，不应描述成自动化已经验证：
+## 8. 发布判定
 
-- 真实 Linux SSH/SFTP 服务器上的权限、删除失败重试和静默断线恢复。
-- 真实远端文件的分屏编辑、独立窗口重挂和冲突保存。
-- 多窗口状态下 Windows 任务栏标题的实时切换。
+当前判定：**本地发布候选通过，可以提交并推送；托管 CI 通过前不创建标签。**
 
-这些是运行环境验收项，不是当前已知代码残留。未经新的实测证据，不移动旧标签、不创建 beta.2 标签，也不发布 GitHub Release。
+项目总体审计结论见 [项目审计报告](../AUDIT_REPORT.md)。
