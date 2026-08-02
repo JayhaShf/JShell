@@ -44,6 +44,9 @@ use crate::{
     terminal,
 };
 
+const SFTP_RECONNECT_ICON: IconName = IconName::Network;
+const SFTP_REFRESH_ICON: IconName = IconName::Redo2;
+
 fn pane_flex_child(weight: f32) -> gpui::Div {
     div()
         .flex_grow(weight)
@@ -249,7 +252,7 @@ impl Ashell {
                     Button::new("sftp-reconnect")
                         .ghost()
                         .small()
-                        .icon(IconName::Redo2)
+                        .icon(SFTP_RECONNECT_ICON)
                         .tooltip(t!("sftp_retry_now").to_string())
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.reconnect_active_sftp(cx);
@@ -259,7 +262,7 @@ impl Ashell {
                     Button::new("sftp-refresh")
                         .ghost()
                         .small()
-                        .icon(IconName::Redo2)
+                        .icon(SFTP_REFRESH_ICON)
                         .tooltip(t!("refresh").to_string())
                         .on_click(cx.listener(|this, _, _, cx| this.refresh_sftp(cx))),
                 )
@@ -3971,6 +3974,12 @@ impl Render for Ashell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sftp_toolbar_uses_distinct_reconnect_and_refresh_icons() {
+        assert!(matches!(SFTP_RECONNECT_ICON, IconName::Network));
+        assert!(matches!(SFTP_REFRESH_ICON, IconName::Redo2));
+    }
 
     #[test]
     fn pane_flex_child_uses_zero_basis_for_exact_ratios() {
