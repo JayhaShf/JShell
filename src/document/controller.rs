@@ -1183,6 +1183,8 @@ impl Ashell {
             cx.notify();
             return;
         };
+        self.sftp_reconnect_after_ssh.remove(&connection_id);
+        self.mark_sftp_cwd_follow_unavailable(&connection_id);
         let Some(document) = self.documents.get_mut(&document_id) else {
             return;
         };

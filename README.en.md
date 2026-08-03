@@ -2,7 +2,7 @@
 
 # JShell
 
-JShell is a Rust and GPUI desktop terminal workspace for local terminals, SSH sessions, SFTP file management, and remote text editing. The current source version is `0.1.0-beta.3`; the UI follows the system language by default and can be changed in settings, while Chinese remains the default documentation entry.
+JShell is a Rust and GPUI desktop terminal workspace for local terminals, SSH sessions, SFTP file management, and remote text editing. The current source version is `0.1.0-beta.4`; the UI follows the system language by default and can be changed in settings, while Chinese remains the default documentation entry.
 
 ![JShell workspace](assets/screenshots/compact-workspace.png)
 

@@ -1,8 +1,11 @@
 pub mod connection;
+pub(crate) mod cwd_follow;
+mod handshake;
 pub mod ops;
 pub mod permissions;
 
 use connection::{ConnectionSupervisor, SftpGeneration};
+use handshake::{SftpHandshakeOutputError, open_sftp_session};
 use permissions::{RemoteFileType, file_type_from_mode};
 
 use std::{
@@ -45,7 +48,7 @@ use crate::{
             session_has_explicit_key,
         },
     },
-    terminal::BackendEvent,
+    terminal::{BackendEvent, SftpConnectionState},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -55,7 +58,9 @@ enum SftpRetryPolicy {
 }
 
 fn sftp_retry_policy(error: &anyhow::Error) -> SftpRetryPolicy {
-    if is_permanent_host_key_error(error) {
+    if is_permanent_host_key_error(error)
+        || error.downcast_ref::<SftpHandshakeOutputError>().is_some()
+    {
         SftpRetryPolicy::Manual
     } else {
         SftpRetryPolicy::Backoff
@@ -82,7 +87,11 @@ pub struct PreviewData {
 
 #[derive(Debug)]
 pub enum SftpCommand {
-    ListDir(String),
+    ListDir {
+        path: String,
+        request_id: Option<u64>,
+        expected_generation: Option<u64>,
+    },
     Preview(String),
     Download {
         remote: String,
@@ -131,7 +140,7 @@ impl SftpCommand {
     fn is_replayable(&self) -> bool {
         matches!(
             self,
-            Self::ListDir(_)
+            Self::ListDir { .. }
                 | Self::Preview(_)
                 | Self::DocumentStat { .. }
                 | Self::DocumentRead { .. }
@@ -263,8 +272,20 @@ impl SftpHandle {
         }
     }
 
-    pub fn list_dir(&self, path: String) {
-        self.send(SftpCommand::ListDir(path));
+    pub fn list_dir(&self, path: String, generation: u64) {
+        self.send(SftpCommand::ListDir {
+            path,
+            request_id: None,
+            expected_generation: Some(generation),
+        });
+    }
+
+    pub(crate) fn follow_dir(&self, path: String, request_id: u64, generation: u64) -> bool {
+        self.send(SftpCommand::ListDir {
+            path,
+            request_id: Some(request_id),
+            expected_generation: Some(generation),
+        })
     }
 
     pub fn preview(&self, path: String) {
@@ -433,8 +454,18 @@ fn reject_unavailable_command(
                 deleted_paths: Vec::new(),
             });
         }
-        SftpCommand::ListDir(_)
-        | SftpCommand::Preview(_)
+        SftpCommand::ListDir {
+            path, request_id, ..
+        } => {
+            let _ = events.send(BackendEvent::SftpListDirFailed {
+                tab_id: tab_id.to_string(),
+                generation: generation.0,
+                request_id,
+                path,
+                reason: t!("sftp_command_channel_closed").to_string(),
+            });
+        }
+        SftpCommand::Preview(_)
         | SftpCommand::CreateDir(_)
         | SftpCommand::Download { .. }
         | SftpCommand::EditFile { .. }
@@ -467,6 +498,25 @@ fn dispatch_pending_commands(worker: &SftpWorker, pending: &mut VecDeque<SftpCom
     }
 }
 
+fn discard_pending_automatic_list_dirs(pending: &mut VecDeque<SftpCommand>) {
+    pending.retain(|command| {
+        !matches!(
+            command,
+            SftpCommand::ListDir {
+                request_id: Some(_),
+                ..
+            }
+        )
+    });
+}
+
+fn list_dir_generation_matches(
+    expected_generation: Option<u64>,
+    generation: SftpGeneration,
+) -> bool {
+    expected_generation.is_none_or(|expected| expected == generation.0)
+}
+
 fn queue_pending_command(
     pending: &mut VecDeque<SftpCommand>,
     command: SftpCommand,
@@ -474,6 +524,24 @@ fn queue_pending_command(
     generation: SftpGeneration,
     events: &std::sync::mpsc::Sender<BackendEvent>,
 ) {
+    if matches!(
+        &command,
+        SftpCommand::ListDir {
+            request_id: Some(_),
+            ..
+        }
+    ) {
+        pending.retain(|pending_command| {
+            !matches!(
+                pending_command,
+                SftpCommand::ListDir {
+                    request_id: Some(_),
+                    ..
+                }
+            )
+        });
+    }
+
     if pending.len() >= MAX_PENDING_SFTP_COMMANDS {
         reject_unavailable_command(tab_id, generation, command, events);
     } else {
@@ -507,6 +575,8 @@ async fn run_sftp_supervisor(
 
     loop {
         if worker.is_none() && retry_timer.is_none() && !connection.is_blocked() {
+            // The UI coordinator will resend its newest path for this generation.
+            discard_pending_automatic_list_dirs(&mut pending);
             let generation = connection
                 .begin_connecting()
                 .expect("SFTP supervisor is not closed");
@@ -548,9 +618,10 @@ async fn run_sftp_supervisor(
                                 .disconnect(generation)
                                 .and_then(|outcome| outcome.retry_after)
                                 .unwrap_or_else(|| std::time::Duration::from_secs(30));
-                            let _ = events.send(BackendEvent::SftpStatus {
+                            let _ = events.send(BackendEvent::SftpConnectionStatus {
                                 tab_id: tab_id.clone(),
                                 generation: generation.0,
+                                state: SftpConnectionState::Reconnecting,
                                 text: format!("{} ({reason})", t!("sftp_reconnecting")),
                             });
                             retry_timer = Some(Box::pin(tokio::time::sleep(delay)));
@@ -703,9 +774,10 @@ async fn run_sftp(
     ready: Arc<tokio::sync::Notify>,
     generation: SftpGeneration,
 ) -> Result<()> {
-    let _ = events.send(BackendEvent::SftpStatus {
+    let _ = events.send(BackendEvent::SftpConnectionStatus {
         tab_id: tab_id.clone(),
         generation: generation.0,
+        state: SftpConnectionState::Connecting,
         text: t!("sftp_connecting").to_string(),
     });
 
@@ -718,7 +790,7 @@ async fn run_sftp(
         .request_subsystem(true, "sftp")
         .await
         .context("request sftp subsystem")?;
-    let sftp = SftpSession::new(channel.into_stream())
+    let sftp = open_sftp_session(channel.into_stream())
         .await
         .context("sftp handshake")?;
     connected.store(true, Ordering::SeqCst);
@@ -735,13 +807,14 @@ async fn run_sftp(
         home: home.clone(),
     });
 
-    let _ = events.send(BackendEvent::SftpStatus {
+    let _ = events.send(BackendEvent::SftpConnectionStatus {
         tab_id: tab_id.clone(),
         generation: generation.0,
+        state: SftpConnectionState::Connected,
         text: t!("sftp_connected").to_string(),
     });
 
-    emit_entries(&events, &tab_id, generation, &sftp, &home).await?;
+    emit_entries(&events, &tab_id, generation, None, &sftp, &home).await?;
 
     let mut active_transfers: std::collections::HashMap<String, TransferStateFlag> =
         std::collections::HashMap::new();
@@ -791,7 +864,14 @@ async fn run_sftp(
             SftpCommand::TransferFinished(id) => {
                 active_transfers.remove(&id);
             }
-            SftpCommand::ListDir(path) => {
+            SftpCommand::ListDir {
+                path,
+                request_id,
+                expected_generation,
+            } => {
+                if !list_dir_generation_matches(expected_generation, generation) {
+                    continue;
+                }
                 let actual_path = if path == "~" {
                     home.clone()
                 } else if let Some(rest) = path.strip_prefix("~/") {
@@ -800,13 +880,22 @@ async fn run_sftp(
                     path
                 };
 
-                if let Err(err) =
-                    emit_entries(&events, &tab_id, generation, &sftp, &actual_path).await
+                if let Err(err) = emit_entries(
+                    &events,
+                    &tab_id,
+                    generation,
+                    request_id,
+                    &sftp,
+                    &actual_path,
+                )
+                .await
                 {
-                    let _ = events.send(BackendEvent::SftpStatus {
+                    let _ = events.send(BackendEvent::SftpListDirFailed {
                         tab_id: tab_id.clone(),
                         generation: generation.0,
-                        text: format!("list failed: {err:#}"),
+                        request_id,
+                        path: actual_path,
+                        reason: format!("list failed: {err:#}"),
                     });
                 }
             }
@@ -1031,7 +1120,11 @@ async fn run_sftp(
                                 generation: generation.0,
                                 text: summary,
                             });
-                            let _ = commands_tx_clone.send(SftpCommand::ListDir(remote_dir));
+                            let _ = commands_tx_clone.send(SftpCommand::ListDir {
+                                path: remote_dir,
+                                request_id: None,
+                                expected_generation: None,
+                            });
                         }
                         Err(err) => {
                             let err_msg = format!("{err:#}");
@@ -1084,7 +1177,7 @@ async fn run_sftp(
                     let Ok(_) = channel.request_subsystem(true, "sftp").await else {
                         return;
                     };
-                    let Ok(sftp_session) = SftpSession::new(channel.into_stream()).await else {
+                    let Ok(sftp_session) = open_sftp_session(channel.into_stream()).await else {
                         return;
                     };
 
@@ -1179,7 +1272,7 @@ async fn run_sftp(
                     let Ok(_) = channel.request_subsystem(true, "sftp").await else {
                         return;
                     };
-                    let Ok(sftp_session) = SftpSession::new(channel.into_stream()).await else {
+                    let Ok(sftp_session) = open_sftp_session(channel.into_stream()).await else {
                         return;
                     };
 
@@ -1244,9 +1337,17 @@ async fn run_sftp(
 
                         // Re-fetch the parent directory to show the newly created folder
                         if let Some(parent) = parent_dir(&actual_path) {
-                            let _ = commands_tx.send(SftpCommand::ListDir(parent));
+                            let _ = commands_tx.send(SftpCommand::ListDir {
+                                path: parent,
+                                request_id: None,
+                                expected_generation: None,
+                            });
                         } else {
-                            let _ = commands_tx.send(SftpCommand::ListDir("/".to_string()));
+                            let _ = commands_tx.send(SftpCommand::ListDir {
+                                path: "/".to_string(),
+                                request_id: None,
+                                expected_generation: None,
+                            });
                         }
                     }
                     Err(err) => {
@@ -1313,9 +1414,17 @@ async fn run_sftp(
                         first.clone()
                     };
                     if let Some(parent) = parent_dir(&actual_path) {
-                        let _ = commands_tx.send(SftpCommand::ListDir(parent));
+                        let _ = commands_tx.send(SftpCommand::ListDir {
+                            path: parent,
+                            request_id: None,
+                            expected_generation: None,
+                        });
                     } else {
-                        let _ = commands_tx.send(SftpCommand::ListDir("/".to_string()));
+                        let _ = commands_tx.send(SftpCommand::ListDir {
+                            path: "/".to_string(),
+                            request_id: None,
+                            expected_generation: None,
+                        });
                     }
                 }
             }
@@ -1371,6 +1480,7 @@ async fn emit_entries(
     events: &std::sync::mpsc::Sender<BackendEvent>,
     tab_id: &str,
     generation: SftpGeneration,
+    request_id: Option<u64>,
     sftp: &SftpSession,
     path: &str,
 ) -> Result<()> {
@@ -1378,6 +1488,7 @@ async fn emit_entries(
     let _ = events.send(BackendEvent::SftpEntries {
         tab_id: tab_id.to_string(),
         generation: generation.0,
+        request_id,
         path: path.to_string(),
         entries,
     });
@@ -2338,7 +2449,7 @@ async fn open_sftp_subsystem(
         .request_subsystem(true, "sftp")
         .await
         .context("request document sftp subsystem")?;
-    SftpSession::new(channel.into_stream())
+    open_sftp_session(channel.into_stream())
         .await
         .context("document sftp handshake")
 }
@@ -2598,7 +2709,14 @@ mod handle_tests {
 
     #[test]
     fn only_read_only_commands_are_replayable_after_disconnect() {
-        assert!(SftpCommand::ListDir("/etc".into()).is_replayable());
+        assert!(
+            SftpCommand::ListDir {
+                path: "/etc".into(),
+                request_id: None,
+                expected_generation: None,
+            }
+            .is_replayable()
+        );
         assert!(SftpCommand::Preview("/etc/app.conf".into()).is_replayable());
         assert!(!SftpCommand::ReconnectNow.is_replayable());
 
@@ -2630,5 +2748,112 @@ mod handle_tests {
             }
             .is_replayable()
         );
+    }
+
+    #[test]
+    fn queued_automatic_list_dir_replaces_only_older_automatic_list_dirs() {
+        let generation = SftpGeneration(7);
+        let (events, events_rx) = std::sync::mpsc::channel();
+        let mut pending = VecDeque::new();
+        pending.push_back(SftpCommand::ListDir {
+            path: "/manual".into(),
+            request_id: None,
+            expected_generation: Some(generation.0),
+        });
+        pending.push_back(SftpCommand::ListDir {
+            path: "/automatic-old".into(),
+            request_id: Some(1),
+            expected_generation: Some(generation.0),
+        });
+        pending.push_back(SftpCommand::Preview("/preview.txt".into()));
+        pending.push_back(SftpCommand::ListDir {
+            path: "/refresh".into(),
+            request_id: None,
+            expected_generation: None,
+        });
+
+        queue_pending_command(
+            &mut pending,
+            SftpCommand::ListDir {
+                path: "/automatic-new".into(),
+                request_id: Some(2),
+                expected_generation: Some(generation.0),
+            },
+            "group-1",
+            generation,
+            &events,
+        );
+
+        assert!(matches!(
+            pending.pop_front(),
+            Some(SftpCommand::ListDir {
+                path,
+                request_id: None,
+                expected_generation: Some(7),
+            }) if path == "/manual"
+        ));
+        assert!(matches!(
+            pending.pop_front(),
+            Some(SftpCommand::Preview(path)) if path == "/preview.txt"
+        ));
+        assert!(matches!(
+            pending.pop_front(),
+            Some(SftpCommand::ListDir {
+                path,
+                request_id: None,
+                expected_generation: None,
+            }) if path == "/refresh"
+        ));
+        assert!(matches!(
+            pending.pop_front(),
+            Some(SftpCommand::ListDir {
+                path,
+                request_id: Some(2),
+                expected_generation: Some(7),
+            }) if path == "/automatic-new"
+        ));
+        assert!(pending.is_empty());
+        assert!(events_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn reconnect_discards_only_pending_automatic_list_dirs() {
+        let mut pending = VecDeque::new();
+        pending.push_back(SftpCommand::ListDir {
+            path: "/manual".into(),
+            request_id: None,
+            expected_generation: Some(1),
+        });
+        pending.push_back(SftpCommand::ListDir {
+            path: "/automatic".into(),
+            request_id: Some(1),
+            expected_generation: Some(1),
+        });
+        pending.push_back(SftpCommand::Preview("/preview.txt".into()));
+
+        discard_pending_automatic_list_dirs(&mut pending);
+
+        assert!(matches!(
+            pending.pop_front(),
+            Some(SftpCommand::ListDir {
+                path,
+                request_id: None,
+                expected_generation: Some(1),
+            }) if path == "/manual"
+        ));
+        assert!(matches!(
+            pending.pop_front(),
+            Some(SftpCommand::Preview(path)) if path == "/preview.txt"
+        ));
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn list_dir_generation_guard_accepts_current_and_unbound_commands() {
+        let generation = SftpGeneration(9);
+
+        assert!(list_dir_generation_matches(Some(9), generation));
+        assert!(!list_dir_generation_matches(Some(8), generation));
+        assert!(list_dir_generation_matches(None, generation));
     }
 }

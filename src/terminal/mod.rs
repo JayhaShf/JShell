@@ -33,6 +33,23 @@ pub enum TabKind {
     Serial,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SftpConnectionState {
+    Connecting,
+    Connected,
+    Reconnecting,
+}
+
+impl SftpConnectionState {
+    pub(crate) const fn is_connected(self) -> bool {
+        matches!(self, Self::Connected)
+    }
+
+    pub(crate) const fn is_reconnecting(self) -> bool {
+        matches!(self, Self::Reconnecting)
+    }
+}
+
 #[derive(Debug)]
 pub enum BackendCommand {
     Input(Vec<u8>),
@@ -61,8 +78,16 @@ pub enum BackendEvent {
     SftpEntries {
         tab_id: String,
         generation: u64,
+        request_id: Option<u64>,
         path: String,
         entries: Vec<RemoteEntry>,
+    },
+    SftpListDirFailed {
+        tab_id: String,
+        generation: u64,
+        request_id: Option<u64>,
+        path: String,
+        reason: String,
     },
     SftpPreview {
         tab_id: String,
@@ -72,6 +97,12 @@ pub enum BackendEvent {
     SftpStatus {
         tab_id: String,
         generation: u64,
+        text: String,
+    },
+    SftpConnectionStatus {
+        tab_id: String,
+        generation: u64,
+        state: SftpConnectionState,
         text: String,
     },
     SftpConnectionBlocked {
@@ -162,6 +193,8 @@ pub struct TerminalTab {
     pub id: String,
     pub title: String,
     pub dynamic_title: String,
+    pub remote_cwd: Option<String>,
+    pub(crate) cwd_follow_on_next_title: bool,
     pub kind: TabKind,
     pub status: String,
     pub connected: bool,
@@ -217,14 +250,17 @@ pub struct ViewportSelection {
 #[derive(Clone, Default)]
 pub struct SftpUiState {
     pub current_path: String,
+    pub(crate) path_initialized: bool,
     pub generation: u64,
     pub status: String,
+    pub(crate) cwd_follow_pause_status_displayed: bool,
     pub entries: Vec<RemoteEntry>,
     pub selected_path: Option<String>,
     pub preview: Option<PreviewData>,
     pub selected_entries: std::collections::HashSet<String>,
     pub deleting_entries: std::collections::HashSet<String>,
     pub home_dir: String,
+    pub(crate) cwd_follow: crate::sftp::cwd_follow::SftpCwdFollowState,
 }
 
 pub(crate) const fn backend_generation_matches(current: u32, event: u32) -> bool {
@@ -232,6 +268,20 @@ pub(crate) const fn backend_generation_matches(current: u32, event: u32) -> bool
 }
 
 impl SftpUiState {
+    pub(crate) fn set_status(&mut self, status: String) {
+        self.status = status;
+        self.cwd_follow_pause_status_displayed = false;
+    }
+
+    pub(crate) fn set_cwd_follow_paused_status(&mut self, status: String) {
+        self.status = status;
+        self.cwd_follow_pause_status_displayed = true;
+    }
+
+    pub(crate) const fn is_cwd_follow_pause_status_displayed(&self) -> bool {
+        self.cwd_follow_pause_status_displayed
+    }
+
     pub(crate) fn begin_generation(&mut self, generation: u64) -> bool {
         if generation < self.generation {
             return false;
@@ -245,10 +295,11 @@ impl SftpUiState {
     }
 
     pub(crate) fn apply_home(&mut self, home: String) {
-        let initialize_path = self.current_path == "/" && self.entries.is_empty();
+        let initialize_path = !self.path_initialized;
         self.home_dir = home.clone();
         if initialize_path {
             self.current_path = home;
+            self.path_initialized = true;
             self.selected_path = None;
             self.preview = None;
             self.selected_entries.clear();
@@ -258,7 +309,53 @@ impl SftpUiState {
 
 #[cfg(test)]
 mod sftp_ui_state_tests {
-    use super::{SftpUiState, backend_generation_matches};
+    use super::{BackendEvent, SftpConnectionState, SftpUiState, backend_generation_matches};
+
+    fn connection_state(event: BackendEvent) -> SftpConnectionState {
+        let BackendEvent::SftpConnectionStatus { state, .. } = event else {
+            panic!("expected typed SFTP connection status");
+        };
+        state
+    }
+
+    #[test]
+    fn typed_sftp_connection_status_does_not_depend_on_localized_text() {
+        for text in ["SFTP connected", "SFTP 已连接", "SFTP verbunden"] {
+            let state = connection_state(BackendEvent::SftpConnectionStatus {
+                tab_id: "group-1".to_string(),
+                generation: 7,
+                state: SftpConnectionState::Connected,
+                text: text.to_string(),
+            });
+            assert!(state.is_connected(), "text: {text}");
+            assert!(!state.is_reconnecting(), "text: {text}");
+        }
+
+        let state = connection_state(BackendEvent::SftpConnectionStatus {
+            tab_id: "group-1".to_string(),
+            generation: 7,
+            state: SftpConnectionState::Reconnecting,
+            text: "SFTP 正在重新连接".to_string(),
+        });
+        assert!(!state.is_connected());
+        assert!(state.is_reconnecting());
+    }
+
+    #[test]
+    fn cwd_follow_pause_status_tracking_does_not_depend_on_localized_text() {
+        let mut state = SftpUiState::default();
+
+        for status in ["SFTP connected", "permission denied"] {
+            state.set_cwd_follow_paused_status("\u{6682}\u{505c}".to_string());
+            assert!(state.is_cwd_follow_pause_status_displayed());
+
+            state.set_status(status.to_string());
+            assert!(
+                !state.is_cwd_follow_pause_status_displayed(),
+                "status: {status}"
+            );
+        }
+    }
 
     #[test]
     fn applying_home_synchronizes_the_initial_directory() {
@@ -280,6 +377,7 @@ mod sftp_ui_state_tests {
     fn applying_home_does_not_reset_a_directory_being_reloaded() {
         let mut state = SftpUiState {
             current_path: "/var/log".to_string(),
+            path_initialized: true,
             generation: 0,
             entries: vec![crate::sftp::RemoteEntry {
                 name: "app.log".to_string(),
@@ -297,6 +395,20 @@ mod sftp_ui_state_tests {
 
         assert_eq!(state.home_dir, "/home/alice");
         assert_eq!(state.current_path, "/var/log");
+    }
+
+    #[test]
+    fn applying_home_preserves_an_explicit_root_directory() {
+        let mut state = SftpUiState {
+            current_path: "/".to_string(),
+            path_initialized: true,
+            ..SftpUiState::default()
+        };
+
+        state.apply_home("/home/alice".to_string());
+
+        assert_eq!(state.home_dir, "/home/alice");
+        assert_eq!(state.current_path, "/");
     }
 
     #[test]
@@ -389,6 +501,8 @@ impl TerminalTab {
             id: id.clone(),
             title: title.clone(),
             dynamic_title: title,
+            remote_cwd: None,
+            cwd_follow_on_next_title: false,
             kind,
             status,
             connected: matches!(kind, TabKind::Local),

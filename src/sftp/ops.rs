@@ -3,7 +3,7 @@ use std::collections::HashSet;
 
 use crate::{
     Ashell, SftpContextMenuState,
-    sftp::{RemoteEntry, SftpHandle},
+    sftp::{RemoteEntry, SftpHandle, cwd_follow::parse_terminal_cwd},
     terminal,
 };
 
@@ -90,7 +90,7 @@ impl Ashell {
         }
         if !handle.send(crate::sftp::SftpCommand::DeletePaths(paths.clone())) {
             finish_sftp_delete(&mut sftp.deleting_entries, &paths);
-            sftp.status = rust_i18n::t!("sftp_command_channel_closed").to_string();
+            sftp.set_status(rust_i18n::t!("sftp_command_channel_closed").to_string());
             cx.notify();
             return false;
         }
@@ -120,27 +120,75 @@ impl Ashell {
     }
 
     pub(crate) fn reconnect_active_sftp(&mut self, cx: &mut Context<Self>) {
-        if let Some(handle) = self.active_sftp_handle().cloned() {
+        if let Some(group_id) = self.active_group.clone()
+            && let Some(handle) = self.sftp_handles.get(&group_id).cloned()
+        {
+            self.sftp_reconnect_after_ssh.remove(&group_id);
+            self.mark_sftp_cwd_follow_unavailable(&group_id);
             handle.reconnect_now();
             if let Some(sftp) = self.active_sftp_mut() {
-                sftp.status = rust_i18n::t!("sftp_reconnecting").to_string();
+                sftp.set_status(rust_i18n::t!("sftp_reconnecting").to_string());
             }
             cx.notify();
         }
     }
 
     pub(crate) fn navigate_sftp(&mut self, path: String, cx: &mut Context<Self>) {
-        if let Some(handle) = self.active_sftp_handle() {
-            tracing::info!("[sftp] navigating to directory: '{}'", path);
-            handle.list_dir(path.clone());
-            if let Some(sftp) = self.active_sftp_mut() {
-                sftp.current_path = path;
-                sftp.selected_path = None;
-                sftp.preview = None;
-                sftp.selected_entries.clear();
-                self.pending_sftp_path_sync = Some(sftp.current_path.clone());
-            }
-            cx.notify();
+        if let Some(active_tab) = self.active_tab.as_deref()
+            && let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == active_tab)
+        {
+            tab.cwd_follow_on_next_title = false;
+        }
+        let (ready, generation) = if let Some(sftp) = self.active_sftp_mut() {
+            sftp.cwd_follow.cancel_for_manual_navigation();
+            (sftp.cwd_follow.is_ready(), sftp.generation)
+        } else {
+            return;
+        };
+
+        tracing::info!("[sftp] navigating to directory: '{}'", path);
+        if ready && let Some(handle) = self.active_sftp_handle().cloned() {
+            handle.list_dir(path.clone(), generation);
+        }
+        let path_for_input = self.active_sftp_mut().map(|sftp| {
+            sftp.current_path = path;
+            sftp.path_initialized = true;
+            sftp.selected_path = None;
+            sftp.preview = None;
+            sftp.selected_entries.clear();
+            sftp.current_path.clone()
+        });
+        if let Some(path) = path_for_input {
+            self.pending_sftp_path_sync = Some(path);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn sync_cwd_from_terminal(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(active_id) = self.active_tab.clone() else {
+            return;
+        };
+        let Some(home_dir) = self
+            .tab_groups
+            .iter()
+            .find(|group| group.pane_root.contains(&active_id))
+            .and_then(|group| group.sftp.as_ref())
+            .map(|sftp| sftp.home_dir.as_str())
+        else {
+            return;
+        };
+        let path = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == active_id)
+            .and_then(|tab| {
+                tab.remote_cwd
+                    .clone()
+                    .or_else(|| parse_terminal_cwd(&tab.dynamic_title, home_dir))
+            });
+
+        if let Some(path) = path {
+            self.navigate_sftp(path, cx);
         }
     }
 

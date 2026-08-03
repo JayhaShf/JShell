@@ -206,6 +206,16 @@ pub enum CursorStyle {
     BeamBlink,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum SftpCwdSyncMode {
+    Off,
+    Realtime,
+    #[default]
+    #[serde(other)]
+    OnTerminalSwitch,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigFile {
     #[serde(default)]
@@ -260,6 +270,8 @@ pub struct ConfigFile {
     pub sidebar_collapsed: bool,
     #[serde(default)]
     pub sftp_panel_minimized: bool,
+    #[serde(default)]
+    pub sftp_cwd_sync_mode: SftpCwdSyncMode,
     #[serde(default)]
     pub key_bindings: std::collections::HashMap<String, String>,
     #[serde(default)]
@@ -439,6 +451,7 @@ impl Default for ConfigFile {
             monitoring_position: default_monitoring_position(),
             sidebar_collapsed: false,
             sftp_panel_minimized: false,
+            sftp_cwd_sync_mode: SftpCwdSyncMode::default(),
             key_bindings: std::collections::HashMap::new(),
             sync_endpoint: String::new(),
             sync_username: String::new(),
@@ -1382,6 +1395,14 @@ impl ConfigStore {
         self.cache.sftp_panel_minimized = val;
     }
 
+    pub fn sftp_cwd_sync_mode(&self) -> SftpCwdSyncMode {
+        self.cache.sftp_cwd_sync_mode
+    }
+
+    pub fn set_sftp_cwd_sync_mode(&mut self, mode: SftpCwdSyncMode) {
+        self.cache.sftp_cwd_sync_mode = mode;
+    }
+
     pub fn get(&self, id: &str) -> Option<&Session> {
         self.cache.sessions.iter().find(|s| s.id == id)
     }
@@ -1658,6 +1679,7 @@ impl ConfigStore {
         disk_config.monitoring_position = local_config.monitoring_position;
         disk_config.sidebar_collapsed = local_config.sidebar_collapsed;
         disk_config.sftp_panel_minimized = local_config.sftp_panel_minimized;
+        disk_config.sftp_cwd_sync_mode = local_config.sftp_cwd_sync_mode;
         disk_config.key_bindings = local_config.key_bindings;
         disk_config.use_proxy = local_config.use_proxy;
         disk_config.read_env_proxy = local_config.read_env_proxy;
@@ -3323,6 +3345,43 @@ mod tests {
     }
 
     #[test]
+    fn legacy_config_defaults_to_terminal_switch_follow() {
+        let legacy_config: ConfigFile = serde_json::from_str("{}").unwrap();
+
+        assert_eq!(
+            legacy_config.sftp_cwd_sync_mode,
+            SftpCwdSyncMode::OnTerminalSwitch
+        );
+    }
+
+    #[test]
+    fn unknown_sftp_cwd_sync_mode_falls_back_to_terminal_switch() {
+        let config: ConfigFile =
+            serde_json::from_str(r#"{"sftp_cwd_sync_mode":"future-mode"}"#).unwrap();
+
+        assert_eq!(config.sftp_cwd_sync_mode, SftpCwdSyncMode::OnTerminalSwitch);
+    }
+
+    #[test]
+    fn realtime_sftp_cwd_sync_mode_serializes_and_deserializes() {
+        let config = ConfigFile {
+            sftp_cwd_sync_mode: SftpCwdSyncMode::Realtime,
+            ..ConfigFile::default()
+        };
+
+        let serialized = serde_json::to_string(&config).unwrap();
+        assert!(serialized.contains(r#""sftp_cwd_sync_mode":"realtime""#));
+
+        let restored: ConfigFile = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(restored.sftp_cwd_sync_mode, SftpCwdSyncMode::Realtime);
+
+        let key = MasterKey::from_secret(vec![29; 32]).unwrap();
+        let encrypted = encrypt_config_v2(&config, &key).unwrap();
+        let decrypted = decrypt_config_v2(&encrypted, &key).unwrap();
+        assert_eq!(decrypted.sftp_cwd_sync_mode, SftpCwdSyncMode::Realtime);
+    }
+
+    #[test]
     fn sync_target_fields_are_backward_compatible() {
         let legacy_config: ConfigFile = serde_json::from_str("{}").unwrap();
 
@@ -4174,6 +4233,7 @@ mod tests {
             ui_font_size: 18.0,
             terminal_font_size: 20.0,
             show_hidden_files: true,
+            sftp_cwd_sync_mode: SftpCwdSyncMode::Realtime,
             key_bindings: std::collections::HashMap::from([(
                 "OpenSettings".to_string(),
                 "ctrl-shift-,".to_string(),
@@ -4197,6 +4257,7 @@ mod tests {
         assert_eq!(decrypted.ui_font_size, 18.0);
         assert_eq!(decrypted.terminal_font_size, 20.0);
         assert!(decrypted.show_hidden_files);
+        assert_eq!(decrypted.sftp_cwd_sync_mode, SftpCwdSyncMode::Realtime);
         assert_eq!(
             decrypted
                 .key_bindings

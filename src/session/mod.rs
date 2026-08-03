@@ -29,6 +29,21 @@ pub(crate) enum SessionProxyPolicy {
     Custom,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SftpStartAction {
+    Start,
+    Reconnect,
+    Noop,
+}
+
+fn sftp_start_action(handle_exists: bool, reconnect_after_ssh: bool) -> SftpStartAction {
+    match (handle_exists, reconnect_after_ssh) {
+        (false, _) => SftpStartAction::Start,
+        (true, true) => SftpStartAction::Reconnect,
+        (true, false) => SftpStartAction::Noop,
+    }
+}
+
 pub(crate) fn session_proxy_policy(proxy_type: &str) -> SessionProxyPolicy {
     match proxy_type.trim().to_ascii_lowercase().as_str() {
         "" | "none" => SessionProxyPolicy::Inherit,
@@ -1065,14 +1080,17 @@ impl Ashell {
             focused_pane_path: Vec::new(),
             sftp: Some(crate::terminal::SftpUiState {
                 current_path: "/".into(),
+                path_initialized: false,
                 generation: 0,
                 status: rust_i18n::t!("sftp_connecting").to_string(),
+                cwd_follow_pause_status_displayed: false,
                 entries: Vec::new(),
                 selected_path: None,
                 preview: None,
                 selected_entries: std::collections::HashSet::new(),
                 deleting_entries: std::collections::HashSet::new(),
                 home_dir: "/".into(),
+                cwd_follow: crate::sftp::cwd_follow::SftpCwdFollowState::default(),
             }),
         });
         self.active_group = Some(group_id.clone());
@@ -1088,6 +1106,58 @@ impl Ashell {
             self.saved_scroll_handle.scroll_to_item(index);
         }
         cx.notify();
+        self.active_tab = Some(id.clone());
+        self.pending_sftp_path_sync = Some("/".into());
+        self.status = "ssh tab opened".into();
+        self.follow_active_terminal_cwd(crate::sftp::cwd_follow::CwdFollowTrigger::TerminalSwitch);
+        cx.notify();
+    }
+
+    pub(crate) fn ensure_sftp_started_for_terminal(&mut self, tab_id: &str) {
+        let Some(session) = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_id && tab.kind == TabKind::Ssh)
+            .and_then(|tab| tab.session.clone())
+        else {
+            return;
+        };
+        let Some(group_id) = self
+            .tab_groups
+            .iter()
+            .find(|group| group.pane_root.contains(tab_id))
+            .map(|group| group.id.clone())
+        else {
+            return;
+        };
+        let handle = self.sftp_handles.get(&group_id).cloned();
+        let reconnect_after_ssh = self
+            .sftp_reconnect_after_ssh
+            .get(&group_id)
+            .is_some_and(|tab_ids| tab_ids.contains(tab_id));
+        match sftp_start_action(handle.is_some(), reconnect_after_ssh) {
+            SftpStartAction::Noop => return,
+            SftpStartAction::Reconnect => {
+                self.sftp_reconnect_after_ssh.remove(&group_id);
+                self.mark_sftp_cwd_follow_unavailable(&group_id);
+                handle
+                    .expect("reconnect action requires an existing SFTP handle")
+                    .reconnect_now();
+                if let Some(sftp) = self
+                    .tab_groups
+                    .iter_mut()
+                    .find(|group| group.id == group_id)
+                    .and_then(|group| group.sftp.as_mut())
+                {
+                    sftp.set_status(rust_i18n::t!("sftp_reconnecting").to_string());
+                }
+                return;
+            }
+            SftpStartAction::Start => {}
+        }
+
+        self.sftp_reconnect_after_ssh.remove(&group_id);
+        let proxy_config = self.config.connection_proxy_config();
         let sftp_handle = crate::sftp::spawn_sftp(
             self.runtime.handle(),
             group_id.clone(),
@@ -1095,11 +1165,7 @@ impl Ashell {
             proxy_config,
             self.events_tx.clone(),
         );
-        self.sftp_handles.insert(group_id.clone(), sftp_handle);
-        self.active_tab = Some(id.clone());
-        self.pending_sftp_path_sync = Some("/".into());
-        self.status = "ssh tab opened".into();
-        cx.notify();
+        self.sftp_handles.insert(group_id, sftp_handle);
     }
 
     pub(crate) fn open_serial_session(&mut self, session: Session, cx: &mut Context<Self>) {
@@ -1221,20 +1287,18 @@ impl Ashell {
             self.tabs[ix].disconnected_reason = None;
             self.tabs[ix].backend_generation = new_generation;
 
-            // Restart SFTP for the group containing this tab
+            // Reconnect SFTP only after the replacement SSH shell is connected.
             if let Some(group) = self
                 .tab_groups
                 .iter()
                 .find(|g| g.pane_root.contains(tab_id))
             {
                 let group_id = group.id.clone();
-                if let Some(handle) = self.sftp_handles.get(&group_id) {
-                    handle.reconnect_now();
-                    if let Some(group) = self.tab_groups.iter_mut().find(|g| g.id == group_id)
-                        && let Some(sftp) = group.sftp.as_mut()
-                    {
-                        sftp.status = rust_i18n::t!("sftp_reconnecting").to_string();
-                    }
+                if self.sftp_handles.contains_key(&group_id) {
+                    self.sftp_reconnect_after_ssh
+                        .entry(group_id)
+                        .or_default()
+                        .insert(tab_id.to_string());
                 }
             }
         } else {
@@ -1274,6 +1338,8 @@ impl Ashell {
     }
 
     pub(crate) fn activate_tab(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let previous_terminal = self.active_tab.clone();
+        let previous_group = self.active_group.clone();
         if let Some(group_id) = self.active_group.clone()
             && let Some(group) = self.tab_groups.iter_mut().find(|g| g.id == group_id)
         {
@@ -1281,6 +1347,7 @@ impl Ashell {
             group.focused_pane_path = self.focused_pane_path.clone();
         }
         self.active_tab = Some(id.clone());
+        let mut sftp_path_sync = None;
         let tab_group = self
             .tab_groups
             .iter_mut()
@@ -1288,6 +1355,7 @@ impl Ashell {
         if let Some(group) = tab_group {
             self.pane_root = group.pane_root.clone();
             self.active_group = Some(group.id.clone());
+            sftp_path_sync = group.sftp.as_ref().map(|sftp| sftp.current_path.clone());
             self.focus_pane_with_id(id.clone());
         } else {
             self.pane_root = PaneLayout::terminal(id.clone());
@@ -1305,6 +1373,14 @@ impl Ashell {
                 .position(|session| session.id == session_id)
         {
             self.saved_scroll_handle.scroll_to_item(index);
+        }
+        if previous_group != self.active_group {
+            self.pending_sftp_path_sync = sftp_path_sync;
+        }
+        if previous_terminal != self.active_tab {
+            self.follow_active_terminal_cwd(
+                crate::sftp::cwd_follow::CwdFollowTrigger::TerminalSwitch,
+            );
         }
         self.focus_handle.focus(window, cx);
         self.sync_system_tab_to_active_group();
@@ -1346,6 +1422,17 @@ impl Ashell {
             }
             return;
         };
+
+        let remove_deferred_group = self
+            .sftp_reconnect_after_ssh
+            .get_mut(&group.id)
+            .is_some_and(|tab_ids| {
+                tab_ids.remove(&id);
+                tab_ids.is_empty()
+            });
+        if remove_deferred_group {
+            self.sftp_reconnect_after_ssh.remove(&group.id);
+        }
 
         let pane_ids = group.pane_root.tab_ids();
         let pane_ids_str: Vec<&str> = pane_ids.to_vec();
@@ -1407,6 +1494,7 @@ impl Ashell {
                 }
             }
             self.sftp_handles.remove(&group.id);
+            self.sftp_reconnect_after_ssh.remove(&group.id);
             self.tab_groups.remove(group_ix.unwrap());
             self.workspace_tabs.retain(|workspace| {
                 !matches!(
@@ -1457,6 +1545,7 @@ impl Ashell {
             self.net_tx_history.clear();
             self.system_status = None;
             self.sftp_handles.clear();
+            self.sftp_reconnect_after_ssh.clear();
             self.active_workspace_tab = self
                 .workspace_tabs
                 .first()
@@ -1489,7 +1578,6 @@ impl Ashell {
                     .or_else(|| self.tabs.first().map(|t| t.id.clone()))
             });
             if let Some(new_id) = new_id {
-                self.active_tab = Some(new_id.clone());
                 if let Some(g) = self
                     .tab_groups
                     .iter()
@@ -1498,6 +1586,9 @@ impl Ashell {
                     self.active_group = Some(g.id.clone());
                     self.active_workspace_tab = Some(g.id.clone());
                     self.pane_root = g.pane_root.clone();
+                    if let Some(path) = g.sftp.as_ref().map(|sftp| sftp.current_path.clone()) {
+                        self.pending_sftp_path_sync = Some(path);
+                    }
                 }
                 self.focus_pane_with_id(new_id);
             }
@@ -1717,6 +1808,7 @@ impl Ashell {
         }
         self.focused_pane_path = new_full_path;
         self.active_tab = Some(new_id);
+        self.follow_active_terminal_cwd(crate::sftp::cwd_follow::CwdFollowTrigger::TerminalSwitch);
         self.status = "pane split".into();
         tracing::info!(
             "[split] DONE: pane_root={:?} focused_path={:?} active_tab={:?} tabs={}",
@@ -1786,7 +1878,8 @@ impl Ashell {
             }
         }
 
-        if previous_terminal != self.active_tab && self.search_active {
+        let terminal_changed = previous_terminal != self.active_tab;
+        if terminal_changed && self.search_active {
             self.search_active = false;
             self.search_query.clear();
             self.search_matches.clear();
@@ -1794,6 +1887,11 @@ impl Ashell {
             self.search_target_tab = None;
         }
         self.sync_pane_root_to_group();
+        if terminal_changed {
+            self.follow_active_terminal_cwd(
+                crate::sftp::cwd_follow::CwdFollowTrigger::TerminalSwitch,
+            );
+        }
         Some(leaf)
     }
 
@@ -1920,6 +2018,9 @@ impl Ashell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let previous_terminal = self.active_tab.clone();
+        let mut activated = false;
+        let mut sftp_path_sync = None;
         // Save current group state
         if let Some(current_group_id) = self.active_group.clone()
             && let Some(group) = self
@@ -1935,7 +2036,7 @@ impl Ashell {
             self.pane_root = group.pane_root.clone();
             self.focused_pane_path = group.focused_pane_path.clone();
             self.active_group = Some(group_id.clone());
-            self.active_workspace_tab = Some(group_id);
+            self.active_workspace_tab = Some(group_id.clone());
             let ids = group.pane_root.terminal_ids();
             if let Some(id) = group
                 .pane_root
@@ -1943,6 +2044,16 @@ impl Ashell {
                 .or_else(|| ids.first().copied())
             {
                 self.active_tab = Some(id.to_string());
+            }
+            sftp_path_sync = group.sftp.as_ref().map(|sftp| sftp.current_path.clone());
+            activated = true;
+        }
+        if activated {
+            self.pending_sftp_path_sync = sftp_path_sync;
+            if previous_terminal != self.active_tab {
+                self.follow_active_terminal_cwd(
+                    crate::sftp::cwd_follow::CwdFollowTrigger::TerminalSwitch,
+                );
             }
             self.focus_active_pane(window, cx);
         }
@@ -2472,6 +2583,18 @@ mod tests {
             connected_session_tab_id(vec![("old", false, Some(&session))], "prod"),
             None
         );
+    }
+
+    #[test]
+    fn sftp_start_is_idempotent_after_ssh_connected() {
+        assert_eq!(sftp_start_action(false, false), SftpStartAction::Start);
+        let first_repeat = sftp_start_action(true, false);
+        let second_repeat = sftp_start_action(true, false);
+        assert_eq!(
+            (first_repeat, second_repeat),
+            (SftpStartAction::Noop, SftpStartAction::Noop)
+        );
+        assert_eq!(sftp_start_action(true, true), SftpStartAction::Reconnect);
     }
 
     #[test]

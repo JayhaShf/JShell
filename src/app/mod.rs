@@ -400,6 +400,7 @@ pub(crate) struct Ashell {
 
     pub(crate) system_tab_id: Option<String>,
     pub(crate) sftp_handles: std::collections::HashMap<String, crate::sftp::SftpHandle>,
+    pub(crate) sftp_reconnect_after_ssh: HashMap<String, HashSet<String>>,
 
     pub(crate) remote_sample_in_flight: bool,
     pub(crate) runtime: Runtime,
@@ -949,6 +950,7 @@ impl Ashell {
 
             system_tab_id: None,
             sftp_handles: std::collections::HashMap::new(),
+            sftp_reconnect_after_ssh: HashMap::new(),
 
             remote_sample_in_flight: false,
             runtime: Runtime::new().expect("create tokio runtime"),
@@ -1171,7 +1173,9 @@ impl Ashell {
                     .await;
                 if this
                     .update(cx, |this, cx| {
+                        let now = std::time::Instant::now();
                         let changed = this.drain_backend_events();
+                        let cwd_follow_changed = this.expire_sftp_cwd_follow_requests(now);
                         let system_sampled = this.sample_system_if_due();
                         this.sync_theme_if_due(cx);
                         let is_blinking = matches!(
@@ -1179,11 +1183,10 @@ impl Ashell {
                             crate::session::config::CursorStyle::Blink
                                 | crate::session::config::CursorStyle::BeamBlink
                         );
-                        let now = std::time::Instant::now();
                         let blink_due = is_blinking
                             && now.duration_since(last_blink_time)
                                 >= std::time::Duration::from_millis(600);
-                        if changed || system_sampled || blink_due {
+                        if changed || system_sampled || cwd_follow_changed || blink_due {
                             cx.notify();
                             if blink_due {
                                 last_blink_time = now;
@@ -1271,6 +1274,7 @@ impl Ashell {
                     if !accepted {
                         continue;
                     }
+                    self.ensure_sftp_started_for_terminal(&tab_id);
                     self.sync_system_tab_to_active_group();
                     self.request_active_system_snapshot();
                     if self
@@ -1291,17 +1295,139 @@ impl Ashell {
                 BackendEvent::SftpEntries {
                     tab_id,
                     generation,
+                    request_id,
                     path,
                     entries,
                 } => {
-                    if let Some(group) = self.tab_groups.iter_mut().find(|g| g.id == tab_id)
-                        && let Some(sftp) = group.sftp.as_mut()
-                        && sftp.accepts_generation(generation)
-                        && sftp.current_path == path
-                    {
-                        sftp.current_path = path;
-                        sftp.entries = entries;
-                        self.pending_sftp_path_sync = Some(sftp.current_path.clone());
+                    let configured_mode = self.config.sftp_cwd_sync_mode();
+                    let active_group = self.active_group.as_deref() == Some(tab_id.as_str());
+                    match request_id {
+                        None => {
+                            let accepted_path = self
+                                .tab_groups
+                                .iter_mut()
+                                .find(|group| group.id == tab_id)
+                                .and_then(|group| group.sftp.as_mut())
+                                .and_then(|sftp| {
+                                    if sftp.accepts_generation(generation)
+                                        && sftp.current_path == path
+                                    {
+                                        sftp.current_path = path;
+                                        sftp.entries = entries;
+                                        Some(sftp.current_path.clone())
+                                    } else {
+                                        None
+                                    }
+                                });
+                            if active_group && let Some(path) = accepted_path {
+                                self.pending_sftp_path_sync = Some(path);
+                            }
+                        }
+                        Some(request_id) => {
+                            let mut completion =
+                                crate::sftp::cwd_follow::CwdFollowCompletion::default();
+                            let mut accepted_path = None;
+                            if let Some(sftp) = self
+                                .tab_groups
+                                .iter_mut()
+                                .find(|group| group.id == tab_id)
+                                .and_then(|group| group.sftp.as_mut())
+                                && sftp.accepts_generation(generation)
+                            {
+                                completion = sftp.cwd_follow.complete(
+                                    request_id,
+                                    configured_mode,
+                                    Instant::now(),
+                                );
+                                if completion.matched && completion.accept_result {
+                                    sftp.current_path = path;
+                                    sftp.path_initialized = true;
+                                    sftp.entries = entries;
+                                    sftp.selected_path = None;
+                                    sftp.preview = None;
+                                    sftp.selected_entries.clear();
+                                    accepted_path = Some(sftp.current_path.clone());
+                                }
+                            }
+                            if active_group && let Some(path) = accepted_path {
+                                self.pending_sftp_path_sync = Some(path);
+                            }
+                            self.dispatch_pending_sftp_cwd_follow(tab_id, completion.next);
+                        }
+                    }
+                }
+                BackendEvent::SftpListDirFailed {
+                    tab_id,
+                    generation,
+                    request_id,
+                    path,
+                    reason,
+                } => {
+                    let configured_mode = self.config.sftp_cwd_sync_mode();
+                    let active_group = self.active_group.as_deref() == Some(tab_id.as_str());
+                    match request_id {
+                        None => {
+                            let accepted = self
+                                .tab_groups
+                                .iter_mut()
+                                .find(|group| group.id == tab_id)
+                                .and_then(|group| group.sftp.as_mut())
+                                .is_some_and(|sftp| {
+                                    if sftp.accepts_generation(generation)
+                                        && sftp.current_path == path
+                                    {
+                                        sftp.set_status(reason.clone());
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                });
+                            if accepted && active_group {
+                                self.status = reason.into();
+                            }
+                        }
+                        Some(request_id) => {
+                            let mut completion =
+                                crate::sftp::cwd_follow::CwdFollowCompletion::default();
+                            let paused_status =
+                                rust_i18n::t!("sftp_cwd_sync_realtime_paused").to_string();
+                            let mut displayed_status = None;
+                            if let Some(sftp) = self
+                                .tab_groups
+                                .iter_mut()
+                                .find(|group| group.id == tab_id)
+                                .and_then(|group| group.sftp.as_mut())
+                                && sftp.accepts_generation(generation)
+                            {
+                                completion = sftp.cwd_follow.complete(
+                                    request_id,
+                                    configured_mode,
+                                    Instant::now(),
+                                );
+                                if completion.matched && completion.accept_result {
+                                    let pause_active =
+                                        crate::sftp::cwd_follow::realtime_pause_is_active(
+                                            configured_mode,
+                                            sftp.cwd_follow.realtime_paused(),
+                                        );
+                                    let status = if pause_active {
+                                        paused_status
+                                    } else {
+                                        reason.clone()
+                                    };
+                                    if pause_active {
+                                        sftp.set_cwd_follow_paused_status(status.clone());
+                                    } else {
+                                        sftp.set_status(status.clone());
+                                    }
+                                    displayed_status = Some(status);
+                                }
+                            }
+                            if active_group && let Some(status) = displayed_status {
+                                self.status = status.into();
+                            }
+                            self.dispatch_pending_sftp_cwd_follow(tab_id, completion.next);
+                        }
                     }
                 }
                 BackendEvent::SftpPreview {
@@ -1322,25 +1448,80 @@ impl Ashell {
                     generation,
                     text,
                 } => {
-                    let current_path = self
+                    let accepted = self
+                        .tab_groups
+                        .iter_mut()
+                        .find(|group| group.id == tab_id)
+                        .and_then(|group| group.sftp.as_mut())
+                        .is_some_and(|sftp| {
+                            if sftp.accepts_generation(generation) {
+                                sftp.set_status(text.clone());
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                    if accepted && self.active_group.as_ref() == Some(&tab_id) {
+                        self.status = text.into();
+                    }
+                }
+                BackendEvent::SftpConnectionStatus {
+                    tab_id,
+                    generation,
+                    state,
+                    text,
+                } => {
+                    let connected = state.is_connected();
+                    let reconnecting = state.is_reconnecting();
+                    let configured_mode = self.config.sftp_cwd_sync_mode();
+                    let paused_status = rust_i18n::t!("sftp_cwd_sync_realtime_paused").to_string();
+                    let mut follow_request = None;
+                    let current_directory = self
                         .tab_groups
                         .iter_mut()
                         .find(|group| group.id == tab_id)
                         .and_then(|group| group.sftp.as_mut())
                         .and_then(|sftp| {
-                            if sftp.accepts_generation(generation) {
-                                sftp.status = text.clone();
-                                Some(sftp.current_path.clone())
-                            } else {
-                                None
+                            if !sftp.accepts_generation(generation) {
+                                return None;
                             }
+                            let mut displayed_status = text.clone();
+                            let mut pause_active = false;
+                            if connected {
+                                follow_request =
+                                    sftp.cwd_follow.mark_ready(configured_mode, Instant::now());
+                                pause_active = crate::sftp::cwd_follow::realtime_pause_is_active(
+                                    configured_mode,
+                                    sftp.cwd_follow.realtime_paused(),
+                                );
+                                if pause_active {
+                                    displayed_status = paused_status.clone();
+                                }
+                            } else {
+                                sftp.cwd_follow.mark_unavailable();
+                            }
+                            if pause_active {
+                                sftp.set_cwd_follow_paused_status(displayed_status.clone());
+                            } else {
+                                sftp.set_status(displayed_status.clone());
+                            }
+                            Some((
+                                sftp.current_path.clone(),
+                                sftp.home_dir.clone(),
+                                displayed_status,
+                            ))
                         });
-                    let Some(current_path) = current_path else {
+                    let Some((current_path, home_dir, displayed_status)) = current_directory else {
                         continue;
                     };
-                    if text == rust_i18n::t!("sftp_connected") {
-                        if let Some(handle) = self.sftp_handles.get(&tab_id) {
-                            handle.list_dir(current_path);
+                    if connected {
+                        let has_follow_request = follow_request.is_some();
+                        self.dispatch_pending_sftp_cwd_follow(tab_id.clone(), follow_request);
+                        if !has_follow_request
+                            && current_path != home_dir
+                            && let Some(handle) = self.sftp_handles.get(&tab_id)
+                        {
+                            handle.list_dir(current_path, generation);
                         }
                         for document in self
                             .documents
@@ -1350,7 +1531,7 @@ impl Ashell {
                             document.connection_state =
                                 crate::document::DocumentConnectionState::Online;
                         }
-                    } else if text.starts_with(rust_i18n::t!("sftp_reconnecting").as_ref()) {
+                    } else if reconnecting {
                         for document in self
                             .documents
                             .values_mut()
@@ -1361,7 +1542,7 @@ impl Ashell {
                         }
                     }
                     if self.active_group.as_ref() == Some(&tab_id) {
-                        self.status = text.into();
+                        self.status = displayed_status.into();
                     }
                 }
                 BackendEvent::SftpConnectionBlocked {
@@ -1378,7 +1559,7 @@ impl Ashell {
                         .and_then(|group| group.sftp.as_mut())
                         .is_some_and(|sftp| {
                             if sftp.accepts_generation(generation) {
-                                sftp.status = text.clone();
+                                sftp.set_status(text.clone());
                                 true
                             } else {
                                 false
@@ -1387,6 +1568,7 @@ impl Ashell {
                     if !accepted {
                         continue;
                     }
+                    self.mark_sftp_cwd_follow_unavailable(&tab_id);
                     for document in self
                         .documents
                         .values_mut()
@@ -1558,13 +1740,7 @@ impl Ashell {
                     generation,
                     home,
                 } => {
-                    if let Some(group) = self.tab_groups.iter_mut().find(|g| g.id == tab_id)
-                        && let Some(sftp) = group.sftp.as_mut()
-                        && sftp.accepts_generation(generation)
-                    {
-                        sftp.apply_home(home);
-                        self.pending_sftp_path_sync = Some(sftp.current_path.clone());
-                    }
+                    self.handle_sftp_home(tab_id, generation, home);
                 }
                 BackendEvent::SftpGeneration { tab_id, generation } => {
                     let accepted = self
@@ -1574,6 +1750,7 @@ impl Ashell {
                         .and_then(|group| group.sftp.as_mut())
                         .is_some_and(|sftp| sftp.begin_generation(generation));
                     if accepted {
+                        self.mark_sftp_cwd_follow_unavailable(&tab_id);
                         for transfer in self.transfers.iter_mut().filter(|transfer| {
                             transfer.tab_id == tab_id && transfer.generation < generation
                         }) {
@@ -1591,9 +1768,7 @@ impl Ashell {
                     }
                 }
                 BackendEvent::TerminalTitleChanged { tab_id, title } => {
-                    if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
-                        tab.dynamic_title = title;
-                    }
+                    self.handle_terminal_title_changed(tab_id, title);
                 }
                 BackendEvent::SyncFinished(result) => {
                     self.handle_sync_finished(*result);
@@ -1756,20 +1931,18 @@ impl Ashell {
             self.tabs[ix].disconnected_reason = None;
             self.tabs[ix].backend_generation = new_generation;
 
-            // Restart SFTP for the group containing this tab
+            // Reconnect SFTP only after the replacement SSH shell is connected.
             if let Some(group) = self
                 .tab_groups
                 .iter()
                 .find(|g| g.pane_root.contains(&tab_id))
             {
                 let group_id = group.id.clone();
-                if let Some(handle) = self.sftp_handles.get(&group_id) {
-                    handle.reconnect_now();
-                    if let Some(group) = self.tab_groups.iter_mut().find(|g| g.id == group_id)
-                        && let Some(sftp) = group.sftp.as_mut()
-                    {
-                        sftp.status = rust_i18n::t!("sftp_reconnecting").to_string();
-                    }
+                if self.sftp_handles.contains_key(&group_id) {
+                    self.sftp_reconnect_after_ssh
+                        .entry(group_id)
+                        .or_default()
+                        .insert(tab_id.clone());
                 }
             }
         }
@@ -1791,69 +1964,6 @@ impl Ashell {
             self.handle_tab_close(tab_id);
         }
         cx.notify();
-    }
-
-    pub(crate) fn sync_cwd_from_terminal(
-        &mut self,
-        _window: &mut gpui::Window,
-        _cx: &mut Context<Self>,
-    ) {
-        let active_id = self.active_tab.clone();
-        let Some(active_id) = active_id else {
-            return;
-        };
-
-        if let Some(tab) = self.tabs.iter().find(|t| t.id == active_id) {
-            let home_dir = if let Some(group) = self
-                .tab_groups
-                .iter()
-                .find(|g| g.pane_root.contains(&tab.id))
-            {
-                group
-                    .sftp
-                    .as_ref()
-                    .map(|s| s.home_dir.as_str())
-                    .unwrap_or("/")
-            } else {
-                "/"
-            };
-
-            let parsed = Self::parse_path_from_title(&tab.dynamic_title, home_dir);
-
-            if let Some(path) = parsed
-                && let Some(group) = self
-                    .tab_groups
-                    .iter_mut()
-                    .find(|g| g.pane_root.contains(&active_id))
-                && let Some(sftp) = group.sftp.as_mut()
-            {
-                sftp.current_path = path.clone();
-                self.pending_sftp_path_sync = Some(path.clone());
-                if let Some(handle) = self.sftp_handles.get(&group.id) {
-                    handle.send(crate::sftp::SftpCommand::ListDir(path));
-                }
-            }
-        }
-    }
-
-    fn parse_path_from_title(title: &str, home_dir: &str) -> Option<String> {
-        let title = title.strip_prefix("ASHELL_CWD:").unwrap_or(title);
-        let path_part = if let Some(pos) = title.find(':') {
-            title[pos + 1..].trim()
-        } else {
-            title.trim()
-        };
-
-        if path_part.starts_with('/') {
-            Some(path_part.to_string())
-        } else if path_part == "~" {
-            Some(home_dir.to_string())
-        } else if let Some(rest) = path_part.strip_prefix("~/") {
-            let home = home_dir.trim_end_matches('/');
-            Some(format!("{}/{}", home, rest))
-        } else {
-            None
-        }
     }
 
     pub(crate) fn save_layout_state(&self, window: &mut gpui::Window, cx: &gpui::App) {

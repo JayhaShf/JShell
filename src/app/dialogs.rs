@@ -2525,6 +2525,64 @@ impl Ashell {
                                         )
                                         .group(
                                             SettingGroup::new()
+                                                .title(t!("settings_group_ssh_sftp").to_string())
+                                                .item(
+                                                    SettingItem::new(
+                                                        t!("sftp_cwd_sync_mode").to_string(),
+                                                        SettingField::render({
+                                                            let view = view_clone_for_general.clone();
+                                                            move |_, _window, cx| {
+                                                                let current = view.read(cx).config.sftp_cwd_sync_mode();
+                                                                Button::new("sftp-cwd-sync-mode-dropdown")
+                                                                    .small()
+                                                                    .icon(IconName::SquareTerminal)
+                                                                    .label(match current {
+                                                                        crate::session::config::SftpCwdSyncMode::Off => {
+                                                                            t!("sftp_cwd_sync_off").to_string()
+                                                                        }
+                                                                        crate::session::config::SftpCwdSyncMode::OnTerminalSwitch => {
+                                                                            t!("sftp_cwd_sync_on_terminal_switch").to_string()
+                                                                        }
+                                                                        crate::session::config::SftpCwdSyncMode::Realtime => {
+                                                                            t!("sftp_cwd_sync_realtime").to_string()
+                                                                        }
+                                                                    })
+                                                                    .dropdown_menu_with_anchor(Anchor::BottomRight, {
+                                                                        let view = view.clone();
+                                                                        move |menu, window, cx| {
+                                                                            let current = view.read(cx).config.sftp_cwd_sync_mode();
+                                                                            menu.min_w(220.)
+                                                                                .item(
+                                                                                    PopupMenuItem::new(t!("sftp_cwd_sync_off").to_string())
+                                                                                        .checked(current == crate::session::config::SftpCwdSyncMode::Off)
+                                                                                        .on_click(window.listener_for(&view, |this, _, _window, cx| {
+                                                                                            this.set_sftp_cwd_sync_mode(crate::session::config::SftpCwdSyncMode::Off, cx);
+                                                                                        }))
+                                                                                )
+                                                                                .item(
+                                                                                    PopupMenuItem::new(t!("sftp_cwd_sync_on_terminal_switch").to_string())
+                                                                                        .checked(current == crate::session::config::SftpCwdSyncMode::OnTerminalSwitch)
+                                                                                        .on_click(window.listener_for(&view, |this, _, _window, cx| {
+                                                                                            this.set_sftp_cwd_sync_mode(crate::session::config::SftpCwdSyncMode::OnTerminalSwitch, cx);
+                                                                                        }))
+                                                                                )
+                                                                                .item(
+                                                                                    PopupMenuItem::new(t!("sftp_cwd_sync_realtime").to_string())
+                                                                                        .checked(current == crate::session::config::SftpCwdSyncMode::Realtime)
+                                                                                        .on_click(window.listener_for(&view, |this, _, _window, cx| {
+                                                                                            this.set_sftp_cwd_sync_mode(crate::session::config::SftpCwdSyncMode::Realtime, cx);
+                                                                                        }))
+                                                                                )
+                                                                        }
+                                                                    })
+                                                                    .into_any_element()
+                                                            }
+                                                        })
+                                                    ).description(t!("sftp_cwd_sync_description").to_string())
+                                                )
+                                        )
+                                        .group(
+                                            SettingGroup::new()
                                                 .title(t!("settings_group_plugins").to_string())
                                                 .item(
                                                     SettingItem::new(
