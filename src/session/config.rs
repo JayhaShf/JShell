@@ -270,6 +270,8 @@ pub struct ConfigFile {
     pub sidebar_collapsed: bool,
     #[serde(default)]
     pub sftp_panel_minimized: bool,
+    #[serde(default = "default_system_tray")]
+    pub system_tray: bool,
     #[serde(default)]
     pub sftp_cwd_sync_mode: SftpCwdSyncMode,
     #[serde(default)]
@@ -336,6 +338,10 @@ fn default_global_proxy_type() -> String {
 
 fn default_monitoring_position() -> String {
     "Sidebar".to_string()
+}
+
+fn default_system_tray() -> bool {
+    true
 }
 
 fn default_s3_region() -> String {
@@ -451,6 +457,7 @@ impl Default for ConfigFile {
             monitoring_position: default_monitoring_position(),
             sidebar_collapsed: false,
             sftp_panel_minimized: false,
+            system_tray: default_system_tray(),
             sftp_cwd_sync_mode: SftpCwdSyncMode::default(),
             key_bindings: std::collections::HashMap::new(),
             sync_endpoint: String::new(),
@@ -1395,6 +1402,14 @@ impl ConfigStore {
         self.cache.sftp_panel_minimized = val;
     }
 
+    pub fn system_tray(&self) -> bool {
+        self.cache.system_tray
+    }
+
+    pub fn set_system_tray(&mut self, val: bool) {
+        self.cache.system_tray = val;
+    }
+
     pub fn sftp_cwd_sync_mode(&self) -> SftpCwdSyncMode {
         self.cache.sftp_cwd_sync_mode
     }
@@ -1679,6 +1694,7 @@ impl ConfigStore {
         disk_config.monitoring_position = local_config.monitoring_position;
         disk_config.sidebar_collapsed = local_config.sidebar_collapsed;
         disk_config.sftp_panel_minimized = local_config.sftp_panel_minimized;
+        disk_config.system_tray = local_config.system_tray;
         disk_config.sftp_cwd_sync_mode = local_config.sftp_cwd_sync_mode;
         disk_config.key_bindings = local_config.key_bindings;
         disk_config.use_proxy = local_config.use_proxy;
@@ -2489,6 +2505,7 @@ mod tests {
             }],
             sidebar_collapsed: true,
             sftp_panel_minimized: true,
+            system_tray: false,
             sync_endpoint: "https://local-webdav.test/config".to_string(),
             sync_username: "local-webdav-user".to_string(),
             sync_etag: Some("old-etag".to_string()),
@@ -2518,6 +2535,7 @@ mod tests {
             "transfers": &config.transfers,
             "sidebar_collapsed": config.sidebar_collapsed,
             "sftp_panel_minimized": config.sftp_panel_minimized,
+            "system_tray": config.system_tray,
             "sync_endpoint": &config.sync_endpoint,
             "sync_username": &config.sync_username,
             "sync_device_id": &config.sync_device_id,
@@ -3379,6 +3397,22 @@ mod tests {
         let encrypted = encrypt_config_v2(&config, &key).unwrap();
         let decrypted = decrypt_config_v2(&encrypted, &key).unwrap();
         assert_eq!(decrypted.sftp_cwd_sync_mode, SftpCwdSyncMode::Realtime);
+    }
+
+    #[test]
+    fn system_tray_defaults_to_enabled_and_serializes() {
+        let legacy_config: ConfigFile = serde_json::from_str("{}").unwrap();
+        assert!(legacy_config.system_tray);
+
+        let config = ConfigFile {
+            system_tray: false,
+            ..ConfigFile::default()
+        };
+        let serialized = serde_json::to_string(&config).unwrap();
+        assert!(serialized.contains(r#""system_tray":false"#));
+
+        let restored: ConfigFile = serde_json::from_str(&serialized).unwrap();
+        assert!(!restored.system_tray);
     }
 
     #[test]

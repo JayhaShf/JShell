@@ -212,10 +212,15 @@ pub(crate) fn sync_macos_launch_environment() {}
 
 pub(crate) fn open_main_window(cx: &mut App) {
     let startup_config = StartupConfig::load();
-    open_main_window_with_config(cx, startup_config);
+    open_main_window_with_config(cx, startup_config, None, None);
 }
 
-pub(crate) fn open_main_window_with_config(cx: &mut App, startup_config: StartupConfig) {
+pub(crate) fn open_main_window_with_config(
+    cx: &mut App,
+    startup_config: StartupConfig,
+    instance_events: Option<std::sync::mpsc::Receiver<()>>,
+    signal_events: Option<std::sync::mpsc::Receiver<()>>,
+) {
     let config = &startup_config.config;
 
     crate::session::config::initialize_env_proxy();
@@ -286,7 +291,8 @@ pub(crate) fn open_main_window_with_config(cx: &mut App, startup_config: Startup
         window.activate_window();
         window.set_window_title("JShell");
         gpui_component::Theme::sync_system_appearance(Some(window), cx);
-        let view = cx.new(|cx| Ashell::new(window, cx, startup_config));
+        let view =
+            cx.new(|cx| Ashell::new(window, cx, startup_config, instance_events, signal_events));
 
         tracing::info!("[ui] main application window opened");
         let focus_handle = view.read(cx).focus_handle.clone();
@@ -307,6 +313,13 @@ pub(crate) fn open_main_window_with_config(cx: &mut App, startup_config: Startup
                     this.save_layout_state(window, cx);
                 });
                 return true;
+            }
+            if view_clone.read(cx).tray.is_some() && !view_clone.read(cx).closing_application {
+                // Keep the window (and every session) alive in the background.
+                view_clone.update(cx, |this, cx| {
+                    this.hide_to_tray(window, cx);
+                });
+                return false;
             }
             if view_clone.read(cx).has_dirty_documents() {
                 view_clone.update(cx, |this, cx| {

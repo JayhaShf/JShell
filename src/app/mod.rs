@@ -6,8 +6,11 @@ pub mod keybinding_recorder;
 pub mod pane_layout;
 pub mod resizable;
 pub mod search;
+pub mod signals;
+pub mod single_instance;
 pub mod startup;
 pub mod theme;
+pub mod tray;
 pub mod ui;
 pub mod workspace_tabs;
 
@@ -26,6 +29,7 @@ use std::{
 
 use crate::app::resizable::ResizableState;
 use crate::app::startup::StartupConfig;
+use crate::app::tray::{TrayController, TrayRequest};
 use gpui::{
     AnyWindowHandle, AppContext as _, Bounds, Context, Entity, FocusHandle, Pixels, Point,
     SharedString, Size, UniformListScrollHandle, Window, point, px, size,
@@ -331,6 +335,10 @@ pub(crate) struct Ashell {
     pub(crate) window_close_prompt_open: bool,
     pub(crate) window_close_save_queue: Vec<String>,
     pub(crate) window_close_save_current: Option<String>,
+    pub(crate) tray: Option<TrayController>,
+    pub(crate) tray_window_visible: bool,
+    pub(crate) instance_events: Option<mpsc::Receiver<()>>,
+    pub(crate) signal_events: Option<mpsc::Receiver<()>>,
     pub(crate) selector_selection: usize,
     pub(crate) workspace_panels: Entity<ResizableState>,
     pub(crate) body_panels: Entity<ResizableState>,
@@ -504,6 +512,8 @@ impl Ashell {
         window: &mut Window,
         cx: &mut Context<Self>,
         startup_config: StartupConfig,
+        instance_events: Option<mpsc::Receiver<()>>,
+        signal_events: Option<mpsc::Receiver<()>>,
     ) -> Self {
         let StartupConfig {
             config,
@@ -871,6 +881,10 @@ impl Ashell {
             window_close_prompt_open: false,
             window_close_save_queue: Vec::new(),
             window_close_save_current: None,
+            tray: None,
+            tray_window_visible: true,
+            instance_events,
+            signal_events,
             pane_root: PaneLayout::empty(),
             focused_pane_path: Vec::new(),
             terminal_panel_bounds: None,
@@ -964,9 +978,20 @@ impl Ashell {
             config_writes: ConfigWriteCoordinator::default(),
         };
 
+        if this.config.system_tray() {
+            match TrayController::new() {
+                Ok(tray) => this.tray = Some(tray),
+                Err(error) => {
+                    tracing::warn!(
+                        "system tray unavailable, closing the window will quit: {error:#}"
+                    )
+                }
+            }
+        }
+
         this.apply_theme_preferences(window, cx);
         // this.open_local(cx);
-        this.start_event_pump(cx);
+        this.start_event_pump(window, cx);
         this
     }
 
@@ -1164,20 +1189,41 @@ impl Ashell {
         coordinator.run_exclusive(|| self.config.save())
     }
 
-    pub(crate) fn start_event_pump(&self, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
+    pub(crate) fn start_event_pump(&self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |this, cx| {
             let mut last_blink_time = std::time::Instant::now();
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(16))
                     .await;
                 if this
-                    .update(cx, |this, cx| {
+                    .update_in(cx, |this, window, cx| {
                         let now = std::time::Instant::now();
                         let changed = this.drain_backend_events();
                         let cwd_follow_changed = this.expire_sftp_cwd_follow_requests(now);
                         let system_sampled = this.sample_system_if_due();
                         this.sync_theme_if_due(cx);
+                        this.poll_tray_requests(window, cx);
+                        if this
+                            .instance_events
+                            .as_ref()
+                            .is_some_and(|events| events.try_recv().is_ok())
+                        {
+                            // Another launch asked this instance to show its window.
+                            this.show_from_tray(window, cx);
+                        }
+                        if !this.closing_application
+                            && this
+                                .signal_events
+                                .as_ref()
+                                .is_some_and(|events| events.try_recv().is_ok())
+                        {
+                            // A termination signal was received: restore the window and
+                            // go through the regular quit flow, bypassing close-to-tray.
+                            this.closing_application = true;
+                            this.show_from_tray(window, cx);
+                            this.request_application_close(window, cx);
+                        }
                         let is_blinking = matches!(
                             this.cursor_style,
                             crate::session::config::CursorStyle::Blink
@@ -1200,6 +1246,52 @@ impl Ashell {
             }
         })
         .detach();
+    }
+
+    pub(crate) fn hide_to_tray(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tray.is_none() {
+            return;
+        }
+        self.tray_window_visible = false;
+        // Fully hide the window (no taskbar entry, no visible surface) while
+        // keeping the process and its sessions alive, then activate the tray
+        // so the window cannot be reached from alt-tab either.
+        window.set_visible(false);
+        self.status = t!("minimized_to_tray").into();
+        cx.notify();
+    }
+
+    pub(crate) fn show_from_tray(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.tray_window_visible = true;
+        window.set_visible(true);
+        window.activate_window();
+        cx.notify();
+    }
+
+    pub(crate) fn poll_tray_requests(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tray) = self.tray.as_ref() else {
+            return;
+        };
+        let requests: Vec<TrayRequest> = std::iter::from_fn(|| tray.try_recv()).collect();
+        for request in requests {
+            match request {
+                TrayRequest::ToggleWindow => {
+                    if self.tray_window_visible {
+                        self.hide_to_tray(window, cx);
+                    } else {
+                        self.show_from_tray(window, cx);
+                    }
+                }
+                TrayRequest::ShowWindow => {
+                    self.show_from_tray(window, cx);
+                }
+                TrayRequest::Quit => {
+                    // Restore the window first so the unsaved-document prompt is visible.
+                    self.show_from_tray(window, cx);
+                    self.request_application_close(window, cx);
+                }
+            }
+        }
     }
 
     pub(crate) fn drain_backend_events(&mut self) -> bool {
