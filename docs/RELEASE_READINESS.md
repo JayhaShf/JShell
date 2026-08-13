@@ -38,9 +38,9 @@
 
 | 编号 | 事项 | 状态 |
 |---|---|---|
-| B-001 | CI 红灯解除（audit 豁免）+ 全量门禁通过 | ✅ 已解除（本地复验）；push 后确认 CI 绿 |
+| B-001 | CI 红灯解除（audit 豁免）+ 全量门禁通过 | ✅ 已解除；PR #1 CI 质量门禁 + 四平台构建全绿，发布流程质量门禁复跑通过 |
 | B-002 | 安全测试落地（解包回归、shell_quote、i18n 对齐、ssh_config 边界） | ✅ 已落地（新增 30 项测试） |
-| B-003 | beta.2 审计 4 项未验证关闭 | ⏳ ① CI/Release 托管验证：push+tag 后确认；② 非生产 Linux SSH/SFTP 主机复核权限/上传/删除/静默断线恢复；③ 远程编辑冲突/结果未知/断线保留内容复核；④ 真实 R2 上传/下载（需测试账户，不阻塞若提供不了） |
+| B-003 | beta.2 审计 4 项未验证关闭 | ✅ ① CI/Release 托管验证：v1.0.0 tag 发布全流程通过；⏳ ② 非生产 Linux SSH/SFTP 主机复核权限/上传/删除/静默断线恢复；③ 远程编辑冲突/结果未知/断线保留内容复核；④ 真实 R2 上传/下载（需测试账户，不阻塞若提供不了） |
 | B-004 | Windows `WM_ENDSESSION`（系统关机时托盘应用不保存状态） | ⏳ 需文档化降级方案（发布说明中明示）；代码支持列 backlog |
 | B-005 | 易用性关键路径实测：Linux 托盘左键无响应、GNOME Wayland 最小化被忽略 | ⏳ 发布说明中明示；UI 补偿（"隐藏"代替"最小化"）列 backlog |
 
@@ -61,10 +61,10 @@ TOFU 确认弹窗（R-004）、v1 兜底密钥加固（R-005）、WM_ENDSESSION�
 
 ## 4. 发布流程（v1.0 最终推送步骤）
 
-1. 版本升级：`Cargo.toml` → `1.0.0`，同步 `Cargo.lock`；`packaging/arch/PKGBUILD` `pkgver=1.0.0`、`pkgrel=1`
-2. README.md / README.en.md 版本引用 → v1.0.0（历史审计文档保留原版本号）
-3. 撰写 `.github/release-notes/v1.0.0.zh-CN.md`（发布必需）
-4. `scripts/verify.sh` 全量门禁 + `scripts/smoke-linux.sh` 冒烟
-5. 提交 → push `main` → CI 绿
-6. tag `v1.0.0` 并 push（无 `-`，`release.yml` 自动发布为正式版 latest；tag 与 Cargo 版本一致性由 workflow 校验）
-7. 发布后核查：Release 页非 prerelease、四平台产物齐全、PKGBUILD 版本一致
+1. 版本升级：`Cargo.toml` → `1.0.0`，同步 `Cargo.lock`；`packaging/arch/PKGBUILD` `pkgver=1.0.0`、`pkgrel=1` ✅
+2. README.md / README.en.md 版本引用 → v1.0.0（历史审计文档保留原版本号）✅
+3. 撰写 `.github/release-notes/v1.0.0.zh-CN.md`（发布必需）✅
+4. `scripts/verify.sh` 全量门禁 + `scripts/smoke-linux.sh` 冒烟 ✅（全绿；冒烟 9/9）
+5. 提交 → push `main` → CI 绿 ✅（PR #1：质量门禁 + 四平台构建全绿）
+6. tag `v1.0.0` 并 push（无 `-`，`release.yml` 自动发布为正式版 latest；tag 与 Cargo 版本一致性由 workflow 校验）✅（2026-08-13 发布成功）
+7. 发布后核查：Release 页非 prerelease、四平台产物齐全、PKGBUILD 版本一致 ✅（v1.0.0 为 latest 正式版；windows/linux/macos×2 四个产物齐全；PKGBUILD pkgver=1.0.0）
