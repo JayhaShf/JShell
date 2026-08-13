@@ -4270,7 +4270,7 @@ dependencies = [
 
 [[package]]
 name = "jshell"
-version = "0.1.0-beta.4"
+version = "1.0.0"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -4309,6 +4309,7 @@ dependencies = [
  "rustls-native-certs",
  "serde",
  "serde_json",
+ "serde_yaml",
  "serialport",
  "sha1 0.10.7",
  "sha2 0.10.9",

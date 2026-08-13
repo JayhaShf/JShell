@@ -55,10 +55,11 @@ pub fn parse_ssh_config_content(content: &str) -> Result<Vec<SshConfigEntry>> {
         }
 
         // Split into keyword and value
-        // OpenSSH supports both "keyword value" and "keyword=value" formats
+        // OpenSSH supports both "keyword value" and "keyword=value" formats,
+        // separated by either spaces or tabs.
         let (keyword, value) = if let Some(pos) = line.find('=') {
             (&line[..pos], line[pos + 1..].trim())
-        } else if let Some(pos) = line.find(' ') {
+        } else if let Some(pos) = line.find([' ', '\t']) {
             (&line[..pos], line[pos..].trim())
         } else {
             continue;
@@ -111,7 +112,13 @@ pub fn parse_ssh_config_content(content: &str) -> Result<Vec<SshConfigEntry>> {
             }
             "port" => {
                 if let Some(entry) = current_host.as_mut() {
-                    entry.port = value.parse::<u16>().unwrap_or(22);
+                    // Port 0 is not a valid TCP port; treat it like any other
+                    // unparsable value and fall back to the default.
+                    entry.port = value
+                        .parse::<u16>()
+                        .ok()
+                        .filter(|port| *port > 0)
+                        .unwrap_or(22);
                 }
             }
             "identityfile" => {
@@ -175,5 +182,159 @@ mod tests {
 
         assert_eq!(entries[1].host_alias, "anotherhost");
         assert_eq!(entries[1].hostname, "5.6.7.8");
+    }
+
+    #[test]
+    fn defaults_apply_when_host_has_no_options() {
+        let entries = parse_ssh_config_content("Host bare\n").unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].host_alias, "bare");
+        assert_eq!(entries[0].hostname, "bare");
+        assert_eq!(entries[0].user, "");
+        assert_eq!(entries[0].port, 22);
+        assert!(entries[0].identity_files.is_empty());
+        assert!(!entries[0].is_wildcard);
+    }
+
+    #[test]
+    fn wildcard_and_question_mark_hosts_are_excluded() {
+        let content = "\
+Host *
+  HostName anything
+Host prod?.example.com
+  User admin
+Host real
+  User me
+";
+
+        let entries = parse_ssh_config_content(content).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].host_alias, "real");
+        assert_eq!(entries[0].user, "me");
+    }
+
+    #[test]
+    fn multi_pattern_host_is_treated_as_wildcard() {
+        let content = "\
+Host primary *.example.com
+  HostName 10.0.0.1
+Host solo
+";
+
+        let entries = parse_ssh_config_content(content).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].host_alias, "solo");
+    }
+
+    #[test]
+    fn keyword_equals_value_format_is_supported() {
+        let content = "Host eq\nHostName=192.0.2.7\nPort=2200\nUser=bob\n";
+
+        let entries = parse_ssh_config_content(content).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].hostname, "192.0.2.7");
+        assert_eq!(entries[0].port, 2200);
+        assert_eq!(entries[0].user, "bob");
+    }
+
+    #[test]
+    fn keywords_are_case_insensitive() {
+        let content = "host casey\n  HOSTNAME 203.0.113.9\n  USER alice\n  PORT 2022\n";
+
+        let entries = parse_ssh_config_content(content).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].hostname, "203.0.113.9");
+        assert_eq!(entries[0].user, "alice");
+        assert_eq!(entries[0].port, 2022);
+    }
+
+    #[test]
+    fn tab_separated_keywords_are_supported() {
+        let content = "Host\ttabbed\n\tHostName\t198.51.100.4\n\tPort\t2224\n";
+
+        let entries = parse_ssh_config_content(content).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].hostname, "198.51.100.4");
+        assert_eq!(entries[0].port, 2224);
+    }
+
+    #[test]
+    fn invalid_ports_fall_back_to_the_default() {
+        for bad in ["not-a-port", "70000", "-1", "0"] {
+            let content = format!("Host p\n  Port {bad}\n");
+            let entries = parse_ssh_config_content(&content).unwrap();
+            assert_eq!(entries[0].port, 22, "port {bad:?}");
+        }
+    }
+
+    #[test]
+    fn multiple_identity_files_accumulate() {
+        let content = "Host multi\n  IdentityFile ~/.ssh/a\n  IdentityFile ~/.ssh/b\n";
+
+        let entries = parse_ssh_config_content(content).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].identity_files,
+            vec!["~/.ssh/a".to_string(), "~/.ssh/b".to_string()],
+        );
+    }
+
+    #[test]
+    fn match_blocks_flush_and_detach_the_current_host() {
+        let content = "\
+Host before
+  User u1
+Match host x
+  HostName 1.2.3.4
+Host after
+  User u2
+";
+
+        let entries = parse_ssh_config_content(content).unwrap();
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].host_alias, "before");
+        assert_eq!(entries[1].host_alias, "after");
+        // The HostName under Match must not attach to "after".
+        assert_eq!(entries[1].hostname, "after");
+    }
+
+    #[test]
+    fn include_directives_flush_the_current_host() {
+        let content = "Host h1\n  User a\nInclude ~/.ssh/other\nHost h2\n";
+
+        let entries = parse_ssh_config_content(content).unwrap();
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].host_alias, "h1");
+        assert_eq!(entries[1].host_alias, "h2");
+    }
+
+    #[test]
+    fn comments_and_blank_lines_are_skipped() {
+        let content = "# leading comment\n\nHost c\n  HostName 192.0.2.1\n";
+
+        let entries = parse_ssh_config_content(content).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].host_alias, "c");
+        assert_eq!(entries[0].hostname, "192.0.2.1");
+    }
+
+    #[test]
+    fn unknown_keywords_are_ignored() {
+        let content = "Host u\n  UnknownKeyword whatever\n  HostName 192.0.2.2\n";
+
+        let entries = parse_ssh_config_content(content).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].hostname, "192.0.2.2");
     }
 }

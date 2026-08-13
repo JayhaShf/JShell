@@ -96,6 +96,7 @@ system_path_warning: "WARNING: You are attempting to delete critical system path
 delete_success: "Successfully deleted %{count} items"
 delete_failed: "Failed to delete: %{err}"
 deleting_paths: "Deleting %{count} items..."
+confirm: "Confirm"
 local_terminal: "Local Terminal"
 open_local_shell_tab: "Open a new local shell tab"
 connect: "Connect"

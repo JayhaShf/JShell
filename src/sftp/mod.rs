@@ -2348,6 +2348,14 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
+/// Extracts a downloaded directory archive into `target_dir`.
+///
+/// Path traversal protection relies on the archive crates themselves and must
+/// not be weakened by future edits: for zip, `entry.enclosed_name()` rejects
+/// escaping names; for tar, `Archive::unpack` skips entries with `..`
+/// components and its canonicalization check refuses writes that resolve
+/// outside the destination (including through symlinks). See the regression
+/// tests in `handle_tests::extract_*`.
 async fn extract_archive_to(path: &Path, target_dir: &Path) -> Result<()> {
     let Some(file_name) = path
         .file_name()
@@ -2855,5 +2863,257 @@ mod handle_tests {
         assert!(list_dir_generation_matches(Some(9), generation));
         assert!(!list_dir_generation_matches(Some(8), generation));
         assert!(list_dir_generation_matches(None, generation));
+    }
+
+    // ---- Archive extraction traversal regression tests --------------------
+    //
+    // Directory downloads extract a remotely created tar.gz on the local
+    // machine, so escaping entries must never write outside the target
+    // directory. tar 0.4.x guards `..` by skipping the entry and rejects
+    // writes that canonicalize outside the destination (symlink escapes
+    // included); zip is guarded by `enclosed_name()`. These tests pin that
+    // behavior against future refactors of `extract_archive_to`.
+
+    fn append_tar_text_entry<W: std::io::Write>(
+        builder: &mut tar::Builder<W>,
+        name: &str,
+        contents: &str,
+    ) {
+        let mut header = tar::Header::new_gnu();
+        header.set_path(name).expect("set tar entry path");
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append(&header, contents.as_bytes())
+            .expect("append tar entry");
+    }
+
+    /// `Header::set_path` refuses `..` components, so to craft a hostile
+    /// fixture we set a validated placeholder and then patch the raw name
+    /// field (checksum is recomputed afterwards). The reader under test must
+    /// therefore defend itself; `Builder::append` does not re-validate.
+    fn append_tar_entry_with_raw_name<W: std::io::Write>(
+        builder: &mut tar::Builder<W>,
+        name: &str,
+        contents: &str,
+    ) {
+        let mut header = tar::Header::new_gnu();
+        header
+            .set_path("placeholder")
+            .expect("set placeholder path");
+        let name_bytes = name.as_bytes();
+        assert!(
+            name_bytes.len() < 100,
+            "tar name field must fit in 100 bytes"
+        );
+        let bytes = header.as_mut_bytes();
+        bytes[..name_bytes.len()].copy_from_slice(name_bytes);
+        for slot in &mut bytes[name_bytes.len()..100] {
+            *slot = 0;
+        }
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append(&header, contents.as_bytes())
+            .expect("append tar entry");
+    }
+
+    fn write_tar_with_escaping_and_regular_entries(path: &Path) {
+        let file = fs::File::create(path).expect("create tar archive");
+        let mut builder = tar::Builder::new(file);
+        append_tar_entry_with_raw_name(&mut builder, "../evil.txt", "pwned");
+        append_tar_text_entry(&mut builder, "keep.txt", "safe");
+        builder.finish().expect("finish tar archive");
+    }
+
+    #[tokio::test]
+    async fn extract_tar_skips_entries_with_parent_dir_components() {
+        let root = tempfile::tempdir().expect("create temporary extraction root");
+        let target = root.path().join("target");
+        fs::create_dir_all(&target).expect("create target dir");
+        let archive = root.path().join("payload.tar");
+        write_tar_with_escaping_and_regular_entries(&archive);
+
+        extract_archive_to(&archive, &target)
+            .await
+            .expect("extract tar archive");
+
+        // The escaping entry must be skipped, never written outside target.
+        assert!(!root.path().join("evil.txt").exists());
+        assert!(!target.join("evil.txt").exists());
+        assert_eq!(
+            fs::read_to_string(target.join("keep.txt")).expect("read regular entry"),
+            "safe",
+        );
+    }
+
+    #[tokio::test]
+    async fn extract_tar_gz_skips_entries_with_parent_dir_components() {
+        let root = tempfile::tempdir().expect("create temporary extraction root");
+        let target = root.path().join("target");
+        fs::create_dir_all(&target).expect("create target dir");
+        let archive = root.path().join("payload.tar.gz");
+        let file = fs::File::create(&archive).expect("create tar.gz archive");
+        let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        append_tar_entry_with_raw_name(&mut builder, "../evil.txt", "pwned");
+        append_tar_text_entry(&mut builder, "keep.txt", "safe");
+        builder.finish().expect("finish tar archive");
+        builder
+            .into_inner()
+            .expect("unwrap gz encoder")
+            .finish()
+            .expect("finish gzip stream");
+
+        extract_archive_to(&archive, &target)
+            .await
+            .expect("extract tar.gz archive");
+
+        assert!(!root.path().join("evil.txt").exists());
+        assert_eq!(
+            fs::read_to_string(target.join("keep.txt")).expect("read regular entry"),
+            "safe",
+        );
+    }
+
+    #[tokio::test]
+    async fn extract_tar_rejects_writes_through_symlinks_escaping_the_target() {
+        let root = tempfile::tempdir().expect("create temporary extraction root");
+        let target = root.path().join("target");
+        fs::create_dir_all(&target).expect("create target dir");
+        let outside = root.path().join("outside");
+        fs::create_dir_all(&outside).expect("create outside dir");
+        let archive = root.path().join("symlink.tar");
+
+        let file = fs::File::create(&archive).expect("create tar archive");
+        let mut builder = tar::Builder::new(file);
+
+        // A symlink inside the target pointing at a sibling directory,
+        // followed by a file written through it.
+        let mut link = tar::Header::new_gnu();
+        link.set_entry_type(tar::EntryType::Symlink);
+        link.set_path("escape").expect("set symlink entry path");
+        link.set_link_name(outside.to_str().expect("absolute symlink target"))
+            .expect("set symlink target");
+        link.set_size(0);
+        link.set_mode(0o777);
+        link.set_cksum();
+        builder
+            .append(&link, std::io::empty())
+            .expect("append symlink entry");
+
+        append_tar_text_entry(&mut builder, "escape/pwned.txt", "pwned");
+        builder.finish().expect("finish tar archive");
+
+        let result = extract_archive_to(&archive, &target).await;
+
+        // The write through the escaping symlink must be refused outright.
+        assert!(result.is_err());
+        assert!(!outside.join("pwned.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn extract_zip_writes_entries_inside_the_target_directory() {
+        let root = tempfile::tempdir().expect("create temporary extraction root");
+        let target = root.path().join("target");
+        fs::create_dir_all(&target).expect("create target dir");
+        let archive = root.path().join("payload.zip");
+
+        let file = fs::File::create(&archive).expect("create zip archive");
+        let mut writer = zip::ZipWriter::new(file);
+        writer
+            .start_file("nested/hello.txt", zip::write::SimpleFileOptions::default())
+            .expect("start zip entry");
+        std::io::Write::write_all(&mut writer, b"zip contents").expect("write zip entry");
+        writer.finish().expect("finish zip archive");
+
+        extract_archive_to(&archive, &target)
+            .await
+            .expect("extract zip archive");
+
+        assert_eq!(
+            fs::read_to_string(target.join("nested").join("hello.txt"))
+                .expect("read extracted zip entry"),
+            "zip contents",
+        );
+        assert!(!root.path().join("hello.txt").exists());
+    }
+
+    // ---- shell_quote adversarial tests -------------------------------------
+    //
+    // Remote paths are embedded in `tar -C '...' -czf '...' '<name>'` /
+    // `rm -f '<path>'` command lines. The quoting must make it impossible for
+    // a path to terminate the surrounding single-quoted context.
+
+    /// Parses the `'...'"'"'...'` single-quote escaping emitted by
+    /// `shell_quote` back into the original string; `None` means the quoted
+    /// form is malformed (i.e. the payload escaped its quoting context).
+    fn unquote_single(quoted: &str) -> Option<String> {
+        let mut chars = quoted.chars().peekable();
+        if chars.next() != Some('\'') {
+            return None;
+        }
+        let mut out = String::new();
+        while let Some(c) = chars.next() {
+            if c == '\'' {
+                if chars.peek() == Some(&'"') {
+                    for expected in ['"', '\'', '"', '\''] {
+                        if chars.next() != Some(expected) {
+                            return None;
+                        }
+                    }
+                    out.push('\'');
+                } else if chars.peek().is_none() {
+                    return Some(out);
+                } else {
+                    return None;
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn shell_quote_wraps_plain_names_in_single_quotes() {
+        assert_eq!(shell_quote("hello.txt"), "'hello.txt'");
+    }
+
+    #[test]
+    fn shell_quote_escapes_single_quotes() {
+        assert_eq!(shell_quote("it's.txt"), "'it'\"'\"'s.txt'");
+    }
+
+    #[test]
+    fn shell_quote_neutralizes_command_substitution_and_backticks() {
+        assert_eq!(shell_quote("$(rm -rf /)"), "'$(rm -rf /)'");
+        assert_eq!(shell_quote("`id`"), "'`id`'");
+    }
+
+    #[test]
+    fn shell_quote_round_trips_arbitrary_input() {
+        for input in [
+            "plain.txt",
+            "it's.txt",
+            "$(rm -rf /)",
+            "`id`",
+            "a\nb;c&d|e>f<g",
+            "with 'quotes' and \"double\"",
+            "文件 名.txt",
+            "'",
+            "''",
+            "trailing-slash/",
+            "-rf --no-preserve-root",
+        ] {
+            let quoted = shell_quote(input);
+            assert_eq!(
+                unquote_single(&quoted).as_deref(),
+                Some(input),
+                "input: {input:?}, quoted: {quoted:?}",
+            );
+        }
     }
 }

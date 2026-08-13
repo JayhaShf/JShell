@@ -1036,3 +1036,192 @@ pub fn find_url_at_cell(
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alacritty_terminal::term::cell::Cell;
+
+    fn identity_cols(text: &str) -> Vec<i32> {
+        (0..text.len() as i32).collect()
+    }
+
+    fn test_color() -> Hsla {
+        hsla(10, 20, 30)
+    }
+
+    #[test]
+    fn keyword_highlighting_is_case_insensitive() {
+        let mut map = HashMap::new();
+        let text = "an Error occurred";
+        let byte_to_col = identity_cols(text);
+        highlight_keywords(&mut map, text, &byte_to_col, 0, &["ERROR"], test_color());
+
+        // "Error" occupies columns 3..=7.
+        for c in 3..=7 {
+            assert!(map.contains_key(&(0, c)), "expected column {c} highlighted");
+        }
+        assert_eq!(map.len(), 5);
+    }
+
+    #[test]
+    fn keyword_highlighting_never_overlaps() {
+        let mut map = HashMap::new();
+        let text = "ERR ERROR";
+        let byte_to_col = identity_cols(text);
+        highlight_keywords(
+            &mut map,
+            text,
+            &byte_to_col,
+            0,
+            &["ERROR", "ERR"],
+            test_color(),
+        );
+
+        // Both keywords highlight; every position written at most once.
+        for c in [0, 1, 2, 4, 5, 6, 7, 8] {
+            assert!(map.contains_key(&(0, c)), "expected column {c} highlighted");
+        }
+        assert_eq!(map.len(), 8);
+    }
+
+    #[test]
+    fn http_codes_highlight_only_known_codes_at_digit_boundaries() {
+        let colors = highlight_colors();
+        let text = "GET 200 OK / 404 gone / 500 boom / 2000 bad";
+        let byte_to_col = identity_cols(text);
+        let mut map = HashMap::new();
+        highlight_http_codes(&mut map, text, &byte_to_col, 0, &colors);
+
+        let col_200 = text.find("200").expect("200 present") as i32;
+        let col_404 = text.find("404").expect("404 present") as i32;
+        let col_500 = text.find("500").expect("500 present") as i32;
+        let col_2000 = text.find("2000").expect("2000 present") as i32;
+
+        for c in col_200..col_200 + 3 {
+            assert_eq!(map.get(&(0, c)), Some(&colors.http_2xx));
+        }
+        for c in col_404..col_404 + 3 {
+            assert_eq!(map.get(&(0, c)), Some(&colors.http_4xx));
+        }
+        for c in col_500..col_500 + 3 {
+            assert_eq!(map.get(&(0, c)), Some(&colors.http_5xx));
+        }
+        // 2000 is part of a longer number and must not be highlighted.
+        for c in col_2000..col_2000 + 4 {
+            assert!(!map.contains_key(&(0, c)));
+        }
+    }
+
+    #[test]
+    fn ip_addresses_require_boundaries_and_valid_octets() {
+        let text = "from 192.168.1.10 to 10.0.0.1, not 999.1.1.1 nor in1.2.3.4.";
+        let positions = find_ip_addresses(text);
+
+        let mut expected = vec![
+            text.find("192.168.1.10").expect("first ip"),
+            text.find("10.0.0.1").expect("second ip"),
+        ];
+        expected.sort_unstable();
+        assert_eq!(positions, expected);
+    }
+
+    #[test]
+    fn urls_are_found_only_at_boundaries() {
+        let text = "go to https://example.com and http://a.b or xhttps://no";
+        let positions = find_urls(text);
+
+        assert_eq!(
+            positions,
+            vec![
+                text.find("https://example.com").expect("https url"),
+                text.find("http://a.b").expect("http url"),
+            ],
+        );
+    }
+
+    #[test]
+    fn url_length_stops_at_whitespace() {
+        let text = "https://a.b/path?q=1\tnext";
+        assert_eq!(find_url_len(text), text.find('\t').expect("tab present"));
+    }
+
+    #[test]
+    fn ports_are_validated_and_bounded() {
+        let text = ":8080 ok :0 bad :99999 bad :abc no";
+        let positions = find_ports(text);
+
+        assert_eq!(positions, vec![text.find(":8080").expect("valid port")]);
+    }
+
+    #[test]
+    fn port_length_parses_the_full_number() {
+        assert_eq!(find_port_len(":8080 rest"), 5);
+        assert_eq!(find_port_len(":22"), 3);
+    }
+
+    fn cell_at(row: i32, col: i32, c: char, wrap: bool) -> RenderCell {
+        let mut cell = Cell {
+            c,
+            ..Cell::default()
+        };
+        if wrap {
+            cell.flags
+                .insert(alacritty_terminal::term::cell::Flags::WRAPLINE);
+        }
+        RenderCell { row, col, cell }
+    }
+
+    #[test]
+    fn urls_spanning_wrapped_rows_are_highlighted_as_one_logical_line() {
+        // Note: http:// (not https://) so no security keyword overlaps the URL.
+        let first = "go http://exa";
+        let second = "mple.com/x done";
+        let mut cells: Vec<RenderCell> = first
+            .chars()
+            .enumerate()
+            .map(|(col, c)| cell_at(0, col as i32, c, col == first.len() - 1))
+            .collect();
+        cells.extend(
+            second
+                .chars()
+                .enumerate()
+                .map(|(col, c)| cell_at(1, col as i32, c, false)),
+        );
+
+        let map = highlight_cells(&cells, 2);
+        let colors = highlight_colors();
+
+        // The URL runs from row 0 (cols 3..=12) into row 1 (cols 0..=9).
+        for c in 3..=12 {
+            assert_eq!(map.get(&(0, c)), Some(&colors.url), "row 0 col {c}");
+        }
+        for c in 0..=9 {
+            assert_eq!(map.get(&(1, c)), Some(&colors.url), "row 1 col {c}");
+        }
+    }
+
+    #[test]
+    fn find_url_at_cell_resolves_urls_across_wrapped_rows() {
+        let first = "go http://exa";
+        let second = "mple.com/x done";
+        let mut cells: Vec<RenderCell> = first
+            .chars()
+            .enumerate()
+            .map(|(col, c)| cell_at(0, col as i32, c, col == first.len() - 1))
+            .collect();
+        cells.extend(
+            second
+                .chars()
+                .enumerate()
+                .map(|(col, c)| cell_at(1, col as i32, c, false)),
+        );
+
+        // Clicking the first character of the URL on row 1 resolves it.
+        let found = find_url_at_cell(&cells, 2, 1, 0);
+        let (url, url_cells) = found.expect("URL spanning rows must be found");
+        assert_eq!(url, "http://example.com/x");
+        assert_eq!(url_cells.first(), Some(&(0, 3)));
+        assert_eq!(url_cells.last(), Some(&(1, 9)));
+    }
+}

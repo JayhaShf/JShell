@@ -2,7 +2,7 @@
 
 # JShell
 
-JShell 是一个使用 Rust、GPUI 与 `alacritty_terminal` 构建的桌面终端工作区，面向需要同时管理本地终端、SSH 会话、SFTP 文件和远程文本的用户。当前源码版本为 `0.1.0-beta.4`；界面语言默认跟随系统，也可在设置中切换，项目默认文档入口为中文。
+JShell 是一个使用 Rust、GPUI 与 `alacritty_terminal` 构建的桌面终端工作区，面向需要同时管理本地终端、SSH 会话、SFTP 文件和远程文本的用户。当前源码版本为 `1.0.0`；界面语言默认跟随系统，也可在设置中切换，项目默认文档入口为中文。
 
 ![JShell 工作区预览](assets/screenshots/compact-workspace.png)
 

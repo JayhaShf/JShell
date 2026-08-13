@@ -1,0 +1,27 @@
+# cargo-audit 豁免配置（CI 使用 `cargo audit --deny warnings --file Cargo.lock`）。
+#
+# 当前锁文件包含 10 条「unmaintained」警告级告警，均来自 Linux 托盘
+# 依赖链（tray-icon → libappindicator/muda → gtk-rs GTK3 绑定）及一条
+# 传递依赖（proc-macro-error）。该链是 Linux 托盘的事实标准实现，且
+# 仅 Linux 构建引入；Windows/macOS 产物不受影响。替换托盘后端
+# （如 ksni）前无法消除，详见 AUDIT_REPORT 第 5 节「GTK3 绑定告警」。
+#
+# 注意：这些是"不再维护"告警而非可利用漏洞（0 vulnerabilities）；
+# 任何新的安全漏洞告警仍会被 CI 拦截。
+
+[advisories]
+ignore = [
+    # gtk-rs GTK3 绑定整体停止维护（8 条，Linux 托盘链）
+    "RUSTSEC-2024-0412", # gdk
+    "RUSTSEC-2024-0413", # atk
+    "RUSTSEC-2024-0415", # gtk
+    "RUSTSEC-2024-0416", # atk-sys
+    "RUSTSEC-2024-0418", # gdk-sys
+    "RUSTSEC-2024-0419", # gtk3-macros
+    "RUSTSEC-2024-0420", # gtk-sys
+    "RUSTSEC-2024-0429", # glib
+    # gtk-rs 传递依赖，随 GTK3 链停止维护
+    "RUSTSEC-2024-0436", # paste
+    # toml_edit 早期版本的传递依赖（构建期宏），上游无替代版本可用
+    "RUSTSEC-2024-0370", # proc-macro-error
+]
