@@ -1,0 +1,42 @@
+# Maintainer: JShell contributors
+
+pkgname=jshell
+pkgver=0.1.0.beta.4
+pkgrel=4
+pkgdesc="SSH, SFTP and local terminal workspace built with GPUI"
+arch=('x86_64')
+url="https://github.com/JayhaShf/JShell"
+license=('GPL-3.0-or-later')
+depends=(
+  'libxcb'
+  'libxkbcommon'
+  'libxkbcommon-x11'
+  'mesa'
+  'wayland'
+  'libayatana-appindicator'
+)
+makedepends=(
+  'clang'
+  'git'
+  'nasm'
+  'rust'
+)
+options=(!lto !debug)
+source=()
+
+build() {
+  cd "$startdir/../.."
+  cargo build --locked --release
+}
+
+package() {
+  cd "$startdir/../.."
+
+  install -Dm755 target/release/jshell "$pkgdir/usr/bin/jshell"
+  install -Dm644 assets/jshell.desktop \
+    "$pkgdir/usr/share/applications/jshell.desktop"
+  install -Dm644 assets/icons/jshell.png \
+    "$pkgdir/usr/share/icons/hicolor/256x256/apps/jshell.png"
+  install -Dm644 LICENSE \
+    "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
