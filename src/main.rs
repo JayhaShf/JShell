@@ -83,3 +83,53 @@ fn main() {
         );
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    /// Loads a rust-i18n flat `key: "value"` locale file into a map.
+    fn load_locale(name: &str) -> BTreeMap<String, String> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("locales")
+            .join(name);
+        let content = std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+        serde_yaml::from_str::<BTreeMap<String, String>>(&content)
+            .unwrap_or_else(|err| panic!("failed to parse {}: {err}", path.display()))
+    }
+
+    #[test]
+    fn locale_keys_match_between_english_and_chinese() {
+        let en = load_locale("en.yml");
+        let zh = load_locale("zh-CN.yml");
+
+        let missing_in_zh: Vec<&String> = en.keys().filter(|k| !zh.contains_key(*k)).collect();
+        let missing_in_en: Vec<&String> = zh.keys().filter(|k| !en.contains_key(*k)).collect();
+
+        assert!(
+            missing_in_zh.is_empty(),
+            "keys present in en.yml but missing from zh-CN.yml: {missing_in_zh:?}",
+        );
+        assert!(
+            missing_in_en.is_empty(),
+            "keys present in zh-CN.yml but missing from en.yml: {missing_in_en:?}",
+        );
+    }
+
+    #[test]
+    fn locale_values_are_non_empty_in_both_languages() {
+        for (name, map) in [
+            ("en.yml", load_locale("en.yml")),
+            ("zh-CN.yml", load_locale("zh-CN.yml")),
+        ] {
+            let empty: Vec<&String> = map
+                .iter()
+                .filter(|(_, v)| v.is_empty())
+                .map(|(k, _)| k)
+                .collect();
+            assert!(empty.is_empty(), "empty translations in {name}: {empty:?}");
+        }
+    }
+}

@@ -119,6 +119,19 @@ pub(crate) fn init_logging() {
 
     std::fs::create_dir_all(&log_dir).ok();
 
+    // Logs may contain hostnames and usernames; keep the directory private
+    // like the config directory (init_logging runs before the config store
+    // exists, so this cannot rely on its chmod).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(&log_dir) {
+            let mut perms = meta.permissions();
+            perms.set_mode(0o700);
+            let _ = std::fs::set_permissions(&log_dir, perms);
+        }
+    }
+
     let roller = LocalMinutelyRoller::new(log_dir.clone(), "jshell".to_string());
 
     let (non_blocking, _guard) = tracing_appender::non_blocking(roller);
