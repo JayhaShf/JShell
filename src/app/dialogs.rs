@@ -20,6 +20,7 @@ use rust_i18n::t;
 
 use crate::{
     Ashell,
+    app::tray::TrayController,
     session::{
         SessionProxyPolicy, can_submit_ssh_session, config::AuthMethod, parse_non_zero_u16,
         session_proxy_policy, supported_proxy_protocol,
@@ -2391,6 +2392,40 @@ impl Ashell {
                                                             }
                                                         })
                                                     ).description(t!("lock_layout_hint").to_string())
+                                                )
+                                                .item(
+                                                    SettingItem::new(
+                                                        t!("system_tray").to_string(),
+                                                        SettingField::render({
+                                                            let view = view_clone_for_general.clone();
+                                                            move |_, window, cx| {
+                                                                Switch::new("system-tray")
+                                                                    .small()
+                                                                    .checked(view.read(cx).config.system_tray())
+                                                                    .on_click(window.listener_for(&view, |this, checked, _, cx| {
+                                                                        this.config.set_system_tray(*checked);
+                                                                        if *checked && this.tray.is_none() {
+                                                                            match TrayController::new() {
+                                                                                Ok(tray) => this.tray = Some(tray),
+                                                                                Err(error) => {
+                                                                                    tracing::warn!(
+                                                                                        "failed to enable system tray: {error:#}"
+                                                                                    );
+                                                                                    this.config.set_system_tray(false);
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                        if !this.config.system_tray() {
+                                                                            this.tray = None;
+                                                                            this.tray_window_visible = true;
+                                                                        }
+                                                                        this.save_preferences_background();
+                                                                        cx.notify();
+                                                                    }))
+                                                                    .into_any_element()
+                                                            }
+                                                        })
+                                                    ).description(t!("system_tray_hint").to_string())
                                                 )
                                                 .item(
                                                     SettingItem::new(

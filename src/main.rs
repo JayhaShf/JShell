@@ -28,6 +28,16 @@ fn main() {
     app::startup::sync_macos_launch_environment();
     app::startup::init_logging();
 
+    let instance_events = match app::single_instance::acquire() {
+        app::single_instance::AcquireOutcome::First(events) => Some(events),
+        app::single_instance::AcquireOutcome::Second => {
+            // Another instance is already running and has been asked to show
+            // its window, so this process has nothing left to do.
+            return;
+        }
+    };
+    let signal_events = app::signals::install();
+
     #[cfg(target_os = "macos")]
     let app = gpui_platform::application()
         .with_assets(Assets)
@@ -39,6 +49,11 @@ fn main() {
     app.on_reopen(|cx| {
         if cx.windows().is_empty() {
             app::startup::open_main_window(cx);
+        } else if let Some(handle) = cx.windows().first().cloned() {
+            // Restore the window when the dock icon is clicked while hidden in the tray.
+            handle
+                .update(cx, |_, window, _| window.activate_window())
+                .ok();
         }
     });
     app.run(move |cx| {
@@ -60,6 +75,11 @@ fn main() {
         if let Err(err) = app::theme::load_fonts(cx) {
             tracing::warn!("failed to load theme fonts: {err:#}");
         }
-        app::startup::open_main_window_with_config(cx, startup_config);
+        app::startup::open_main_window_with_config(
+            cx,
+            startup_config,
+            instance_events,
+            signal_events,
+        );
     });
 }

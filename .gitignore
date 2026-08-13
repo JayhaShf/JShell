@@ -2,3 +2,11 @@
 /target-release-*/
 /.superpowers/
 .DS_Store
+
+# makepkg artifacts
+/packaging/arch/src/
+/packaging/arch/pkg/
+/packaging/arch/*.pkg.tar.*
+
+# local tooling
+/.zcode/
