@@ -1,95 +1,86 @@
 # JShell 项目审计报告
 
-- 审计日期：2026-08-01
-- 审计对象：`0.1.0-beta.2` 本地发布候选
-- 审计范围：当前修改涉及的分屏、配置写入、R2 手动同步、凭据保护、载荷校验、发布工作流、文档与 Release 产物
-- 范围说明：本轮按用户要求只复审当前修改及其直接依赖，不重新审计未改动的全部业务模块。
+- 审计日期：2026-08-13
+- 审计对象：工作树中未提交的系统托盘 + 后台运行、单实例锁、信号优雅退出三组改动
+- 审计范围：`src/app/tray.rs`、`src/app/single_instance.rs`、`src/app/signals.rs`（全部新增）以及 `src/app/mod.rs`、`src/app/startup.rs`、`src/app/dialogs.rs`、`src/main.rs`、`src/session/config.rs`、`locales/*.yml`、`Cargo.toml/Cargo.lock` 的关联修改，及这些改动与既有关闭/退出流程、配置写入协调器、同步合并逻辑的交互
+- 范围说明：按惯例只复审本次改动及其直接依赖（tray-icon/muda、interprocess、signal-hook、gtk），未重新审计未改动的全部业务模块
+- 历史报告：上一轮 `0.1.0-beta.2` 发布候选审计记录保留在 [docs/RELEASE_AUDIT_0.1.0-beta.2.md](docs/RELEASE_AUDIT_0.1.0-beta.2.md)
 
 ## 1. 审计结论
 
-当前修改范围内未发现仍未处理的 P0 或 P1 问题。此前审查发现的嵌套分屏比例、配置并发写盘、同步凭据部分提交、旧预览/冲突误用、非法快捷键载荷崩溃风险和 Release 工作流权限过宽均已修复并加入回归测试。
+本次审计共发现 5 处问题，全部已修复并复验；当前无未处理的 P0/P1/P2 问题。核心结论：
 
-`RUSTSEC-2023-0071` 对应的 RustCrypto `rsa` crate 不在最终锁定依赖图中。2026-08-01 获取的 RustSec 官方公告库提交 `685d32fd681b540aa64019820639613c5a4fd922` 已用于本地审计，1177 条公告扫描 1024 个锁定依赖后返回成功。
+- **无内存安全问题**：事件泵在 `remove_window()` 之后继续访问实体是安全的——该 fork 的 `Window::remove_window` 只置 `removed` 标记，窗口与实体在本次 update 闭包返回后才销毁（`app.rs` `trail()`）；泵循环下一次迭代 `update_in` 报错即退出，无 use-after-drop。
+- **无死锁路径**：全局 `REQUEST_TX` 互斥锁仅覆盖一次非阻塞 `mpsc::send`；Linux 托盘线程 Drop 时置标志后 join，最多等待一个泵间隔（16ms），且与锁无嵌套。
+- **修复了 1 个功能性缺陷（P1）**：首次信号后信号处理器未恢复默认处置，若优雅退出卡死（如等待保存提示），后续 SIGTERM/SIGINT 将无法强制终止进程。
+- **修复了 1 个多用户正确性问题（P2）**：Linux 抽象命名空间套接字与 macOS `/tmp` 路径对全系统可见，多用户同机时第二个用户永远无法启动（连接会命中他人实例并退出）；现按 UID 隔离。
+- 依赖审计 0 漏洞；新增依赖仅引入 8 条 GTK3 绑定"不再维护"告警（Linux 专用，Windows/macOS 构建不引入），属警告级且为托盘生态事实标准栈。
 
-本地 Release 已重新构建并通过隔离配置启动冒烟。当前仍未执行的是分批提交、推送后的 GitHub Actions、`v0.1.0-beta.2` 标签和 GitHub Release；因此本报告将该版本判定为“本地发布候选已通过门禁，待推送与托管发布验证”，不声明已经发布。
+## 2. 发现与修复
 
-## 2. 本轮修复
+### 2.1 P1：信号处理器未关闭，二次信号无法强制退出
 
-### 2.1 分屏与界面状态
+- `signals.rs` 原实现 `for signal in signals.forever() { ...; break; }` 除触发 clippy `never_loop`（deny 级，编译失败）外，`Signals` 迭代器析构不会自动注销处理器。
+- 修复：取首个信号 → 转发退出请求 → `handle.close()` 恢复默认处置。此后第一个信号优雅退出，第二个信号恢复默认行为可强制杀死，符合"优雅优先、可逃生"语义。
 
-- 每个嵌套 split 容器记录自己的实际 Bounds，拖动比例不再错误使用整个 pane 根区域。
-- 回归场景固定为：根宽 1000、嵌套宽 200、水平拖动 20 像素，ratio 变化 10%。
-- 保留 5 像素死区、10%-90% 限制、释放鼠标后清理拖动状态。
+### 2.2 P2：单实例套接字跨用户冲突
 
-### 2.2 配置写入一致性
+- Linux 抽象套接字无权限隔离，macOS 落盘于共享 `/tmp`：用户 A 的实例会让用户 B 的每次启动误判为"第二实例"并直接退出。
+- 修复：Unix 平台套接字名追加 `getuid()`（`libc` 提升为正式依赖，版本已在锁文件中）；`remove_stale_socket` 使用同一命名函数。
+- Windows 命名管道保留固定名：跨用户连接失败时会走 3 次重试 → 降级无锁运行（仅失去互斥，不会无法启动）。
 
-- 新增统一的配置写入协调器，后台偏好保存与会话、文件夹、传输记录、导入配置、窗口布局和同步写盘共用串行锁与版本屏障。
-- 同步或其他直接写入会淘汰更早排队的偏好快照，避免旧快照覆盖新 sessions、ETag 或偏好。
-- 所有生产路径中的直接 `ConfigStore::save()` 已接入统一协调器；初始化迁移和单元测试除外。
+### 2.3 P2：单实例监听线程创建失败会 panic
 
-### 2.3 R2、凭据与预览事务
+- 原实现 `spawn(...).expect(...)`。修复为失败时记日志并释放监听器（套接字随 Drop 释放），本实例降级无锁运行，不影响启动。
 
-- 上传成功和下载确认先验证并更新系统凭据库，再原子写入本地配置；任一步失败都会保留或恢复旧状态。
-- 本地配置写入失败时恢复先前的同步密码和 R2 Secret；先前不存在的条目会被删除，不留下孤儿凭据。
-- 关闭“记住同步密码”时，删除失败不会把本地标记写成关闭。
-- 下载预览采用确认时的当前“记住密码”选择。
-- provider 或同步表单发生变化时，旧下载预览和上传冲突操作立即失效。
-- 预览和覆盖确认同时校验目标指纹与完整远端连接快照；R2 Access Key ID 改变时，即使桶和对象路径相同，也不能应用旧预览。
+### 2.4 P2：事件泵信号分支防重入
 
-### 2.4 同步载荷校验
+- 同一 tick 内托盘"退出"与信号退出可能先后触发两次 `request_application_close`（幂等但冗余）。信号分支增加 `!closing_application` 守卫。
 
-- v1/v2 Session 和 v2 SessionFolder 使用 `deny_unknown_fields` 的严格 DTO，再显式转换为运行时类型。
-- 快捷键 action 仅允许应用实际支持的动作；按键序列逐 stroke 使用 GPUI `Keystroke::parse` 校验。
-- 合法 chord、空字符串和 `none` 保持兼容；未知动作、非法语法和仅空白值会被拒绝，不再进入可能 panic 的运行时绑定路径。
-- 预览中的偏好类别数改为与当前本地配置比较后的实际变化数，不再固定显示 3。
+### 2.5 P3：clippy 告警清零
 
-### 2.5 发布工作流
+- `tray.rs`：`send_request` 嵌套 if 合并为 let-chain；`MenuItem::with_id` 去除多余 `to_string()`。
+- `signals.rs` 的 `never_loop` 随 2.1 一并修复。
 
-- CI 和 Release 顶层权限收紧为 `contents: read`，仅发布 job 使用 `contents: write`。
-- 所有 checkout 均设置 `persist-credentials: false`。
-- 18 个 Action 引用全部固定到 40 位提交 SHA，并已根据官方 ref 复核。
-- `cargo-audit` 固定为 `0.22.0`。
-- Release 使用固定 RustSec 公告库提交并加 `--no-fetch`，历史标签重跑不会因公告库漂移而改变结果；日常 CI 仍检查当前公告库。
+## 3. 模块审查结论
 
-## 3. 最终本地验证
+| 模块 | 结论 | 要点 |
+|---|---|---|
+| `tray.rs` | 通过 | 全局事件处理器经 `Once` 只装一次，经可替换的 `REQUEST_TX` 转发（muda 的处理器 OnceLock 只能设一次）；锁毒化容忍（`into_inner`/静默丢弃）；Windows/macOS 在 gpui 主线程创建（macOS NSStatusItem 硬性要求）；Linux 专用线程持有图标并自泵 GTK 事件，Drop 置位 + join 后在 gtk 线程内析构 AppIndicator；关闭转托盘时窗口实体不销毁，会话与文档完整保留 |
+| `single_instance.rs` | 通过 | 绑定成功即首实例；绑定失败→连接→写 `activate`→退出（实测第二实例 11ms 内退出）；启动竞态 3 次重试；stale 套接字（macOS）清理；全部失败降级无锁运行 |
+| `signals.rs` | 通过 | SIGINT/SIGTERM → 通道 → 事件泵（≤16ms 延迟）→ `closing_application = true`（绕过转托盘拦截，并允许分离窗口关闭）→ 恢复窗口 → 走含未保存提示的完整退出流程 → `save_layout_state` 保存布局（实测退出时配置 mtime 同步更新） |
+| `mod.rs` 事件泵 | 通过 | `spawn_in` + `update_in` 使泵闭包同时持有实体与窗口；托盘请求、实例激活、信号退出按序处理；窗口移除后同闭包内继续访问实体安全（延迟销毁，见结论 1）；泵随实体释放自动终止 |
+| `startup.rs` 关闭拦截 | 通过 | 托盘存在且非关停状态才最小化；`closing_application` 语义与 `document/window.rs` 既有用法一致（应用关停时允许分离窗口关闭） |
+| `config.rs` | 通过 | `system_tray` serde 缺省 true；同步合并本地值优先（与相邻 UI 状态字段一致），已纳入本地字段保护快照测试并设互异值验证不被远端覆盖 |
+| `dialogs.rs` 设置开关 | 通过 | 开→按需创建托盘（失败回退并回写 false）；关→销毁托盘（Drop 内 join，主线程阻塞 ≤16ms）；开关在 gpui 主线程执行，满足 macOS 约束 |
+| `main.rs` | 通过 | 单实例判定早于应用构建；第二实例在创建任何窗口/托盘前退出（Windows `windows_subsystem` 下无闪烁） |
+| locales | 通过 | 5 个新键中英双语齐全 |
 
-以下命令均在 `D:\Git\ashell` 的最终工作树执行：
+## 4. 验证结果
+
+以下均在最终工作树执行：
 
 | 检查 | 结果 |
 |---|---|
+| `cargo check --all-targets` | 通过，0 警告 |
+| `cargo clippy --all-targets` | 通过，0 警告（`-D warnings` 等效） |
 | `cargo fmt --all -- --check` | 通过 |
-| `cargo test --locked --quiet` | 316 passed，0 failed |
-| `cargo check --locked --all-targets` | 通过 |
-| `cargo clippy --locked --all-targets --all-features -- -D warnings` | 通过 |
-| `cargo audit --deny warnings --file Cargo.lock --db <clean-db> --no-fetch` | 通过；1177 条公告，1024 个依赖 |
-| `cargo tree -i rsa --locked` | 未匹配到 `rsa` crate |
-| GitHub Actions YAML 与固定 SHA 静态检查 | 通过 |
-| `git diff --check` | 通过 |
-| `cargo build --locked --release` | 通过 |
-| 隔离 HOME/USERPROFILE 启动冒烟 | 通过，测试进程已关闭 |
+| `cargo test --bin jshell` | 368 passed，0 failed（含新增 `system_tray_defaults_to_enabled_and_serializes` 与同步本地字段保护用例） |
+| `cargo audit` | 0 漏洞；9 条告警全部为警告级（8× gtk-rs GTK3 "no longer maintained"，Linux 专用依赖链；1× `proc-macro-error` unmaintained，传递依赖），`cargo audit --deny warnings` 前需在审计配置中豁免 |
+| 启动冒烟（Linux，NVIDIA/Vulkan） | 无 panic、无 GTK 错误；托盘创建成功 |
+| 双实例冒烟 | 第二实例连接通知后 11ms 内退出（exit 0），首实例保持运行；首实例退出后套接字立即释放，新实例可重新绑定 |
+| 信号退出冒烟 | `kill -TERM`/`kill -INT` 均 3 秒内优雅退出，日志记录 `received signal N, shutting down gracefully`；退出时配置落盘（`sessions.json` mtime 更新） |
+| 残留进程检查 | 测试后无残留 `target/debug/jshell` 进程 |
 
-最终 Windows 产物：
+## 5. 已知边界与平台风险
 
-- 路径：`D:\Git\ashell\target\release\jshell.exe`
-- 大小：79,746,560 字节
-- SHA-256：`4E0EAFE6E676C2068EAFB13659C0373CA55A7998F192ED344D78BAA55EC229ED`
-- 构建时间：2026-08-01 19:36:32（Asia/Shanghai）
+- **Wayland 最小化依赖合成器**：`set_minimized` 是请求而非命令，GNOME 忽略、KDE 支持；被忽略时关闭窗口表现为"窗口保持可见"，属安全回退（应用仍在后台运行）。
+- **Linux 托盘左键无效**：tray-icon 的 appindicator 实现不发出 Click 事件，属上游 API 限制；Linux 请用托盘菜单"显示/隐藏窗口"。Windows/macOS 左键为"总是恢复窗口"（Windows 端 `activate_window` 自动 `IsIconic→SW_RESTORE`，不受任务栏最小化影响）。
+- **GTK3 绑定告警**：tray-icon→libappindicator→gtk-rs GTK3 链整体停止维护，但该链是 Linux 托盘的事实标准实现且仅 Linux 构建引入；Windows/macOS 产物不受影响。若需消除告警需替换托盘后端（如 ksni），暂不处理。
+- **未做单实例的跨平台信号（Windows WM_ENDSESSION）**：Windows 无控制台信号，会话结束路径不在本次范围。
+- 三个新增常驻线程（`jshell-tray`/`jshell-instance`/`jshell-signals`）均为进程生命周期 daemon 线程，随进程退出终止；`jshell-tray` 在设置中关闭托盘时按需回收。
+- 第二轮托盘创建（设置关闭→开启）在 Linux 上会在新线程创建 GTK 对象；gtk 进程级只初始化一次，新线程依赖自身的默认 GMainContext 泵事件，实测可用但属 GTK 文档未承诺的用法，长期运行场景建议重启应用后使用。
 
-启动冒烟前后，用户现有配置文件 SHA-256 均为：
+## 6. 结论
 
-`B6D937EA3591FCBE1C52465BCD8808F94491F7C9E7BDFBB4572FCA6A69872461`
-
-测试结束后不存在由本轮启动而残留的 JShell 进程。
-
-## 4. 已知边界与发布前事项
-
-- 系统凭据库与配置文件属于两个独立存储，代码已对可报告错误执行补偿回滚；若操作系统在两次存储操作之间被强制终止，仍可能需要用户重新输入同步凭据。
-- 本轮未使用真实 Cloudflare R2 账户写入对象；网络语义由本地 HTTP/AWS SigV4 集成测试验证，GUI 已验证 provider 切换、窄窗口布局和错误状态。
-- 真实 Linux SSH/SFTP 上传、删除、断线恢复以及远端编辑冲突仍建议在非生产测试主机上做发布前人工复核。
-- 推送后必须等待 CI 全部通过，再创建 `v0.1.0-beta.2` 标签；旧标签 `v0.1.0-beta.1` 不移动、不覆盖。
-
-## 5. 发布判定
-
-当前判定：**本地发布候选门禁通过，可以分批提交并推送 `main`；托管 CI 通过后进入标签和 Release 流程。**
-
-详细清单见 [JShell v0.1.0-beta.2 发布候选审计与验收记录](docs/RELEASE_AUDIT_0.1.0-beta.2.md)。
+本次改动（系统托盘 + 后台运行、单实例锁、信号优雅退出）通过门禁：368 项测试、clippy/fmt 零告警、依赖审计零漏洞，三项功能冒烟与两项边界修复（跨用户隔离、二次信号逃生）均复验通过。改动尚未提交，建议按功能分批提交后走既有的 CI/发布流程。
