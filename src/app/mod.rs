@@ -123,6 +123,18 @@ impl ConfigWriteCoordinator {
     }
 }
 
+fn remote_sample_event_matches(
+    system_tab_id: Option<&str>,
+    event_tab_id: &str,
+    current_generation: Option<u32>,
+    event_generation: u32,
+) -> bool {
+    system_tab_id == Some(event_tab_id)
+        && current_generation.is_some_and(|generation| {
+            crate::terminal::backend_generation_matches(generation, event_generation)
+        })
+}
+
 #[derive(Clone)]
 pub(crate) struct TabGroup {
     pub(crate) id: String,
@@ -134,7 +146,10 @@ pub(crate) struct TabGroup {
 
 #[cfg(test)]
 mod window_title_tests {
-    use super::{ConfigWriteCoordinator, format_window_title, global_proxy_form_values};
+    use super::{
+        ConfigWriteCoordinator, format_window_title, global_proxy_form_values,
+        remote_sample_event_matches,
+    };
     use crate::session::config::ConfigStore;
 
     #[test]
@@ -152,6 +167,34 @@ mod window_title_tests {
             "JShell - production"
         );
         assert_eq!(format_window_title(None, None), "JShell");
+    }
+
+    #[test]
+    fn remote_sample_completion_requires_the_selected_tab_and_current_generation() {
+        assert!(remote_sample_event_matches(
+            Some("ssh-a"),
+            "ssh-a",
+            Some(3),
+            3
+        ));
+        assert!(!remote_sample_event_matches(
+            Some("ssh-a"),
+            "ssh-a",
+            Some(3),
+            2
+        ));
+        assert!(!remote_sample_event_matches(
+            Some("ssh-a"),
+            "ssh-b",
+            Some(3),
+            3
+        ));
+        assert!(!remote_sample_event_matches(
+            Some("ssh-a"),
+            "ssh-a",
+            None,
+            3
+        ));
     }
 
     #[test]
@@ -1691,39 +1734,97 @@ impl Ashell {
                         );
                     }
                 }
-                BackendEvent::RemoteSystem { tab_id, snapshot } => {
+                BackendEvent::RemoteSystem {
+                    tab_id,
+                    generation,
+                    snapshot,
+                } => {
+                    let current_generation = self
+                        .tabs
+                        .iter()
+                        .find(|tab| tab.id == tab_id)
+                        .map(|tab| tab.backend_generation);
+                    if !remote_sample_event_matches(
+                        self.system_tab_id.as_deref(),
+                        &tab_id,
+                        current_generation,
+                        generation,
+                    ) {
+                        continue;
+                    }
                     self.remote_sample_in_flight = false;
-                    if self.system_tab_id.as_deref() == Some(tab_id.as_str()) {
-                        self.system_status = None;
-                        self.system = snapshot.clone();
-                        self.cpu_history.push(snapshot.cpu_percent);
-                        if self.cpu_history.len() > 20 {
-                            self.cpu_history.remove(0);
-                        }
-                        self.net_rx_history.push(snapshot.net_rx_rate as f32);
-                        if self.net_rx_history.len() > 20 {
-                            self.net_rx_history.remove(0);
-                        }
-                        self.net_tx_history.push(snapshot.net_tx_rate as f32);
-                        if self.net_tx_history.len() > 20 {
-                            self.net_tx_history.remove(0);
-                        }
+                    self.system_status = None;
+                    self.system = snapshot.clone();
+                    self.cpu_history.push(snapshot.cpu_percent);
+                    if self.cpu_history.len() > 20 {
+                        self.cpu_history.remove(0);
+                    }
+                    self.net_rx_history.push(snapshot.net_rx_rate as f32);
+                    if self.net_rx_history.len() > 20 {
+                        self.net_rx_history.remove(0);
+                    }
+                    self.net_tx_history.push(snapshot.net_tx_rate as f32);
+                    if self.net_tx_history.len() > 20 {
+                        self.net_tx_history.remove(0);
                     }
                 }
-                BackendEvent::RemoteSystemUnavailable { tab_id, reason } => {
-                    self.remote_sample_in_flight = false;
-                    if self.system_tab_id.as_deref() == Some(tab_id.as_str()) {
-                        self.system_status = Some(reason.clone().into());
-                        self.status = reason.into();
+                BackendEvent::RemoteSystemUnavailable {
+                    tab_id,
+                    generation,
+                    reason,
+                } => {
+                    let current_generation = self
+                        .tabs
+                        .iter()
+                        .find(|tab| tab.id == tab_id)
+                        .map(|tab| tab.backend_generation);
+                    if !remote_sample_event_matches(
+                        self.system_tab_id.as_deref(),
+                        &tab_id,
+                        current_generation,
+                        generation,
+                    ) {
+                        continue;
                     }
+                    self.remote_sample_in_flight = false;
+                    self.system_status = Some(reason.clone().into());
+                    self.status = reason.into();
                 }
-                BackendEvent::CommandHistory { tab_id, entries } => {
+                BackendEvent::CommandHistory {
+                    tab_id,
+                    generation,
+                    entries,
+                } => {
+                    let is_current = self.tabs.iter().any(|tab| {
+                        tab.id == tab_id
+                            && crate::terminal::backend_generation_matches(
+                                tab.backend_generation,
+                                generation,
+                            )
+                    });
+                    if !is_current {
+                        continue;
+                    }
                     let history = self.command_history_by_tab.entry(tab_id).or_default();
                     history.entries = entries;
                     history.loading = false;
                     history.error = None;
                 }
-                BackendEvent::CommandHistoryUnavailable { tab_id, reason } => {
+                BackendEvent::CommandHistoryUnavailable {
+                    tab_id,
+                    generation,
+                    reason,
+                } => {
+                    let is_current = self.tabs.iter().any(|tab| {
+                        tab.id == tab_id
+                            && crate::terminal::backend_generation_matches(
+                                tab.backend_generation,
+                                generation,
+                            )
+                    });
+                    if !is_current {
+                        continue;
+                    }
                     let history = self.command_history_by_tab.entry(tab_id).or_default();
                     history.loading = false;
                     history.error = Some(reason);
@@ -1733,19 +1834,24 @@ impl Ashell {
                     generation,
                     reason,
                 } => {
-                    self.remote_sample_in_flight = false;
-                    let is_current = self
+                    let current_generation = self
                         .tabs
                         .iter()
                         .find(|t| t.id == tab_id)
-                        .is_some_and(|tab| {
-                            crate::terminal::backend_generation_matches(
-                                tab.backend_generation,
-                                generation,
-                            )
-                        });
-                    if !is_current {
+                        .map(|tab| tab.backend_generation);
+                    if !current_generation.is_some_and(|current| {
+                        crate::terminal::backend_generation_matches(current, generation)
+                    }) {
                         continue;
+                    }
+                    let closes_active_sample = remote_sample_event_matches(
+                        self.system_tab_id.as_deref(),
+                        &tab_id,
+                        current_generation,
+                        generation,
+                    );
+                    if closes_active_sample {
+                        self.remote_sample_in_flight = false;
                     }
                     let is_graceful_exit =
                         reason == "local shell closed" || reason == "ssh session closed";
@@ -1759,7 +1865,7 @@ impl Ashell {
                         tab.status = reason.clone();
                         tab.disconnected_reason = Some(reason.clone());
                     }
-                    if self.system_tab_id.as_deref() == Some(tab_id.as_str()) {
+                    if closes_active_sample {
                         self.system_status = Some(reason.clone().into());
                     }
                     if let Some(progress) = self.connection_progress.as_mut()

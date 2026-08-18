@@ -190,18 +190,42 @@ pub async fn confirm_overwrite(
     credentials: SyncCredentials,
     payload: SyncPayloadV2,
 ) -> SyncApiResult<Option<String>> {
-    let expected_etag = match test_connection(credentials.clone()).await? {
-        RemoteObjectState::Exists { etag: Some(etag) } => Some(etag),
-        RemoteObjectState::Exists { etag: None } => return Err(SyncError::Conflict),
-        RemoteObjectState::Missing => None,
-    };
-    upload(credentials, payload, expected_etag).await
+    let (expected_etag, allow_unconditional_webdav) =
+        match test_connection(credentials.clone()).await? {
+            RemoteObjectState::Exists { etag: Some(etag) } => (Some(etag), false),
+            RemoteObjectState::Exists { etag: None }
+                if matches!(&credentials.backend, SyncBackendCredentials::WebDav { .. }) =>
+            {
+                // Some WebDAV servers do not expose validators. This path is reached only
+                // after the user confirms the conflict, so permit the unavoidable
+                // unconditional write while retaining conditional writes everywhere else.
+                (None, true)
+            }
+            RemoteObjectState::Exists { etag: None } => return Err(SyncError::Conflict),
+            RemoteObjectState::Missing => (None, false),
+        };
+    upload_with_webdav_policy(
+        credentials,
+        payload,
+        expected_etag,
+        allow_unconditional_webdav,
+    )
+    .await
 }
 
 pub async fn upload(
     credentials: SyncCredentials,
     payload: SyncPayloadV2,
     expected_etag: Option<String>,
+) -> SyncApiResult<Option<String>> {
+    upload_with_webdav_policy(credentials, payload, expected_etag, false).await
+}
+
+async fn upload_with_webdav_policy(
+    credentials: SyncCredentials,
+    payload: SyncPayloadV2,
+    expected_etag: Option<String>,
+    allow_unconditional_webdav: bool,
 ) -> SyncApiResult<Option<String>> {
     validate_credentials(&credentials)?;
     let encryption_password = SecretString::new(credentials.encryption_password);
@@ -216,7 +240,14 @@ pub async fn upload(
             endpoint,
             username,
             password,
-        } => upload_webdav(&endpoint, &username, &password, body, expected_etag).await,
+        } => {
+            let condition = match expected_etag {
+                Some(etag) => WebDavWriteCondition::Match(etag),
+                None if allow_unconditional_webdav => WebDavWriteCondition::Unconditional,
+                None => WebDavWriteCondition::CreateOnly,
+            };
+            upload_webdav(&endpoint, &username, &password, body, condition).await
+        }
         SyncBackendCredentials::S3 {
             endpoint,
             region,
@@ -258,12 +289,18 @@ pub async fn upload(
     }
 }
 
+enum WebDavWriteCondition {
+    CreateOnly,
+    Match(String),
+    Unconditional,
+}
+
 async fn upload_webdav(
     endpoint: &str,
     username: &str,
     password: &str,
     body: Vec<u8>,
-    expected_etag: Option<String>,
+    condition: WebDavWriteCondition,
 ) -> SyncApiResult<Option<String>> {
     let client = sync_http_client()?;
     let mut request = client
@@ -271,12 +308,14 @@ async fn upload_webdav(
         .basic_auth(username, Some(password))
         .header(header::CONTENT_TYPE, "application/json")
         .body(body);
-    request = if let Some(etag) = expected_etag {
-        request.header(header::IF_MATCH, etag)
-    } else {
-        // An uninitialized client may only create a new remote file. This keeps
-        // it from silently replacing configuration uploaded by another device.
-        request.header(header::IF_NONE_MATCH, "*")
+    request = match condition {
+        WebDavWriteCondition::Match(etag) => request.header(header::IF_MATCH, etag),
+        WebDavWriteCondition::CreateOnly => {
+            // An uninitialized client may only create a new remote file. This keeps
+            // it from silently replacing configuration uploaded by another device.
+            request.header(header::IF_NONE_MATCH, "*")
+        }
+        WebDavWriteCondition::Unconditional => request,
     };
     let response = request.send().await.map_err(map_reqwest_error)?;
     if !response.status().is_success() {
@@ -375,23 +414,36 @@ pub(crate) fn validate_credentials(
         ));
     }
     match &credentials.backend {
-        SyncBackendCredentials::WebDav { endpoint, .. } if endpoint.trim().is_empty() => Err(
-            SyncError::InvalidInput("WebDAV endpoint is required".to_string()),
-        ),
+        SyncBackendCredentials::WebDav { endpoint, .. } => {
+            if endpoint.trim().is_empty() {
+                return Err(SyncError::InvalidInput(
+                    "WebDAV endpoint is required".to_string(),
+                ));
+            }
+            validate_https_endpoint(endpoint, "WebDAV")
+        }
         SyncBackendCredentials::S3 {
+            endpoint,
             region,
             bucket,
             access_key,
             secret_key,
             ..
-        } if region.trim().is_empty()
-            || bucket.trim().is_empty()
-            || access_key.trim().is_empty()
-            || secret_key.is_empty() =>
-        {
-            Err(SyncError::InvalidInput(
-                "S3 region, bucket, access key and secret key are required".to_string(),
-            ))
+        } => {
+            if region.trim().is_empty()
+                || bucket.trim().is_empty()
+                || access_key.trim().is_empty()
+                || secret_key.is_empty()
+            {
+                return Err(SyncError::InvalidInput(
+                    "S3 region, bucket, access key and secret key are required".to_string(),
+                ));
+            }
+            if endpoint.trim().is_empty() {
+                Ok(())
+            } else {
+                validate_https_endpoint(endpoint, "S3")
+            }
         }
         SyncBackendCredentials::R2 {
             account_id,
@@ -399,18 +451,73 @@ pub(crate) fn validate_credentials(
             object_key,
             access_key_id,
             secret_access_key,
-        } if account_id.len() != 32
-            || !account_id.bytes().all(|byte| byte.is_ascii_hexdigit())
-            || bucket.trim().is_empty()
-            || object_key.trim().is_empty()
-            || access_key_id.trim().is_empty()
-            || secret_access_key.expose_secret().is_empty() =>
-        {
-            Err(SyncError::InvalidInput(
-                "R2 credentials are incomplete or invalid".to_string(),
-            ))
+        } => {
+            if account_id.len() != 32
+                || !account_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+                || bucket.trim().is_empty()
+                || object_key.trim().is_empty()
+                || access_key_id.trim().is_empty()
+                || secret_access_key.expose_secret().is_empty()
+            {
+                return Err(SyncError::InvalidInput(
+                    "R2 credentials are incomplete or invalid".to_string(),
+                ));
+            }
+            Ok(())
         }
-        _ => Ok(()),
+    }
+}
+
+fn validate_https_endpoint(endpoint: &str, backend: &str) -> SyncApiResult<()> {
+    let url = reqwest::Url::parse(endpoint.trim()).map_err(|_| {
+        SyncError::InvalidInput(format!("{backend} endpoint must be a valid HTTPS URL"))
+    })?;
+    if url.host_str().is_none() {
+        return Err(SyncError::InvalidInput(format!(
+            "{backend} endpoint must include a host"
+        )));
+    }
+    if sync_transport_url_is_allowed(&url) {
+        Ok(())
+    } else {
+        Err(SyncError::InvalidInput(format!(
+            "{backend} endpoint must use HTTPS"
+        )))
+    }
+}
+
+fn sync_transport_url_is_allowed(url: &reqwest::Url) -> bool {
+    url.scheme() == "https" || is_test_loopback_http_endpoint(url)
+}
+
+fn sync_redirect_is_allowed(next: &reqwest::Url, previous: &[reqwest::Url]) -> bool {
+    let Some(initial) = previous.first() else {
+        return false;
+    };
+    sync_transport_url_is_allowed(next)
+        && initial.scheme() == next.scheme()
+        && initial.host_str() == next.host_str()
+        && initial.port_or_known_default() == next.port_or_known_default()
+}
+
+fn is_test_loopback_http_endpoint(url: &reqwest::Url) -> bool {
+    #[cfg(test)]
+    {
+        url.scheme() == "http"
+            && url
+                .host_str()
+                .and_then(|host| {
+                    host.trim_start_matches('[')
+                        .trim_end_matches(']')
+                        .parse::<std::net::IpAddr>()
+                        .ok()
+                })
+                .is_some_and(|address| address.is_loopback())
+    }
+    #[cfg(not(test))]
+    {
+        let _ = url;
+        false
     }
 }
 
@@ -699,6 +806,13 @@ fn sync_http_client() -> SyncApiResult<Client> {
     Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if sync_redirect_is_allowed(attempt.url(), attempt.previous()) {
+                reqwest::redirect::Policy::default().redirect(attempt)
+            } else {
+                attempt.error("sync redirects must stay on the original secure origin")
+            }
+        }))
         .build()
         .map_err(map_reqwest_error)
 }
@@ -990,6 +1104,17 @@ mod tests {
         }
     }
 
+    fn webdav_credentials(endpoint: String) -> SyncCredentials {
+        SyncCredentials {
+            backend: SyncBackendCredentials::WebDav {
+                endpoint,
+                username: "webdav-user".to_string(),
+                password: "webdav-password".to_string(),
+            },
+            encryption_password: "correct horse battery staple".to_string(),
+        }
+    }
+
     fn assert_secret_string(_: &SecretString) {}
 
     #[test]
@@ -1063,6 +1188,53 @@ mod tests {
         );
         assert!(!requests[1].headers.contains_key("if-none-match"));
         assert!(!requests[1].body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn confirmed_webdav_overwrite_without_etag_uses_unconditional_put() {
+        let (endpoint, server) = spawn_http_server(vec![
+            TestResponse::empty("200 OK", &[]),
+            TestResponse::empty("200 OK", &[]),
+        ])
+        .await;
+
+        let etag = confirm_overwrite(
+            webdav_credentials(endpoint),
+            SyncPayloadV2::new(secret_portable_config()),
+        )
+        .await
+        .unwrap();
+        let requests = server.await.unwrap();
+
+        assert_eq!(etag, None);
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].method, "HEAD");
+        assert_eq!(requests[1].method, "PUT");
+        assert!(!requests[1].headers.contains_key("if-match"));
+        assert!(!requests[1].headers.contains_key("if-none-match"));
+        assert!(!requests[1].body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_webdav_upload_remains_create_only() {
+        let (endpoint, server) = spawn_http_server(vec![TestResponse::empty("200 OK", &[])]).await;
+
+        upload(
+            webdav_credentials(endpoint),
+            SyncPayloadV2::new(secret_portable_config()),
+            None,
+        )
+        .await
+        .unwrap();
+        let requests = server.await.unwrap();
+
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "PUT");
+        assert_eq!(
+            requests[0].headers.get("if-none-match").map(String::as_str),
+            Some("*")
+        );
+        assert!(!requests[0].headers.contains_key("if-match"));
     }
 
     #[tokio::test]
@@ -1444,6 +1616,62 @@ mod tests {
             validate_credentials(&credentials),
             Err(SyncError::InvalidInput(_))
         ));
+    }
+
+    #[test]
+    fn sync_endpoints_require_https() {
+        for mut credentials in [
+            webdav_credentials("http://sync.example.test/config".to_string()),
+            s3_credentials("http://s3.example.test".to_string()),
+            webdav_credentials("ftp://sync.example.test/config".to_string()),
+        ] {
+            assert!(matches!(
+                validate_credentials(&credentials),
+                Err(SyncError::InvalidInput(_))
+            ));
+
+            match &mut credentials.backend {
+                SyncBackendCredentials::WebDav { endpoint, .. }
+                | SyncBackendCredentials::S3 { endpoint, .. } => {
+                    *endpoint = "https://sync.example.test/config".to_string();
+                }
+                SyncBackendCredentials::R2 { .. } => unreachable!(),
+            }
+            validate_credentials(&credentials).unwrap();
+        }
+    }
+
+    #[test]
+    fn tests_only_allow_http_on_ip_loopback() {
+        validate_credentials(&webdav_credentials("http://127.0.0.1:8080".to_string())).unwrap();
+        validate_credentials(&s3_credentials("http://[::1]:8080".to_string())).unwrap();
+
+        for endpoint in [
+            "http://localhost:8080",
+            "http://126.0.0.1:8080",
+            "http://192.0.2.1:8080",
+        ] {
+            assert!(matches!(
+                validate_credentials(&webdav_credentials(endpoint.to_string())),
+                Err(SyncError::InvalidInput(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn sync_redirects_must_stay_on_the_original_origin() {
+        let initial = reqwest::Url::parse("https://sync.example.test/config").unwrap();
+        let same_origin =
+            reqwest::Url::parse("https://sync.example.test/redirected-config").unwrap();
+        let other_host = reqwest::Url::parse("https://other.example.test/config").unwrap();
+        let other_port = reqwest::Url::parse("https://sync.example.test:8443/config").unwrap();
+        let downgraded = reqwest::Url::parse("http://sync.example.test/config").unwrap();
+
+        let previous = std::slice::from_ref(&initial);
+        assert!(sync_redirect_is_allowed(&same_origin, previous));
+        assert!(!sync_redirect_is_allowed(&other_host, previous));
+        assert!(!sync_redirect_is_allowed(&other_port, previous));
+        assert!(!sync_redirect_is_allowed(&downgraded, previous));
     }
 
     #[test]

@@ -53,6 +53,10 @@ JShell 是一个使用 Rust、GPUI 与 `alacritty_terminal` 构建的桌面终�
 - Linux：`jshell-<版本>-linux-x86_64.tar.gz`
 - macOS：`jshell-<版本>-macos-aarch64.zip` 或 `jshell-<版本>-macos-x86_64.zip`
 
+Linux 预编译包以 Ubuntu 22.04 为兼容基线，需要 `glibc 2.35` 或更高版本，以及 GTK 3、Ayatana AppIndicator 3、XCB、xkbcommon/xkbcommon-x11、Wayland 和 OpenGL 运行库。不同发行版的软件包名称可能不同；低于该 glibc 基线的系统请从源码构建。
+
+每个发布包都随附项目的 GPL-3.0-or-later 许可证、内嵌 Noto CJK 字体的 OFL-1.1 许可证及字体来源说明。
+
 macOS 应用使用临时签名。系统拦截首次启动时，可在确认下载来源后执行：
 
 ```bash
@@ -79,7 +83,7 @@ C:\Users\<用户名>\.config\jshell\sessions.json
 
 ## 开发与构建
 
-要求 Rust `1.89.0` 或更高版本，以及目标平台所需的 GPUI 系统依赖。
+要求 Rust `1.92.0` 或更高版本，以及目标平台所需的 GPUI 系统依赖。
 
 ```bash
 cargo run --locked
@@ -100,9 +104,11 @@ cargo test --locked --quiet
 cargo check --locked --all-targets
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo build --locked --release
-cargo audit
+cargo audit --deny warnings --file Cargo.lock
 git diff --check
 ```
+
+也可以运行 `./scripts/verify.sh` 执行同一组本地门禁；该脚本要求预先安装 `cargo-audit`，缺失时会失败。
 
 ## 许可证
 

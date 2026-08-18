@@ -122,18 +122,22 @@ pub enum BackendEvent {
     },
     RemoteSystem {
         tab_id: String,
+        generation: u32,
         snapshot: SystemSnapshot,
     },
     RemoteSystemUnavailable {
         tab_id: String,
+        generation: u32,
         reason: String,
     },
     CommandHistory {
         tab_id: String,
+        generation: u32,
         entries: Vec<String>,
     },
     CommandHistoryUnavailable {
         tab_id: String,
+        generation: u32,
         reason: String,
     },
     SftpHome {
@@ -286,6 +290,11 @@ impl SftpUiState {
         if generation < self.generation {
             return false;
         }
+        if generation > self.generation {
+            // Completions from the previous worker are intentionally rejected by generation;
+            // release their UI-only pending markers at the same boundary.
+            self.deleting_entries.clear();
+        }
         self.generation = generation;
         true
     }
@@ -420,6 +429,20 @@ mod sftp_ui_state_tests {
         assert!(!state.accepts_generation(1));
         assert!(!state.begin_generation(1));
         assert_eq!(state.generation, 2);
+    }
+
+    #[test]
+    fn advancing_sftp_generation_releases_interrupted_delete_markers() {
+        let mut state = SftpUiState {
+            generation: 4,
+            deleting_entries: ["/tmp/a".to_string(), "/tmp/b".to_string()]
+                .into_iter()
+                .collect(),
+            ..SftpUiState::default()
+        };
+
+        assert!(state.begin_generation(5));
+        assert!(state.deleting_entries.is_empty());
     }
 
     #[test]

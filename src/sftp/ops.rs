@@ -57,26 +57,6 @@ pub(crate) fn apply_sftp_delete_result(
     }
 }
 
-pub(crate) fn is_editable_text_file(filename: &str) -> bool {
-    let lower = filename.to_lowercase();
-    let ext = std::path::Path::new(&lower)
-        .extension()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
-    let known_exts = [
-        "txt", "conf", "json", "yaml", "yml", "xml", "ini", "sh", "py", "rs", "js", "ts", "html",
-        "css", "md", "toml", "csv", "log", "cfg",
-    ];
-    if known_exts.contains(&ext) {
-        return true;
-    }
-    let known_names = ["dockerfile", "makefile", ".gitignore", ".env"];
-    if known_names.contains(&lower.as_str()) {
-        return true;
-    }
-    false
-}
-
 impl Ashell {
     pub(crate) fn delete_sftp_paths(&mut self, paths: Vec<String>, cx: &mut Context<Self>) -> bool {
         let Some(handle) = self.active_sftp_handle().cloned() else {
@@ -267,17 +247,6 @@ impl Ashell {
             return;
         };
         self.download_sftp_entry(menu.remote_path, window, cx);
-        cx.notify();
-    }
-
-    pub(crate) fn trigger_sftp_context_edit(&mut self, cx: &mut Context<Self>) {
-        let Some(menu) = self.sftp_context_menu.take() else {
-            return;
-        };
-        if let Some(handle) = self.active_sftp_handle() {
-            tracing::info!("[sftp] triggering edit for file: '{}'", menu.remote_path);
-            handle.edit_file(menu.remote_path);
-        }
         cx.notify();
     }
 

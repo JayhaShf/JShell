@@ -27,9 +27,25 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           repository: RustSec/advisory-db
-          ref: 685d32fd681b540aa64019820639613c5a4fd922
+          ref: 2f08fbb85332687b721f2f22706d07448369451b
           path: .rustsec-advisory-db
           persist-credentials: false
+
+      - name: Verify RustSec advisory database freshness
+        shell: bash
+        run: |
+          set -euo pipefail
+          DB_TIMESTAMP="$(git -C .rustsec-advisory-db show -s --format=%ct HEAD)"
+          NOW="$(date -u +%s)"
+          MAX_AGE_SECONDS="$((14 * 24 * 60 * 60))"
+          AGE_SECONDS="$((NOW - DB_TIMESTAMP))"
+
+          if (( AGE_SECONDS < 0 || AGE_SECONDS > MAX_AGE_SECONDS )); then
+            echo "::error::Pinned RustSec advisory database is older than 14 days; update its commit before releasing."
+            exit 1
+          fi
+
+          git -C .rustsec-advisory-db show -s --format='RustSec database: %H (%cI)' HEAD
 
       # GPUI needs these system libs on Linux to compile.
       - name: Install Linux GUI dependencies
@@ -46,6 +62,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
+          toolchain: 1.92.0
           components: rustfmt, clippy
 
       - name: Cache cargo build
@@ -87,18 +104,22 @@ jobs:
             target: x86_64-pc-windows-msvc
             name: windows-x86_64
             bin: jshell.exe
+            run_tests: true
           - os: ubuntu-22.04 # build on the oldest supported runner for broader glibc compatibility
             target: x86_64-unknown-linux-gnu
             name: linux-x86_64
             bin: jshell
-          - os: macos-14 # Apple Silicon
+            run_tests: true
+          - os: macos-15 # Apple Silicon
             target: aarch64-apple-darwin
             name: macos-aarch64
             bin: jshell
-          - os: macos-14 # Intel (cross-compiled from Apple Silicon to avoid queue delays)
+            run_tests: true
+          - os: macos-15 # Intel (cross-compiled from Apple Silicon to avoid queue delays)
             target: x86_64-apple-darwin
             name: macos-x86_64
             bin: jshell
+            run_tests: false
 
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
@@ -108,10 +129,10 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
+          toolchain: 1.92.0
           targets: ${{ matrix.target }}
 
-      - name: Verify tag matches Cargo package version
-        if: github.event_name == 'push'
+      - name: Resolve package version and verify release tag
         shell: bash
         run: |
           set -euo pipefail
@@ -129,11 +150,15 @@ jobs:
             exit 1
           fi
 
-          EXPECTED_TAG="v${CARGO_VERSION}"
-          if [[ "$GITHUB_REF_NAME" != "$EXPECTED_TAG" ]]; then
-            echo "::error::Release tag '$GITHUB_REF_NAME' does not match Cargo.toml package.version '$CARGO_VERSION' (expected '$EXPECTED_TAG')."
-            exit 1
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            EXPECTED_TAG="v${CARGO_VERSION}"
+            if [[ "$GITHUB_REF_NAME" != "$EXPECTED_TAG" ]]; then
+              echo "::error::Release tag '$GITHUB_REF_NAME' does not match Cargo.toml package.version '$CARGO_VERSION' (expected '$EXPECTED_TAG')."
+              exit 1
+            fi
           fi
+
+          echo "PACKAGE_VERSION=$CARGO_VERSION" >> "$GITHUB_ENV"
 
       # GPUI needs these system libs on Linux to compile.
       - name: Install Linux GUI dependencies
@@ -146,12 +171,21 @@ jobs:
             libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
             libgl1-mesa-dev libegl1-mesa-dev libgtk-3-dev \
-            libudev-dev
+            libudev-dev libayatana-appindicator3-1 \
+            dbus-x11 gnome-keyring xauth xvfb
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: ${{ matrix.target }}
+
+      - name: Run native target tests
+        if: matrix.run_tests
+        run: cargo test --locked --target ${{ matrix.target }}
+
+      - name: Compile cross-target tests
+        if: ${{ ! matrix.run_tests }}
+        run: cargo test --locked --target ${{ matrix.target }} --no-run
 
       - name: Build (release)
         run: cargo build --locked --release --target ${{ matrix.target }}
@@ -159,9 +193,13 @@ jobs:
       - name: Package
         shell: bash
         run: |
-          set -eu
-          VERSION="${GITHUB_REF_NAME:-dev}"
-          STAGE="jshell-${VERSION}-${{ matrix.name }}"
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            VERSION_LABEL="$GITHUB_REF_NAME"
+          else
+            VERSION_LABEL="v${PACKAGE_VERSION}-dev.${GITHUB_RUN_NUMBER}"
+          fi
+          STAGE="jshell-${VERSION_LABEL}-${{ matrix.name }}"
 
           if [ "${{ runner.os }}" = "macOS" ]; then
             # ── Build a proper .app bundle ────────────────────────────────────
@@ -175,8 +213,8 @@ jobs:
 
             cp "target/${{ matrix.target }}/release/jshell" "$CONTENTS/MacOS/JShell"
             cp "assets/icons/jshell.icns" "$CONTENTS/Resources/jshell.icns"
+            bash scripts/stage-release-licenses.sh "$CONTENTS/Resources/licenses"
 
-            VERSION_NUM="${VERSION#v}"
             cat > "$CONTENTS/Info.plist" <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -198,9 +236,9 @@ jobs:
             <key>CFBundlePackageType</key>
             <string>APPL</string>
             <key>CFBundleShortVersionString</key>
-            <string>${VERSION_NUM}</string>
+            <string>${PACKAGE_VERSION}</string>
             <key>CFBundleVersion</key>
-            <string>1</string>
+            <string>${GITHUB_RUN_NUMBER}</string>
             <key>LSMinimumSystemVersion</key>
             <string>12.0</string>
             <key>NSHighResolutionCapable</key>
@@ -222,6 +260,7 @@ jobs:
           elif [ "${{ runner.os }}" = "Windows" ]; then
             mkdir "$STAGE"
             cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "$STAGE/"
+            bash scripts/stage-release-licenses.sh "$STAGE"
             7z a "${STAGE}.zip" "$STAGE" >/dev/null
             echo "ASSET=${STAGE}.zip" >> "$GITHUB_ENV"
 
@@ -229,8 +268,170 @@ jobs:
             # Linux
             mkdir "$STAGE"
             cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "$STAGE/"
+            bash scripts/stage-release-licenses.sh "$STAGE"
             tar -czf "${STAGE}.tar.gz" "$STAGE"
             echo "ASSET=${STAGE}.tar.gz" >> "$GITHUB_ENV"
+          fi
+
+      - name: Smoke-test packaged Windows app
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $smokeDir = Join-Path $env:RUNNER_TEMP "jshell-release-smoke"
+          $profileDir = Join-Path $smokeDir "profile"
+          New-Item -ItemType Directory -Force -Path $smokeDir, $profileDir | Out-Null
+          Expand-Archive -LiteralPath $env:ASSET -DestinationPath $smokeDir -Force
+
+          $exe = Get-ChildItem -Path $smokeDir -Recurse -File -Filter "jshell.exe" | Select-Object -First 1
+          if ($null -eq $exe) {
+            throw "Packaged jshell.exe was not found"
+          }
+
+          $stageDir = $exe.Directory.FullName
+          $requiredFiles = @(
+            (Join-Path $stageDir "LICENSE")
+            (Join-Path $stageDir "THIRD_PARTY_LICENSES/OFL-1.1.txt")
+            (Join-Path $stageDir "THIRD_PARTY_LICENSES/Noto-CJK-SOURCE.zh-CN.md")
+          )
+          foreach ($requiredFile in $requiredFiles) {
+            if (-not (Test-Path -LiteralPath $requiredFile -PathType Leaf)) {
+              throw "Required release license file is missing: $requiredFile"
+            }
+          }
+
+          $oldHome = $env:HOME
+          $oldUserProfile = $env:USERPROFILE
+          $env:HOME = $profileDir
+          $env:USERPROFILE = $profileDir
+          $process = $null
+          try {
+            $process = Start-Process -FilePath $exe.FullName -PassThru
+            Start-Sleep -Seconds 5
+            $process.Refresh()
+            if ($process.HasExited) {
+              throw "Packaged Windows app exited during startup smoke test with code $($process.ExitCode)"
+            }
+          } finally {
+            if ($null -ne $process) {
+              $process.Refresh()
+              if (-not $process.HasExited) {
+                Stop-Process -Id $process.Id -Force
+              }
+            }
+            $env:HOME = $oldHome
+            $env:USERPROFILE = $oldUserProfile
+          }
+
+      - name: Smoke-test packaged Linux app
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          SMOKE_DIR="$(mktemp -d)"
+          trap 'rm -rf "$SMOKE_DIR"' EXIT
+          tar -xzf "$ASSET" -C "$SMOKE_DIR"
+
+          BIN="$(find "$SMOKE_DIR" -type f -name jshell -print -quit)"
+          if [[ -z "$BIN" ]]; then
+            echo "::error::Packaged Linux binary was not found."
+            exit 1
+          fi
+          STAGE_DIR="$(dirname "$BIN")"
+          test -s "$STAGE_DIR/LICENSE"
+          test -s "$STAGE_DIR/THIRD_PARTY_LICENSES/OFL-1.1.txt"
+          test -s "$STAGE_DIR/THIRD_PARTY_LICENSES/Noto-CJK-SOURCE.zh-CN.md"
+
+          bash scripts/smoke-linux-keyring.sh \
+            --require-display --binary "$BIN"
+
+          bash scripts/smoke-linux-fallback.sh \
+            --require-display --binary "$BIN"
+
+      - name: Verify packaged macOS app
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          SMOKE_DIR="$(mktemp -d)"
+          ditto -x -k "$ASSET" "$SMOKE_DIR"
+          APP="$SMOKE_DIR/JShell.app"
+
+          test -x "$APP/Contents/MacOS/JShell"
+          case "${{ matrix.target }}" in
+            aarch64-apple-darwin) EXPECTED_ARCH="arm64" ;;
+            x86_64-apple-darwin) EXPECTED_ARCH="x86_64" ;;
+            *)
+              echo "::error::Unexpected macOS target '${{ matrix.target }}'."
+              exit 1
+              ;;
+          esac
+          ACTUAL_ARCHS="$(lipo -archs "$APP/Contents/MacOS/JShell")"
+          if [[ "$ACTUAL_ARCHS" != "$EXPECTED_ARCH" ]]; then
+            echo "::error::Packaged macOS binary architecture '$ACTUAL_ARCHS' does not match '$EXPECTED_ARCH'."
+            exit 1
+          fi
+          test -s "$APP/Contents/Resources/licenses/LICENSE"
+          test -s "$APP/Contents/Resources/licenses/THIRD_PARTY_LICENSES/OFL-1.1.txt"
+          test -s "$APP/Contents/Resources/licenses/THIRD_PARTY_LICENSES/Noto-CJK-SOURCE.zh-CN.md"
+          plutil -lint "$APP/Contents/Info.plist"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")" = "$PACKAGE_VERSION"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP/Contents/Info.plist")" = "$GITHUB_RUN_NUMBER"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+
+      - name: Smoke-test packaged native macOS app
+        if: matrix.target == 'aarch64-apple-darwin'
+        shell: bash
+        run: |
+          set -euo pipefail
+          SMOKE_DIR="$(mktemp -d)"
+          APP_PID=""
+          cleanup() {
+            if [[ -n "$APP_PID" ]] && kill -0 "$APP_PID" 2>/dev/null; then
+              kill -KILL "$APP_PID" 2>/dev/null || true
+            fi
+            rm -rf "$SMOKE_DIR"
+          }
+          trap cleanup EXIT
+
+          ditto -x -k "$ASSET" "$SMOKE_DIR"
+          mkdir -p "$SMOKE_DIR/home"
+          HOME="$SMOKE_DIR/home" "$SMOKE_DIR/JShell.app/Contents/MacOS/JShell" \
+            >"$SMOKE_DIR/jshell.log" 2>&1 &
+          APP_PID=$!
+          sleep 5
+          if ! kill -0 "$APP_PID" 2>/dev/null; then
+            wait "$APP_PID" || APP_EXIT=$?
+            cat "$SMOKE_DIR/jshell.log"
+            echo "::error::Packaged macOS app exited during startup smoke test with code ${APP_EXIT:-0}."
+            exit 1
+          fi
+
+          kill -TERM "$APP_PID"
+          for _ in {1..25}; do
+            if ! kill -0 "$APP_PID" 2>/dev/null; then
+              break
+            fi
+            sleep 0.2
+          done
+          if kill -0 "$APP_PID" 2>/dev/null; then
+            cat "$SMOKE_DIR/jshell.log"
+            echo "::error::Packaged macOS app did not exit within 5 seconds of SIGTERM."
+            kill -KILL "$APP_PID" 2>/dev/null || true
+            wait "$APP_PID" 2>/dev/null || true
+            APP_PID=""
+            exit 1
+          fi
+          if wait "$APP_PID"; then
+            APP_EXIT=0
+          else
+            APP_EXIT=$?
+          fi
+          APP_PID=""
+          if [[ "$APP_EXIT" -ne 0 ]]; then
+            cat "$SMOKE_DIR/jshell.log"
+            echo "::error::Packaged macOS app exited after SIGTERM with code $APP_EXIT."
+            exit 1
           fi
 
       - name: Upload workflow artifact
@@ -242,7 +443,7 @@ jobs:
   publish:
     name: Publish Release
     needs: build
-    if: startsWith(github.ref, 'refs/tags/')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
       contents: write # required to create or update the GitHub Release
@@ -265,6 +466,17 @@ jobs:
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
+          merge-multiple: true
+
+      - name: Generate release checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 \
+            | sort -z \
+            | xargs -0 sha256sum > SHA256SUMS
+          test "$(wc -l < SHA256SUMS)" -eq 4
 
       - name: Attach to GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
@@ -272,5 +484,5 @@ jobs:
           name: JShell ${{ github.ref_name }}
           prerelease: ${{ contains(github.ref_name, '-') }}
           body_path: .github/release-notes/${{ github.ref_name }}.zh-CN.md
-          files: dist/**/*
+          files: dist/*
           fail_on_unmatched_files: true

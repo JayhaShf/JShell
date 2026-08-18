@@ -3,9 +3,9 @@ name = "jshell"
 version = "1.0.0"
 edition = "2024"
 authors = ["JShell contributors"]
-description = "A Windows-focused SSH and local terminal workspace"
+description = "A cross-platform SSH, SFTP, serial, and local terminal workspace"
 license = "GPL-3.0-or-later"
-rust-version = "1.89.0"
+rust-version = "1.92.0"
 
 [dependencies]
 anyhow = "1"
@@ -61,7 +61,6 @@ futures = "0.3.32"
 zeroize = "1.8"
 libc = "0.2"
 keyring = { version = "3.6.3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust", "vendored"] }
-notify = "6.1.1"
 open = "5.1"
 time = { version = "0.3.47", features = ["formatting", "local-offset"] }
 tracing-appender = "0.2.5"
@@ -106,10 +105,14 @@ license-file = ["LICENSE"]
 extended-description = "A GPUI Component based SSH and local terminal client"
 section = "terminal"
 priority = "optional"
+depends = "$auto, libayatana-appindicator3-1"
 assets = [
     ["target/release/jshell", "usr/bin/", "755"],
     ["assets/jshell.desktop", "usr/share/applications/", "644"],
     ["assets/icons/jshell.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
+    ["LICENSE", "usr/share/licenses/jshell/LICENSE", "644"],
+    ["assets/fonts/OFL-1.1.txt", "usr/share/licenses/jshell/OFL-1.1.txt", "644"],
+    ["assets/fonts/SOURCE.zh-CN.md", "usr/share/licenses/jshell/Noto-CJK-SOURCE.zh-CN.md", "644"],
 ]
 
 [package.metadata.winres]

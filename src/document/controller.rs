@@ -1,12 +1,12 @@
 use crate::document::remote::RemoteDocumentKey;
 use crate::document::{
-    DocumentMode, LoadedDocument, ReadOnlyReason, TextKind, inspect_text,
+    DocumentMode, EDITABLE_MAX_BYTES, LoadedDocument, ReadOnlyReason, TextKind, inspect_text,
     language::detect_language,
     large_file::{LargeFileState, PAGE_BYTES, PAGE_READ_BYTES, normalize_window},
     mode_for_size,
     remote::{ByteRange, RemoteFileBackend},
 };
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use gpui::{AppContext as _, Context, Entity, Focusable as _, PathPromptOptions, Window};
 use gpui_component::input::{InputEvent, InputState};
 use rust_i18n::t;
@@ -26,6 +26,7 @@ pub struct SaveRequest {
     pub path: String,
     pub bytes: Vec<u8>,
     pub opened_metadata: crate::document::remote::RemoteMetadata,
+    pub original_hash: [u8; 32],
     pub revision: u64,
     pub operation_id: String,
 }
@@ -35,6 +36,7 @@ impl SaveRequest {
         path: impl Into<String>,
         bytes: Vec<u8>,
         opened_metadata: crate::document::remote::RemoteMetadata,
+        original_hash: [u8; 32],
         revision: u64,
         operation_id: impl Into<String>,
     ) -> Self {
@@ -42,6 +44,7 @@ impl SaveRequest {
             path: path.into(),
             bytes,
             opened_metadata,
+            original_hash,
             revision,
             operation_id: operation_id.into(),
         }
@@ -53,6 +56,7 @@ pub struct PendingSave {
     pub path: String,
     pub bytes: Vec<u8>,
     pub opened_metadata: crate::document::remote::RemoteMetadata,
+    pub original_hash: [u8; 32],
     pub current_metadata: Option<crate::document::remote::RemoteMetadata>,
     pub revision: u64,
     pub operation_id: String,
@@ -67,6 +71,7 @@ impl PendingSave {
             path: request.path,
             bytes: request.bytes,
             opened_metadata: request.opened_metadata,
+            original_hash: request.original_hash,
             current_metadata,
             revision: request.revision,
             operation_id: request.operation_id,
@@ -122,6 +127,20 @@ pub fn close_decision(revisions: DocumentRevisions) -> CloseDecision {
     }
 }
 
+fn preserved_focus_path_after_document_removal(
+    pane_root: &crate::PaneLayout,
+    previous_focus: Option<&PaneLeaf>,
+    removed_document_id: &str,
+) -> Option<Vec<usize>> {
+    match previous_focus {
+        Some(PaneLeaf::Terminal(tab_id)) => pane_root.path_to_terminal(tab_id),
+        Some(PaneLeaf::Document(document_id)) if document_id != removed_document_id => {
+            pane_root.path_to_document(document_id)
+        }
+        Some(PaneLeaf::Document(_) | PaneLeaf::Empty) | None => None,
+    }
+}
+
 pub async fn run_save_check<B: RemoteFileBackend>(
     backend: &B,
     request: SaveRequest,
@@ -137,6 +156,22 @@ pub async fn run_save_check<B: RemoteFileBackend>(
     };
 
     if crate::document::remote::has_conflict(&request.opened_metadata, &current_metadata) {
+        return Ok(SaveOutcome::Conflict(PendingSave::from_request(
+            request,
+            Some(current_metadata),
+        )));
+    }
+
+    let current_bytes = match backend.read(&request.path, None).await {
+        Ok(bytes) => bytes,
+        Err(error) if crate::document::remote::is_not_found(&error) => {
+            return Ok(SaveOutcome::RemoteDeleted(PendingSave::from_request(
+                request, None,
+            )));
+        }
+        Err(error) => return Err(error),
+    };
+    if <[u8; 32]>::from(Sha256::digest(&current_bytes)) != request.original_hash {
         return Ok(SaveOutcome::Conflict(PendingSave::from_request(
             request,
             Some(current_metadata),
@@ -199,6 +234,11 @@ pub async fn load_remote_document<B: RemoteFileBackend>(
         }
         DocumentMode::MetadataOnly => Vec::new(),
     };
+    if mode == DocumentMode::Editable && bytes.len() as u64 > EDITABLE_MAX_BYTES {
+        return Err(anyhow!(
+            "remote document grew beyond the editable size limit while loading"
+        ));
+    }
 
     let (inspected, large_file) = if mode == DocumentMode::PagedReadOnly {
         let binary = bytes.iter().take(1024).any(|byte| *byte == 0);
@@ -818,6 +858,7 @@ impl Ashell {
             document.key.remote_path.clone(),
             bytes,
             opened_metadata,
+            document.original_hash,
             revision,
             operation_id.clone(),
         );
@@ -1283,10 +1324,19 @@ impl Ashell {
             .iter_mut()
             .find(|group| group.pane_root.contains_document(document_id))
             .map(|group| {
+                let previous_focus = group
+                    .pane_root
+                    .focused_leaf(&group.focused_pane_path)
+                    .cloned();
                 let adjacent_path = group.pane_root.remove_document_and_focus(document_id);
-                group.focused_pane_path = adjacent_path
-                    .or_else(|| group.pane_root.first_leaf_path())
-                    .unwrap_or_default();
+                group.focused_pane_path = preserved_focus_path_after_document_removal(
+                    &group.pane_root,
+                    previous_focus.as_ref(),
+                    document_id,
+                )
+                .or(adjacent_path)
+                .or_else(|| group.pane_root.first_leaf_path())
+                .unwrap_or_default();
                 (
                     group.id.clone(),
                     group.pane_root.clone(),
@@ -1316,6 +1366,32 @@ impl Ashell {
             self.workspace_tabs.remove(index);
         }
         self.documents.remove(document_id);
+
+        let empty_group_id = updated_group.as_ref().and_then(|(group_id, pane_root, _)| {
+            (pane_root.tab_ids().is_empty() && pane_root.document_ids().is_empty())
+                .then(|| group_id.clone())
+        });
+        if let Some(group_id) = empty_group_id {
+            self.sftp_handles.remove(&group_id);
+            self.sftp_reconnect_after_ssh.remove(&group_id);
+            self.tab_groups.retain(|group| group.id != group_id);
+            self.workspace_tabs.retain(|workspace| {
+                !matches!(
+                    workspace,
+                    WorkspaceTab::Session {
+                        group_id: workspace_group_id,
+                        ..
+                    } if workspace_group_id == &group_id
+                )
+            });
+            if self.active_group.as_deref() == Some(group_id.as_str()) {
+                self.active_group = None;
+                self.active_tab = None;
+                self.pane_root = crate::PaneLayout::empty();
+                self.focused_pane_path.clear();
+                self.pending_sftp_path_sync = None;
+            }
+        }
 
         if self.active_workspace_tab == removed_workspace_id {
             match self.pane_root.focused_leaf(&self.focused_pane_path) {
@@ -1356,16 +1432,22 @@ impl Ashell {
                 }
             }
         }
+        self.sync_system_tab_to_active_group();
         cx.notify();
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CloseDecision, close_decision, find_existing_document};
+    use super::{
+        CloseDecision, close_decision, find_existing_document,
+        preserved_focus_path_after_document_removal,
+    };
     use crate::document::{DocumentMode, DocumentRevisions, LineEnding, SaveState, remote::*};
+    use crate::{PaneLayout, PaneLeaf};
     use anyhow::{Result, anyhow};
     use async_trait::async_trait;
+    use sha2::{Digest, Sha256};
     use std::sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -1385,6 +1467,32 @@ mod tests {
         revisions.changed();
 
         assert_eq!(close_decision(revisions), CloseDecision::Prompt);
+    }
+
+    #[test]
+    fn closing_an_inactive_document_preserves_the_focused_pane() {
+        let mut layout = PaneLayout::Vertical(
+            vec![
+                PaneLayout::terminal("left"),
+                PaneLayout::Leaf(PaneLeaf::Document("document".into())),
+                PaneLayout::terminal("right"),
+            ],
+            0.5,
+        );
+        let previous_focus = layout.focused_leaf(&[2]).cloned();
+        let adjacent_path = layout.remove_document_and_focus("document");
+        let focused_path = preserved_focus_path_after_document_removal(
+            &layout,
+            previous_focus.as_ref(),
+            "document",
+        )
+        .or(adjacent_path)
+        .expect("a terminal remains");
+
+        assert_eq!(
+            layout.focused_leaf(&focused_path),
+            Some(&PaneLeaf::Terminal("right".into()))
+        );
     }
 
     #[derive(Clone)]
@@ -1413,6 +1521,7 @@ mod tests {
     #[derive(Clone)]
     struct MemoryBackend {
         stat: StatBehavior,
+        bytes: Vec<u8>,
         write: WriteBehavior,
         writes: WriteLog,
     }
@@ -1421,6 +1530,7 @@ mod tests {
         fn matching(metadata: RemoteMetadata) -> Self {
             Self {
                 stat: StatBehavior::Metadata(metadata.clone()),
+                bytes: b"alpha".to_vec(),
                 write: WriteBehavior::Metadata(RemoteMetadata {
                     size: metadata.size,
                     mtime: metadata.mtime + 1,
@@ -1433,6 +1543,7 @@ mod tests {
         fn failing_write(metadata: RemoteMetadata, message: &str) -> Self {
             Self {
                 stat: StatBehavior::Metadata(metadata),
+                bytes: b"alpha".to_vec(),
                 write: WriteBehavior::Failure(message.into()),
                 writes: Arc::new(Mutex::new(Vec::new())),
             }
@@ -1441,6 +1552,7 @@ mod tests {
         fn channel_closed_write(metadata: RemoteMetadata) -> Self {
             Self {
                 stat: StatBehavior::Metadata(metadata),
+                bytes: b"alpha".to_vec(),
                 write: WriteBehavior::ChannelClosed,
                 writes: Arc::new(Mutex::new(Vec::new())),
             }
@@ -1449,6 +1561,7 @@ mod tests {
         fn missing() -> Self {
             Self {
                 stat: StatBehavior::Missing,
+                bytes: Vec::new(),
                 write: WriteBehavior::Failure("write must not run".into()),
                 writes: Arc::new(Mutex::new(Vec::new())),
             }
@@ -1469,7 +1582,7 @@ mod tests {
         }
 
         async fn read(&self, _path: &str, _range: Option<ByteRange>) -> Result<Vec<u8>> {
-            Err(anyhow!("not used by save tests"))
+            Ok(self.bytes.clone())
         }
 
         async fn write_atomic(
@@ -1497,6 +1610,10 @@ mod tests {
             mtime: 20,
             permissions: Some(0o100644),
         }
+    }
+
+    fn opened_hash() -> [u8; 32] {
+        Sha256::digest(b"alpha").into()
     }
 
     #[async_trait]
@@ -1610,6 +1727,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn editable_document_growth_is_rejected_after_read() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let backend = ReadBackend {
+            metadata: RemoteMetadata {
+                size: 1,
+                mtime: 20,
+                permissions: Some(0o100644),
+            },
+            bytes: vec![b'x'; crate::document::EDITABLE_MAX_BYTES as usize + 1],
+            reads: reads.clone(),
+        };
+
+        let error = super::load_remote_document(&backend, "/tmp/growing.txt")
+            .await
+            .expect_err("growth beyond the editable limit must fail");
+
+        assert!(error.to_string().contains("editable size limit"));
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn save_success_marks_only_the_saved_revision_clean() {
         let backend = MemoryBackend::matching(opened_metadata());
         let mut revisions = DocumentRevisions::default();
@@ -1622,6 +1760,7 @@ mod tests {
                 "/etc/app.conf",
                 b"alpha".to_vec(),
                 opened_metadata(),
+                opened_hash(),
                 saved_revision,
                 "operation-1",
             ),
@@ -1661,6 +1800,7 @@ mod tests {
                 "/etc/app.conf",
                 b"local".to_vec(),
                 opened_metadata(),
+                opened_hash(),
                 1,
                 "operation-1",
             ),
@@ -1677,12 +1817,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn same_size_and_mtime_content_change_requires_a_conflict_choice() {
+        let mut backend = MemoryBackend::matching(opened_metadata());
+        backend.bytes = b"bravo".to_vec();
+
+        let outcome = super::run_save_check(
+            &backend,
+            super::SaveRequest::new(
+                "/etc/app.conf",
+                b"local".to_vec(),
+                opened_metadata(),
+                opened_hash(),
+                1,
+                "operation-1",
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, super::SaveOutcome::Conflict(_)));
+        assert!(backend.writes().is_empty());
+    }
+
+    #[tokio::test]
     async fn save_failure_preserves_text_and_dirty_state() {
         let backend = MemoryBackend::failing_write(opened_metadata(), "disk full");
         let request = super::SaveRequest::new(
             "/etc/app.conf",
             b"local".to_vec(),
             opened_metadata(),
+            opened_hash(),
             1,
             "operation-1",
         );
@@ -1705,6 +1869,7 @@ mod tests {
                 "/etc/app.conf",
                 b"local".to_vec(),
                 opened_metadata(),
+                opened_hash(),
                 1,
                 "operation-1",
             ),
@@ -1728,6 +1893,7 @@ mod tests {
                 "/etc/app.conf",
                 b"local".to_vec(),
                 opened_metadata(),
+                opened_hash(),
                 1,
                 "operation-1",
             ),

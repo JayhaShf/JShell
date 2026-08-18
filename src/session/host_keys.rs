@@ -299,6 +299,9 @@ fn check_server_key_contents(
         }
 
         let normalized = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        if !raw_entry_could_match_target(&normalized, &target, &normalized_target) {
+            continue;
+        }
         let entry: Entry = normalized
             .parse()
             .map_err(|source| HostKeyError::InvalidEntry {
@@ -342,15 +345,68 @@ fn check_server_key_contents(
     if let Some((line, marker)) = unsupported_marker {
         return Ok(HostKeyCheck::UnsupportedMarker { line, marker });
     }
+    if trusted {
+        return Ok(HostKeyCheck::Trusted);
+    }
     if !changed.is_empty() {
         changed.sort();
         changed.dedup();
         return Ok(HostKeyCheck::Changed { stored: changed });
     }
-    if trusted {
-        return Ok(HostKeyCheck::Trusted);
-    }
     Ok(HostKeyCheck::Unknown)
+}
+
+fn raw_entry_could_match_target(line: &str, target: &str, normalized_target: &str) -> bool {
+    let mut fields = line.split_whitespace();
+    let Some(first) = fields.next() else {
+        return false;
+    };
+    let patterns = if first.starts_with('@') {
+        let Some(patterns) = fields.next() else {
+            // The malformed marker might have belonged to this target, so fail closed.
+            return true;
+        };
+        patterns
+    } else {
+        first
+    };
+
+    if patterns.starts_with('|') {
+        // Valid hashed records can be filtered without parsing the public key. If the
+        // hash itself is malformed, retain the line so the strict parser fails closed.
+        let mut parts = patterns.split('|');
+        let valid_prefix = parts.next() == Some("") && parts.next() == Some("1");
+        let Some(salt) = parts.next() else {
+            return true;
+        };
+        let Some(hash) = parts.next() else {
+            return true;
+        };
+        if !valid_prefix || parts.next().is_some() {
+            return true;
+        }
+        let Ok(salt) =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, salt.as_bytes())
+        else {
+            return true;
+        };
+        let Ok(hash) =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, hash.as_bytes())
+        else {
+            return true;
+        };
+        let Ok(hash): Result<[u8; 20], _> = hash.try_into() else {
+            return true;
+        };
+        return hashed_host_matches(&salt, &hash, target)
+            || (target != normalized_target
+                && hashed_host_matches(&salt, &hash, normalized_target));
+    }
+
+    patterns.split(',').any(|pattern| {
+        let pattern = pattern.strip_prefix('!').unwrap_or(pattern);
+        wildcard_match(&pattern.to_ascii_lowercase(), normalized_target)
+    })
 }
 
 fn append_server_key_at_path(
@@ -735,19 +791,38 @@ mod tests {
     }
 
     #[test]
-    fn rejects_different_old_key_even_when_current_key_is_also_stored() {
+    fn trusts_exact_key_even_when_a_different_old_key_is_also_stored() {
         let original = format!("example.test {KNOWN_KEY}\nexample.test {CHANGED_KEY}\n");
         let known_hosts = TempKnownHosts::existing(&original);
 
-        let error = verify_server_key_at_path(
-            "example.test",
-            22,
-            &public_key(KNOWN_KEY),
-            &known_hosts.path,
-        )
-        .expect_err("any different stored key must block the connection");
+        assert_eq!(
+            verify_server_key_at_path(
+                "example.test",
+                22,
+                &public_key(KNOWN_KEY),
+                &known_hosts.path,
+            )
+            .expect("an exact stored key must take precedence over stale keys"),
+            HostKeyVerification::Trusted,
+        );
+        assert_eq!(known_hosts.contents(), original);
+    }
 
-        assert!(matches!(error, HostKeyError::Changed { .. }));
+    #[test]
+    fn trusts_exact_key_when_multiple_host_key_algorithms_are_stored() {
+        let original = format!("example.test {ECDSA_KEY}\nexample.test {KNOWN_KEY}\n");
+        let known_hosts = TempKnownHosts::existing(&original);
+
+        assert_eq!(
+            verify_server_key_at_path(
+                "example.test",
+                22,
+                &public_key(KNOWN_KEY),
+                &known_hosts.path,
+            )
+            .expect("the exact Ed25519 key must survive an ECDSA record for the same host"),
+            HostKeyVerification::Trusted,
+        );
         assert_eq!(known_hosts.contents(), original);
     }
 
@@ -845,6 +920,42 @@ mod tests {
             &known_hosts.path,
         )
         .expect_err("malformed matching entry must be rejected");
+
+        assert!(matches!(error, HostKeyError::InvalidEntry { line: 1, .. }));
+        assert_eq!(known_hosts.contents(), original);
+    }
+
+    #[test]
+    fn ignores_malformed_entry_for_an_unrelated_host() {
+        let original =
+            format!("unrelated.example ssh-ed25519 not-base64\nexample.test {KNOWN_KEY}\n");
+        let known_hosts = TempKnownHosts::existing(&original);
+
+        assert_eq!(
+            verify_server_key_at_path(
+                "example.test",
+                22,
+                &public_key(KNOWN_KEY),
+                &known_hosts.path,
+            )
+            .expect("an unrelated malformed record must not block this host"),
+            HostKeyVerification::Trusted,
+        );
+        assert_eq!(known_hosts.contents(), original);
+    }
+
+    #[test]
+    fn malformed_hashed_entry_still_fails_closed() {
+        let original = "|1|not-base64|also-not-base64 ssh-ed25519 not-base64\n";
+        let known_hosts = TempKnownHosts::existing(original);
+
+        let error = verify_server_key_at_path(
+            "example.test",
+            22,
+            &public_key(KNOWN_KEY),
+            &known_hosts.path,
+        )
+        .expect_err("a malformed hashed identity cannot be proven unrelated");
 
         assert!(matches!(error, HostKeyError::InvalidEntry { line: 1, .. }));
         assert_eq!(known_hosts.contents(), original);

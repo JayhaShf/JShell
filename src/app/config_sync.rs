@@ -1,6 +1,7 @@
 use gpui::{Context, Entity, SharedString};
 use gpui_component::input::InputState;
 use rust_i18n::t;
+use std::{fs::File, io::Read, path::Path};
 
 use crate::{
     Ashell,
@@ -32,6 +33,50 @@ pub(crate) struct PendingSyncUpload {
 pub(crate) struct SyncUiState {
     pub(crate) pending_sync_download: Option<PendingSyncDownload>,
     pub(crate) pending_sync_upload_conflict: Option<PendingSyncUpload>,
+}
+
+fn export_config_file(
+    path: &std::path::Path,
+    config: &crate::session::config::ConfigFile,
+) -> anyhow::Result<()> {
+    let bytes = serde_json::to_vec_pretty(config)?;
+    crate::session::config::atomic_write_config(path, &bytes)
+}
+
+fn validate_import_config_size(bytes: &[u8]) -> anyhow::Result<()> {
+    if bytes.len() > sync::MAX_SYNC_PAYLOAD_BYTES {
+        anyhow::bail!(
+            "imported configuration exceeds the {} byte limit",
+            sync::MAX_SYNC_PAYLOAD_BYTES
+        );
+    }
+    Ok(())
+}
+
+fn parse_imported_config(bytes: &[u8]) -> anyhow::Result<crate::session::config::ConfigFile> {
+    validate_import_config_size(bytes)?;
+    Ok(serde_json::from_slice(bytes)?)
+}
+
+fn read_imported_config(path: &Path) -> anyhow::Result<crate::session::config::ConfigFile> {
+    let file = File::open(path)?;
+    let mut bytes = Vec::new();
+    file.take((sync::MAX_SYNC_PAYLOAD_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    parse_imported_config(&bytes)
+}
+
+fn replace_imported_config_with_save(
+    config: &mut crate::session::config::ConfigStore,
+    imported: crate::session::config::ConfigFile,
+    save: impl FnOnce(&crate::session::config::ConfigStore) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let previous = std::mem::replace(&mut config.cache, imported);
+    if let Err(error) = save(config) {
+        config.cache = previous;
+        return Err(error);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -804,16 +849,14 @@ impl Ashell {
         cx.spawn_in(window, async move |_this, cx| {
             if let Some(file_handle) = file_dialog.await {
                 let path = file_handle.path().to_path_buf();
-                if let Ok(json_str) = serde_json::to_string_pretty(&local_config) {
-                    let _ = cx
-                        .background_executor()
-                        .spawn(async move {
-                            if let Err(err) = std::fs::write(path, json_str) {
-                                tracing::error!("failed to export local config: {err:#}");
-                            }
-                        })
-                        .await;
-                }
+                let _ = cx
+                    .background_executor()
+                    .spawn(async move {
+                        if let Err(err) = export_config_file(&path, &local_config) {
+                            tracing::error!("failed to export local config: {err:#}");
+                        }
+                    })
+                    .await;
             }
             Ok::<(), anyhow::Error>(())
         })
@@ -834,17 +877,21 @@ impl Ashell {
                 let path = file_handle.path().to_path_buf();
                 let read_result = cx
                     .background_executor()
-                    .spawn(async move { std::fs::read_to_string(path) })
+                    .spawn(async move { read_imported_config(&path) })
                     .await;
 
-                if let Ok(json_str) = read_result
-                    && let Ok(config_file) =
-                        serde_json::from_str::<crate::session::config::ConfigFile>(&json_str)
-                {
+                if let Ok(config_file) = read_result {
                     let _ = gpui::AsyncWindowContext::update(cx, |window, cx| {
                         let _ = this.update(cx, |this, cx| {
-                            this.config.cache = config_file;
-                            if let Err(err) = this.save_config_now() {
+                            let coordinator = this.config_writes.clone();
+                            let result = coordinator.run_exclusive(|| {
+                                replace_imported_config_with_save(
+                                    &mut this.config,
+                                    config_file,
+                                    crate::session::config::ConfigStore::save,
+                                )
+                            });
+                            if let Err(err) = result {
                                 tracing::error!("failed to save imported config: {err:#}");
                             } else {
                                 this.apply_loaded_config(window, cx);
@@ -1028,6 +1075,73 @@ mod tests {
 
     fn config_snapshot(config: &ConfigStore) -> serde_json::Value {
         serde_json::to_value(&config.cache).unwrap()
+    }
+
+    #[test]
+    fn exported_config_atomically_replaces_the_target_with_private_permissions() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("jshell-config.json");
+        std::fs::write(&path, b"stale partial export").unwrap();
+
+        let config = ConfigStore::in_memory();
+        export_config_file(&path, &config.cache).unwrap();
+
+        let exported: crate::session::config::ConfigFile =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            serde_json::to_value(exported).unwrap(),
+            serde_json::to_value(&config.cache).unwrap()
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn imported_config_size_limit_accepts_boundary_and_rejects_overflow() {
+        let at_limit = vec![0_u8; sync::MAX_SYNC_PAYLOAD_BYTES];
+        assert!(validate_import_config_size(&at_limit).is_ok());
+
+        let over_limit = vec![0_u8; sync::MAX_SYNC_PAYLOAD_BYTES + 1];
+        let error = validate_import_config_size(&over_limit)
+            .expect_err("an import larger than the sync payload limit must be rejected");
+        assert!(error.to_string().contains("exceeds"));
+    }
+
+    #[test]
+    fn imported_config_parser_enforces_size_before_json_decoding() {
+        let over_limit = vec![b'{'; sync::MAX_SYNC_PAYLOAD_BYTES + 1];
+        let error = parse_imported_config(&over_limit)
+            .expect_err("oversized imports must fail before parsing arbitrary JSON");
+        assert!(error.to_string().contains("exceeds"));
+    }
+
+    #[test]
+    fn failed_import_save_restores_the_previous_cached_config() {
+        let mut config = ConfigStore::in_memory();
+        config.replace_sessions(vec![session("local-session", "local.test")]);
+        let before = config_snapshot(&config);
+        let mut imported = config.cache.clone();
+        imported.sessions = vec![session("imported-session", "remote.test")];
+
+        let error = replace_imported_config_with_save(&mut config, imported, |_| {
+            Err(anyhow::anyhow!("simulated import persistence failure"))
+        })
+        .expect_err("a failed import must not replace the cached configuration");
+
+        assert!(
+            error
+                .to_string()
+                .contains("simulated import persistence failure")
+        );
+        assert_eq!(config_snapshot(&config), before);
     }
 
     #[test]

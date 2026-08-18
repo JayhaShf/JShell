@@ -164,20 +164,81 @@ pub(crate) fn init_logging() {
         .init();
 }
 
+#[cfg(any(test, target_os = "macos"))]
+fn poll_until<T, E>(
+    timeout: std::time::Duration,
+    interval: std::time::Duration,
+    mut poll: impl FnMut() -> Result<Option<T>, E>,
+) -> Result<Option<T>, E> {
+    let started = std::time::Instant::now();
+    loop {
+        if let Some(value) = poll()? {
+            return Ok(Some(value));
+        }
+
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        std::thread::sleep(interval.min(remaining));
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_login_environment(
+    shell: &std::ffi::OsStr,
+    timeout: std::time::Duration,
+) -> std::io::Result<Option<(std::process::ExitStatus, Vec<u8>)>> {
+    use std::io::{Read as _, Seek as _};
+
+    let mut output = tempfile::tempfile()?;
+    let output_writer = output.try_clone()?;
+    let mut child = std::process::Command::new(shell)
+        .args(["-l", "-c", "env -0"])
+        .stdout(std::process::Stdio::from(output_writer))
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+
+    let status = match poll_until(timeout, std::time::Duration::from_millis(20), || {
+        child.try_wait()
+    }) {
+        Ok(Some(status)) => status,
+        Ok(None) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(None);
+        }
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
+
+    output.seek(std::io::SeekFrom::Start(0))?;
+    let mut bytes = Vec::new();
+    output.read_to_end(&mut bytes)?;
+    Ok(Some((status, bytes)))
+}
+
 #[cfg(target_os = "macos")]
 pub(crate) fn sync_macos_launch_environment() {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-    let Ok(output) = std::process::Command::new(&shell)
-        .args(["-l", "-c", "env -0"])
-        .output()
-    else {
+    let Ok(output) = macos_login_environment(
+        std::ffi::OsStr::new(&shell),
+        std::time::Duration::from_secs(3),
+    ) else {
         return;
     };
-    if !output.status.success() {
+    let Some((status, stdout)) = output else {
+        tracing::warn!("timed out while reading the macOS login shell environment");
+        return;
+    };
+    if !status.success() {
         return;
     }
 
-    for entry in output.stdout.split(|b| *b == 0) {
+    for entry in stdout.split(|b| *b == 0) {
         if entry.is_empty() {
             continue;
         }
@@ -354,10 +415,11 @@ pub(crate) fn open_main_window_with_config(
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::Cell, time::Duration};
+
     use anyhow::anyhow;
 
-    use super::StartupConfig;
-    use crate::session::config::ConfigStore;
+    use super::{StartupConfig, poll_until};
 
     #[test]
     fn startup_config_failure_uses_non_persistent_mode_and_keeps_error() {
@@ -373,9 +435,31 @@ mod tests {
     }
 
     #[test]
-    fn startup_config_default_tmp_dir_does_not_require_loading_encrypted_config() {
-        let path = ConfigStore::default_tmp_dir().expect("resolve default temporary directory");
+    fn polling_returns_the_first_completed_value() {
+        let polls = Cell::new(0);
 
-        assert!(path.ends_with(std::path::Path::new("jshell").join("tmp")));
+        let result = poll_until(Duration::from_secs(1), Duration::ZERO, || {
+            let current = polls.get() + 1;
+            polls.set(current);
+            Ok::<_, std::convert::Infallible>((current == 3).then_some("ready"))
+        })
+        .unwrap();
+
+        assert_eq!(result, Some("ready"));
+        assert_eq!(polls.get(), 3);
+    }
+
+    #[test]
+    fn polling_stops_at_the_deadline() {
+        let polls = Cell::new(0);
+
+        let result = poll_until(Duration::ZERO, Duration::ZERO, || {
+            polls.set(polls.get() + 1);
+            Ok::<Option<()>, std::convert::Infallible>(None)
+        })
+        .unwrap();
+
+        assert_eq!(result, None);
+        assert_eq!(polls.get(), 1);
     }
 }

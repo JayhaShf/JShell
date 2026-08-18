@@ -22,15 +22,21 @@ makedepends=(
   'rust'
 )
 options=(!lto !debug)
-source=()
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('936683658faeaf7d1e087ad98ac6986027f7501705a411495b3375ef297c0b09')
+
+prepare() {
+  cd "$srcdir/JShell-$pkgver"
+  cargo fetch --locked
+}
 
 build() {
-  cd "$startdir/../.."
-  cargo build --locked --release
+  cd "$srcdir/JShell-$pkgver"
+  cargo build --frozen --release
 }
 
 package() {
-  cd "$startdir/../.."
+  cd "$srcdir/JShell-$pkgver"
 
   install -Dm755 target/release/jshell "$pkgdir/usr/bin/jshell"
   install -Dm644 assets/jshell.desktop \
@@ -39,4 +45,8 @@ package() {
     "$pkgdir/usr/share/icons/hicolor/256x256/apps/jshell.png"
   install -Dm644 LICENSE \
     "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 assets/fonts/OFL-1.1.txt \
+    "$pkgdir/usr/share/licenses/$pkgname/OFL-1.1.txt"
+  install -Dm644 assets/fonts/SOURCE.zh-CN.md \
+    "$pkgdir/usr/share/licenses/$pkgname/Noto-CJK-SOURCE.zh-CN.md"
 }

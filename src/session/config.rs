@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File},
-    io::Write as _,
+    io::{Read as _, Write as _},
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
 };
@@ -487,7 +487,7 @@ impl Default for ConfigFile {
     }
 }
 
-fn atomic_write_config(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn atomic_write_config(path: &Path, bytes: &[u8]) -> Result<()> {
     atomic_write_config_with(path, bytes, |staged, target| {
         staged
             .persist(target)
@@ -721,6 +721,35 @@ pub struct ConfigStore {
     master_key: MasterKey,
 }
 
+const MAX_CONFIG_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
+fn read_config_file(path: &Path) -> Result<Vec<u8>> {
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("failed to inspect configuration {}", path.display()))?;
+    if metadata.len() > MAX_CONFIG_FILE_BYTES {
+        bail!(
+            "configuration file {} exceeds the {} byte limit",
+            path.display(),
+            MAX_CONFIG_FILE_BYTES
+        );
+    }
+
+    let file = File::open(path)
+        .with_context(|| format!("failed to read configuration {}", path.display()))?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_CONFIG_FILE_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read configuration {}", path.display()))?;
+    if bytes.len() as u64 > MAX_CONFIG_FILE_BYTES {
+        bail!(
+            "configuration file {} exceeds the {} byte limit",
+            path.display(),
+            MAX_CONFIG_FILE_BYTES
+        );
+    }
+    Ok(bytes)
+}
+
 impl ConfigStore {
     pub fn load() -> Result<Self> {
         let path = Self::config_path()?;
@@ -773,7 +802,22 @@ impl ConfigStore {
 
             let tmp_dir = parent.join("tmp");
             let _ = fs::remove_dir_all(&tmp_dir);
-            let _ = fs::create_dir_all(&tmp_dir);
+            fs::create_dir_all(&tmp_dir).with_context(|| {
+                format!("failed to create config temp dir {}", tmp_dir.display())
+            })?;
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&tmp_dir, fs::Permissions::from_mode(0o700)).with_context(
+                    || {
+                        format!(
+                            "failed to set config temp dir permissions for {}",
+                            tmp_dir.display()
+                        )
+                    },
+                )?;
+            }
         }
 
         let source_path = if path.exists() {
@@ -786,8 +830,7 @@ impl ConfigStore {
         let migrated_config_location = source_path != path;
 
         let (mut cache, master_key, migrated_encryption) = if source_path.exists() {
-            let raw_bytes = fs::read(&source_path)
-                .with_context(|| format!("failed to read {}", source_path.display()))?;
+            let raw_bytes = read_config_file(&source_path)?;
             match config_format_version(&raw_bytes) {
                 Ok(2) => {
                     let key = key_provider
@@ -880,14 +923,6 @@ impl ConfigStore {
 
     pub fn is_persistent(&self) -> bool {
         !self.path.as_os_str().is_empty()
-    }
-
-    pub fn default_tmp_dir() -> Result<PathBuf> {
-        let config_path = Self::config_path()?;
-        let config_dir = config_path
-            .parent()
-            .context("configuration path has no parent directory")?;
-        Ok(config_dir.join("tmp"))
     }
 
     fn config_path() -> Result<PathBuf> {
@@ -1661,8 +1696,7 @@ impl ConfigStore {
             return Ok(());
         }
         let mut disk_config = if self.path.exists() {
-            let raw_bytes = fs::read(&self.path)
-                .with_context(|| format!("failed to read {}", self.path.display()))?;
+            let raw_bytes = read_config_file(&self.path)?;
             decrypt_config_v2(&raw_bytes, &self.master_key)
                 .with_context(|| format!("failed to decrypt {}", self.path.display()))?
         } else {
@@ -3712,8 +3746,8 @@ mod tests {
 
     #[test]
     fn config_store_encryption_first_run_creates_key_and_saves_v2() {
-        let path =
-            std::env::temp_dir().join(format!("jshell-config-first-run-{}.json", Uuid::new_v4()));
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("sessions.json");
         let provider = TestKeyProvider::default();
         let mut store = ConfigStore::load_with_key_provider(
             path.clone(),
@@ -3731,7 +3765,34 @@ mod tests {
         assert_eq!(config_format_version(&raw).unwrap(), 2);
         let key = provider.key.borrow().clone().unwrap();
         assert_eq!(decrypt_config_v2(&raw, &key).unwrap().ui_font_size, 18.0);
-        let _ = fs::remove_file(path);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            assert_eq!(
+                fs::metadata(root.path().join("tmp"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+    }
+
+    #[test]
+    fn config_file_reader_rejects_oversized_files_before_parsing() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("sessions.json");
+        let file = File::create(&path).unwrap();
+        file.set_len(MAX_CONFIG_FILE_BYTES + 1).unwrap();
+
+        let error = read_config_file(&path)
+            .expect_err("configuration files above the hard limit must be rejected");
+
+        assert!(error.to_string().contains("exceeds"));
+        assert!(error.to_string().contains(path.to_string_lossy().as_ref()));
     }
 
     #[test]

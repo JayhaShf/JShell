@@ -32,10 +32,12 @@ run_step "cargo clippy (-D warnings)" cargo clippy --locked --all-targets --all-
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
     run_step "cargo build --release" cargo build --locked --release
 fi
-if command -v cargo-audit >/dev/null 2>&1 || cargo audit --version >/dev/null 2>&1; then
-    run_step "cargo audit" cargo audit --file Cargo.lock
+if cargo audit --version >/dev/null 2>&1; then
+    run_step "cargo audit (-D warnings)" cargo audit --deny warnings --file Cargo.lock
 else
-    echo "==> cargo audit: SKIPPED (cargo-audit not installed)"
+    echo "==> cargo audit"
+    echo "    FAIL (cargo-audit is required; install cargo-audit before verification)"
+    failures=$((failures + 1))
 fi
 run_step "git diff --check" git diff --check
 

@@ -2,8 +2,8 @@
 
 - 适用版本：v1.0.0（及后续版本）
 - 测试依据：`README.md` 功能说明（需求基线）、`AUDIT_REPORT.md` 与 `docs/RELEASE_AUDIT_*.md`（历史审计与已知风险）、`docs/superpowers/specs/`（设计规格）
-- 自动化现状：368+ 项内联单测（`cargo test --bin jshell`）、CI 质量门禁（fmt / test / check / clippy `-D warnings` / cargo audit `--deny warnings`）
-- 执行工具：`scripts/verify.sh`（本地全量门禁）、`scripts/smoke-linux.sh`（Linux 冒烟）
+- 自动化现状：442 项内联单测（`cargo test --locked`）、CI 质量门禁（fmt / debug+原生平台 test / check / clippy `-D warnings` / cargo audit `--deny warnings`）
+- 执行工具：`scripts/verify.sh`（本地全量门禁）、`scripts/smoke-linux-keyring.sh` / `scripts/smoke-linux-fallback.sh`（Linux 安全存储双场景冒烟）
 - 本文档覆盖六类测试：功能、性能、兼容性、安全、回归、易用性。每类给出目标、用例清单（含自动化覆盖标注）、判定标准与执行频率。
 
 ---
@@ -51,6 +51,7 @@
 | F-024 | 目录归档解包：正常条目、`..` 穿越条目、符号链接逃逸 | 正常解包；穿越被跳过；逃逸被拒绝 | [A+] 4 项解包回归测试 |
 | F-025 | 静默断线检测与指数退避重连、手动重连、永久错误（认证/主机密钥）停止重试 | 状态图标与提示正确 | [A] `sftp_retry_policy`；[M] 断网演练 |
 | F-026 | 终端 CWD 跟随（关闭/实时/切标签时） | 按所选模式跟随目录 | [A] `cwd_follow.rs` 状态机 |
+| F-027 | SSH/SFTP 初始化超时和关闭取消 | 30s 内失败；关闭立即取消；初始化期命令保序 | [A+] setup deadline/cancel/order 测试 |
 
 ### 1.4 远程编辑器（`src/document/`）
 
@@ -77,8 +78,8 @@
 | 编号 | 用例 | 预期 | 覆盖 |
 |---|---|---|---|
 | F-050 | 关闭转托盘、托盘显示/退出、设置开关 | 状态保持、开关生效 | [M]；[A] `system_tray` 配置默认值 |
-| F-051 | 双实例：第二实例通知并立即退出 | 首实例保持运行 | [A] 逻辑测试；[M] `scripts/smoke-linux.sh` |
-| F-052 | SIGTERM/SIGINT 优雅退出（3s 内、退出码 0、配置落盘） | 完整退出流程含未保存提示 | [M] `scripts/smoke-linux.sh` |
+| F-051 | 双实例：第二实例通知并立即退出 | 首实例保持运行 | [A] 逻辑测试；[M] Linux keyring/fallback 双场景冒烟 |
+| F-052 | SIGTERM/SIGINT 优雅退出（3s 内、退出码 0、配置落盘） | 完整退出流程含未保存提示 | [M] Linux keyring/fallback 双场景冒烟 |
 | F-053 | 二次信号强制终止 | 处理器恢复默认处置 | [A] 审计修复复验 |
 
 ### 1.7 主题 / i18n / 键位 / 系统监控
@@ -128,8 +129,8 @@
 **专项**：
 - C-001 旧版 `ashell` 配置迁移：`~/.config/ashell/sessions.json` → 迁移后删除源（[A] 迁移测试）
 - C-002 配置前向兼容：未知字段/缺省字段以 serde 默认值加载不崩溃（[A] serde 默认测试）
-- C-003 已知平台风险回归（`AUDIT_REPORT.md` 第 5 节）：每发布至少复核一次
-- C-004 CI 四平台 release 构建通过（自动化）；平台矩阵当前只构建，建议后续补 `cargo test`（见 RELEASE_READINESS 优化项）
+- C-003 已知平台风险回归（`AUDIT_REPORT.md` 第 6、7 节）：每发布至少复核一次
+- C-004 CI 四平台 release 构建通过（自动化）；Windows/Linux/macOS aarch64 原生测试，macOS x86_64 交叉 `--no-run`，发布包额外校验许可证、签名/结构与架构
 
 **判定标准**：矩阵内无功能性阻塞；已知限制必须与文档一致。
 
@@ -140,7 +141,7 @@
 **目标**：无凭据泄露、无注入、无越权写入、依赖无漏洞。
 
 ### 4.1 自动化（CI 常驻）
-- `cargo audit --deny warnings`：0 漏洞；10 条「unmaintained」警告已按 `.cargo/audit.toml` 豁免（GTK3 托盘链，见注释与 `AUDIT_REPORT` 第 5 节）
+- `cargo audit --deny warnings`：无未豁免漏洞；9 条 `unmaintained` 与 1 条 `unsound` 已按 ID 记录并豁免。`RUSTSEC-2024-0429` 是 Linux GTK3/glib 残余风险，见 `.cargo/audit.toml` 与 `AUDIT_REPORT` 第 7 节
 - `cargo clippy -D warnings`、`cargo fmt --check` 常驻
 - 新增安全回归测试（本次）：
   - S-001 目录归档解包：tar/tar.gz `..` 条目跳过、符号链接逃逸拒绝、zip 正常解包 [A+]
@@ -165,9 +166,9 @@
 
 ## 5. 回归测试
 
-**目标**：改动不破坏既有行为；368+ 项单测为回归基底。
+**目标**：改动不破坏既有行为；442 项单测为回归基底。
 
-- **触发策略**：每次提交前本地跑 `scripts/verify.sh`；PR/推送由 CI 全量执行；发布前追加 `scripts/smoke-linux.sh`。
+- **触发策略**：每次提交前本地跑 `scripts/verify.sh`；PR/推送由 CI 全量执行；发布前追加 keyring 与 fallback 两种 Linux 冒烟。
 - **重点回归面**（历史缺陷多发区）：
   - 重连 stale 事件 generation 守卫（SSH/SFTP）
   - 断线后不重放破坏性 SFTP 命令（上传/下载/删除）
@@ -209,7 +210,7 @@
 |---|---|---|
 | 功能/回归（自动化） | 每次提交（CI）+ 本地 verify.sh | 内联单测 |
 | 安全（自动化） | 每次提交（CI） | audit/clippy + 安全回归测试 |
-| 冒烟（托盘/单实例/信号） | 每次发布前 | scripts/smoke-linux.sh |
+| 冒烟（托盘/单实例/信号/安全存储） | 每次发布前 | scripts/smoke-linux-keyring.sh + scripts/smoke-linux-fallback.sh |
 | 功能/易用性手工用例 | 每次发布前 | 本文档 1/6 节清单 |
 | 性能 | 发布前（P-001/002/004），大版本全量 | 本文档第 2 节规程 |
 | 兼容性矩阵 | 发布前（三平台），平台专项按需 | 本文档第 3 节矩阵 |

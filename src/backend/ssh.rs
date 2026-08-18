@@ -1,6 +1,9 @@
 use std::{
+    collections::VecDeque,
+    future::Future,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -24,6 +27,83 @@ use crate::{
     system::{SystemSnapshot, remote_snapshot_from_kv},
     terminal::{BackendCommand, BackendEvent, BackendTx},
 };
+
+const SSH_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
+const SSH_AUXILIARY_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_REMOTE_SYSTEM_BYTES: usize = 64 * 1024;
+
+#[derive(Debug)]
+enum SetupOutcome<T> {
+    Ready {
+        value: T,
+        pending: VecDeque<BackendCommand>,
+    },
+    Cancelled,
+}
+
+async fn await_setup_or_close<T>(
+    setup: impl Future<Output = Result<T>>,
+    commands: &mut mpsc::UnboundedReceiver<BackendCommand>,
+    timeout: Duration,
+) -> Result<SetupOutcome<T>> {
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(setup);
+    tokio::pin!(deadline);
+    let mut pending = VecDeque::new();
+
+    loop {
+        tokio::select! {
+            result = &mut setup => {
+                return result.map(|value| SetupOutcome::Ready { value, pending });
+            }
+            _ = &mut deadline => {
+                return Err(anyhow!("SSH setup timed out after {} seconds", timeout.as_secs()));
+            }
+            command = commands.recv() => {
+                match command {
+                    None | Some(BackendCommand::Close) => return Ok(SetupOutcome::Cancelled),
+                    Some(command) => pending.push_back(command),
+                }
+            }
+        }
+    }
+}
+
+async fn await_auxiliary_probe<T>(
+    label: &str,
+    probe: impl Future<Output = Result<T>>,
+    timeout: Duration,
+) -> Result<T> {
+    tokio::time::timeout(timeout, probe)
+        .await
+        .map_err(|_| anyhow!("{label} timed out"))?
+}
+
+fn append_bounded_probe_output(
+    output: &mut Vec<u8>,
+    data: &[u8],
+    limit: usize,
+    label: &str,
+) -> Result<()> {
+    if output.len().saturating_add(data.len()) > limit {
+        return Err(anyhow!("{label} exceeds size limit"));
+    }
+    output.extend_from_slice(data);
+    Ok(())
+}
+
+fn send_ssh_closed(
+    events: &std::sync::mpsc::Sender<BackendEvent>,
+    tab_id: &str,
+    generation: u32,
+    reason: impl Into<String>,
+) {
+    let _ = events.send(BackendEvent::Closed {
+        tab_id: tab_id.to_string(),
+        generation,
+        reason: reason.into(),
+    });
+}
 
 #[expect(
     clippy::too_many_arguments,
@@ -54,11 +134,7 @@ pub fn spawn_ssh_terminal(
         )
         .await
         {
-            let _ = events.send(BackendEvent::Closed {
-                tab_id: task_tab,
-                generation,
-                reason: format!("{err:#}"),
-            });
+            send_ssh_closed(&events, &task_tab, generation, format!("{err:#}"));
         }
     });
     BackendTx::Ssh(cmd_tx)
@@ -67,67 +143,88 @@ pub fn spawn_ssh_terminal(
 async fn sample_remote_system_with_handle(
     handle: Arc<tokio::sync::Mutex<russh::client::Handle<ClientHandler>>>,
 ) -> Result<SystemSnapshot> {
-    let mut channel = handle
-        .lock()
-        .await
-        .channel_open_session()
-        .await
-        .context("open metrics session")?;
-    channel
-        .exec(true, REMOTE_SYSTEM_PROBE)
-        .await
-        .context("exec remote metrics probe")?;
+    await_auxiliary_probe(
+        "remote metrics probe",
+        async {
+            let mut channel = handle
+                .lock()
+                .await
+                .channel_open_session()
+                .await
+                .context("open metrics session")?;
+            channel
+                .exec(true, REMOTE_SYSTEM_PROBE)
+                .await
+                .context("exec remote metrics probe")?;
 
-    let mut stdout = Vec::new();
-    while let Some(msg) = channel.wait().await {
-        match msg {
-            ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, ext: _ } => {
-                stdout.extend_from_slice(&data);
+            let mut stdout = Vec::new();
+            while let Some(msg) = channel.wait().await {
+                match msg {
+                    ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, ext: _ } => {
+                        append_bounded_probe_output(
+                            &mut stdout,
+                            &data,
+                            MAX_REMOTE_SYSTEM_BYTES,
+                            "remote metrics output",
+                        )?;
+                    }
+                    ChannelMsg::Close => break,
+                    _ => {}
+                }
             }
-            ChannelMsg::Close => break,
-            _ => {}
-        }
-    }
 
-    let output = String::from_utf8_lossy(&stdout);
-    remote_snapshot_from_kv(&output)
+            let output = String::from_utf8_lossy(&stdout);
+            remote_snapshot_from_kv(&output)
+        },
+        SSH_AUXILIARY_PROBE_TIMEOUT,
+    )
+    .await
 }
 
 async fn load_remote_command_history_with_handle(
     handle: Arc<tokio::sync::Mutex<russh::client::Handle<ClientHandler>>>,
 ) -> Result<Vec<String>> {
-    let mut channel = handle
-        .lock()
-        .await
-        .channel_open_session()
-        .await
-        .context("open command history session")?;
-    channel
-        .exec(true, REMOTE_COMMAND_HISTORY_PROBE)
-        .await
-        .context("exec remote command history probe")?;
+    await_auxiliary_probe(
+        "remote command history probe",
+        async {
+            let mut channel = handle
+                .lock()
+                .await
+                .channel_open_session()
+                .await
+                .context("open command history session")?;
+            channel
+                .exec(true, REMOTE_COMMAND_HISTORY_PROBE)
+                .await
+                .context("exec remote command history probe")?;
 
-    let mut stdout = Vec::new();
-    while let Some(msg) = channel.wait().await {
-        match msg {
-            ChannelMsg::Data { data } => {
-                if stdout.len().saturating_add(data.len()) > MAX_REMOTE_HISTORY_BYTES {
-                    return Err(anyhow!("remote command history exceeds size limit"));
+            let mut stdout = Vec::new();
+            while let Some(msg) = channel.wait().await {
+                match msg {
+                    ChannelMsg::Data { data } => {
+                        append_bounded_probe_output(
+                            &mut stdout,
+                            &data,
+                            MAX_REMOTE_HISTORY_BYTES,
+                            "remote command history",
+                        )?;
+                    }
+                    ChannelMsg::Close => break,
+                    _ => {}
                 }
-                stdout.extend_from_slice(&data);
             }
-            ChannelMsg::Close => break,
-            _ => {}
-        }
-    }
 
-    let output = String::from_utf8_lossy(&stdout);
-    if !output.starts_with(REMOTE_HISTORY_FORMAT_PREFIX) {
-        return Err(anyhow!(
-            "remote shell did not return a supported history format"
-        ));
-    }
-    Ok(parse_remote_command_history(&output))
+            let output = String::from_utf8_lossy(&stdout);
+            if !output.starts_with(REMOTE_HISTORY_FORMAT_PREFIX) {
+                return Err(anyhow!(
+                    "remote shell did not return a supported history format"
+                ));
+            }
+            Ok(parse_remote_command_history(&output))
+        },
+        SSH_AUXILIARY_PROBE_TIMEOUT,
+    )
+    .await
 }
 
 #[expect(
@@ -153,21 +250,31 @@ async fn run_ssh(
         ),
     });
 
-    let handle = Arc::new(tokio::sync::Mutex::new(
-        connect_and_authenticate(&tab_id, generation, &session, &proxy_config, &events).await?,
-    ));
-
-    let mut channel = handle
-        .lock()
-        .await
-        .channel_open_session()
-        .await
-        .context("open session")?;
-    channel
-        .request_pty(true, "xterm-256color", cols.into(), rows.into(), 0, 0, &[])
-        .await
-        .context("request pty")?;
-    channel.request_shell(true).await.context("request shell")?;
+    let setup = async {
+        let handle = Arc::new(tokio::sync::Mutex::new(
+            connect_and_authenticate(&tab_id, generation, &session, &proxy_config, &events).await?,
+        ));
+        let channel = handle
+            .lock()
+            .await
+            .channel_open_session()
+            .await
+            .context("open session")?;
+        channel
+            .request_pty(true, "xterm-256color", cols.into(), rows.into(), 0, 0, &[])
+            .await
+            .context("request pty")?;
+        channel.request_shell(true).await.context("request shell")?;
+        Ok::<_, anyhow::Error>((handle, channel))
+    };
+    let SetupOutcome::Ready {
+        value: (handle, mut channel),
+        mut pending,
+    } = await_setup_or_close(setup, &mut commands, SSH_SETUP_TIMEOUT).await?
+    else {
+        send_ssh_closed(&events, &tab_id, generation, "ssh session closed");
+        return Ok(());
+    };
 
     let _ = events.send(BackendEvent::Status {
         tab_id: tab_id.clone(),
@@ -181,10 +288,17 @@ async fn run_ssh(
 
     let exit_reason;
     let mut is_graceful_close = false;
+    let mut auxiliary_tasks = tokio::task::JoinSet::new();
 
     loop {
         tokio::select! {
-            command = commands.recv() => {
+            command = async {
+                if let Some(command) = pending.pop_front() {
+                    Some(command)
+                } else {
+                    commands.recv().await
+                }
+            } => {
                 match command {
                     Some(BackendCommand::Input(bytes)) => {
                         if let Err(err) = channel.data(bytes.as_slice()).await {
@@ -200,17 +314,19 @@ async fn run_ssh(
                         let handle_clone = handle.clone();
                         let tab_id_clone = tab_id.clone();
                         let events_clone = events.clone();
-                        tokio::spawn(async move {
+                        auxiliary_tasks.spawn(async move {
                             match sample_remote_system_with_handle(handle_clone).await {
                                 Ok(snapshot) => {
                                     let _ = events_clone.send(BackendEvent::RemoteSystem {
                                         tab_id: tab_id_clone,
+                                        generation,
                                         snapshot,
                                     });
                                 }
                                 Err(err) => {
                                     let _ = events_clone.send(BackendEvent::RemoteSystemUnavailable {
                                         tab_id: tab_id_clone,
+                                        generation,
                                         reason: format!("remote metrics unavailable: {err:#}"),
                                     });
                                 }
@@ -221,11 +337,12 @@ async fn run_ssh(
                         let handle_clone = handle.clone();
                         let tab_id_clone = tab_id.clone();
                         let events_clone = events.clone();
-                        tokio::spawn(async move {
+                        auxiliary_tasks.spawn(async move {
                             match load_remote_command_history_with_handle(handle_clone).await {
                                 Ok(entries) => {
                                     let _ = events_clone.send(BackendEvent::CommandHistory {
                                         tab_id: tab_id_clone,
+                                        generation,
                                         entries,
                                     });
                                 }
@@ -233,6 +350,7 @@ async fn run_ssh(
                                     let _ = events_clone.send(
                                         BackendEvent::CommandHistoryUnavailable {
                                             tab_id: tab_id_clone,
+                                            generation,
                                             reason: format!("remote command history unavailable: {err:#}"),
                                         },
                                     );
@@ -246,6 +364,11 @@ async fn run_ssh(
                         exit_reason = "ssh session closed".to_string();
                         break;
                     }
+                }
+            }
+            auxiliary = auxiliary_tasks.join_next(), if !auxiliary_tasks.is_empty() => {
+                if let Some(Err(error)) = auxiliary {
+                    tracing::debug!("[ssh] auxiliary probe task stopped: {error}");
                 }
             }
             msg = channel.wait() => {
@@ -286,16 +409,15 @@ async fn run_ssh(
         }
     }
 
+    auxiliary_tasks.abort_all();
+    while auxiliary_tasks.join_next().await.is_some() {}
+
     let _ = handle
         .lock()
         .await
         .disconnect(Disconnect::ByApplication, "bye", "")
         .await;
-    let _ = events.send(BackendEvent::Closed {
-        tab_id,
-        generation,
-        reason: exit_reason,
-    });
+    send_ssh_closed(&events, &tab_id, generation, exit_reason);
     Ok(())
 }
 
@@ -822,13 +944,95 @@ impl Handler for ClientHandler {
 
 #[cfg(test)]
 mod command_history_tests {
-    use super::{ClientHandler, parse_remote_command_history};
+    use super::{
+        ClientHandler, SetupOutcome, append_bounded_probe_output, await_auxiliary_probe,
+        await_setup_or_close, parse_remote_command_history, send_ssh_closed,
+    };
     use crate::session::host_keys::HostKeyError;
+    use crate::terminal::{BackendCommand, BackendEvent};
 
     const TEST_HOST_KEY: &str =
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ";
     const CHANGED_HOST_KEY: &str =
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA6rWI3G1sz07DnfFlrouTcysQlj2P+jpNSOEWD9OJ3X";
+
+    #[tokio::test]
+    async fn close_cancels_ssh_setup_before_handshake_finishes() {
+        let (commands, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        commands.send(BackendCommand::Close).unwrap();
+
+        let outcome = await_setup_or_close(
+            std::future::pending::<anyhow::Result<()>>(),
+            &mut receiver,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, SetupOutcome::Cancelled));
+    }
+
+    #[test]
+    fn cancelled_setup_emits_one_closed_event() {
+        let (events, receiver) = std::sync::mpsc::channel();
+        send_ssh_closed(&events, "tab-1", 7, "ssh session closed");
+
+        match receiver.recv().expect("closed event") {
+            BackendEvent::Closed {
+                tab_id,
+                generation,
+                reason,
+            } => {
+                assert_eq!(tab_id, "tab-1");
+                assert_eq!(generation, 7);
+                assert_eq!(reason, "ssh session closed");
+            }
+            event => panic!("expected closed event, got {event:?}"),
+        }
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn ssh_setup_has_a_deadline() {
+        let (_commands, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let result = await_setup_or_close(
+            std::future::pending::<anyhow::Result<()>>(),
+            &mut receiver,
+            std::time::Duration::from_millis(10),
+        )
+        .await;
+        let Err(error) = result else {
+            panic!("pending setup must time out");
+        };
+
+        assert!(error.to_string().contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn auxiliary_ssh_probes_have_a_deadline() {
+        let result = await_auxiliary_probe(
+            "test probe",
+            std::future::pending::<anyhow::Result<()>>(),
+            std::time::Duration::from_millis(10),
+        )
+        .await;
+
+        let error = result.expect_err("pending probe must time out");
+        assert!(error.to_string().contains("test probe timed out"));
+    }
+
+    #[test]
+    fn auxiliary_ssh_probe_output_is_bounded() {
+        let mut output = b"1234".to_vec();
+        append_bounded_probe_output(&mut output, b"56", 6, "test output")
+            .expect("output exactly at the limit is accepted");
+        assert_eq!(output, b"123456");
+
+        let error = append_bounded_probe_output(&mut output, b"7", 6, "test output")
+            .expect_err("output beyond the limit must be rejected");
+        assert!(error.to_string().contains("test output exceeds size limit"));
+        assert_eq!(output, b"123456");
+    }
 
     #[tokio::test]
     async fn client_handler_accepts_and_records_new_host_key() {

@@ -32,6 +32,10 @@ Prebuilt archives are published on [GitHub Releases](https://github.com/JayhaShf
 - `jshell-<version>-macos-aarch64.zip`
 - `jshell-<version>-macos-x86_64.zip`
 
+The prebuilt Linux archive targets Ubuntu 22.04 compatibility and requires glibc 2.35 or newer together with the GTK 3, Ayatana AppIndicator 3, XCB, xkbcommon/xkbcommon-x11, Wayland, and OpenGL runtime libraries. Package names vary by distribution; build from source on systems below that glibc baseline.
+
+Every release archive includes the project GPL-3.0-or-later license, the OFL-1.1 license for the embedded Noto CJK fonts, and the font source notice.
+
 The macOS bundle is ad-hoc signed. After verifying the download source, remove quarantine if macOS blocks the first launch:
 
 ```bash
@@ -44,7 +48,7 @@ The default configuration file is `~/.config/jshell/sessions.json`. JShell migra
 
 ## Development
 
-Rust `1.89.0` or newer is required.
+Rust `1.92.0` or newer is required.
 
 ```bash
 cargo run --locked
@@ -61,9 +65,11 @@ cargo test --locked --quiet
 cargo check --locked --all-targets
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo build --locked --release
-cargo audit
+cargo audit --deny warnings --file Cargo.lock
 git diff --check
 ```
+
+You can run the same local gate with `./scripts/verify.sh`. It requires `cargo-audit` and fails when that tool is unavailable.
 
 ## License
 

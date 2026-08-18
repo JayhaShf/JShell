@@ -1,6 +1,10 @@
 use crate::session::config::Session;
 use crate::terminal::{BackendCommand, BackendEvent};
 use std::io::{Read, Write};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 /// Spawn the serial port backend threads.
 /// Returns a sender to send commands (like keyboard inputs) to the serial port.
@@ -72,6 +76,8 @@ pub fn spawn_serial_client(
             }
         };
 
+        let stop = Arc::new(AtomicBool::new(false));
+
         // Notify connected
         let _ = events_tx_clone.send(BackendEvent::Connected {
             tab_id: tab_id_clone.clone(),
@@ -81,6 +87,7 @@ pub fn spawn_serial_client(
         // Spawn write thread
         let tab_id_write = tab_id_clone.clone();
         let events_tx_write = events_tx_clone.clone();
+        let write_stop = Arc::clone(&stop);
         std::thread::spawn(move || {
             while let Some(cmd) = cmd_rx.blocking_recv() {
                 match cmd {
@@ -100,12 +107,16 @@ pub fn spawn_serial_client(
                     _ => {}
                 }
             }
+            write_stop.store(true, Ordering::Release);
         });
 
         // Read loop in current thread
         let mut buf = [0u8; 1024];
         let mut last_was_cr = false;
         loop {
+            if stop.load(Ordering::Acquire) {
+                break;
+            }
             match port.read(&mut buf) {
                 Ok(n) if n > 0 => {
                     let mut processed = Vec::with_capacity(n * 2);
@@ -227,5 +238,9 @@ mod tests {
 
         // 5. Clean up
         cmd_tx.send(BackendCommand::Close).unwrap();
+        assert!(matches!(
+            events_rx.recv_timeout(std::time::Duration::from_secs(2)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+        ));
     }
 }

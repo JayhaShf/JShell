@@ -35,7 +35,7 @@ use crate::{
         terminal_tab_status, workspace_tab_accessibility_label, workspace_tab_color_role,
         workspace_tab_keyboard_action,
     },
-    sftp::ops::{SftpEntryAction, SftpEntryGesture, is_editable_text_file, sftp_entry_action},
+    sftp::ops::{SftpEntryAction, SftpEntryGesture, sftp_entry_action},
     sftp::{
         format_mtime,
         permissions::{RemoteFileType, format_permissions},
@@ -3801,25 +3801,6 @@ impl Render for Ashell {
                                                     )),
                                             )
                                         })
-                                        .when(
-                                            !menu.is_dir
-                                                && is_editable_text_file(&menu.remote_path),
-                                            |this| {
-                                                this.child(
-                                                    Button::new("sftp-context-edit")
-                                                        .ghost()
-                                                        .w_full()
-                                                        .justify_start()
-                                                        .label(t!("edit_file"))
-                                                        .tooltip(
-                                                            t!("edit_file_tooltip").to_string(),
-                                                        )
-                                                        .on_click(cx.listener(|this, _, _, cx| {
-                                                            this.trigger_sftp_context_edit(cx);
-                                                        })),
-                                                )
-                                            },
-                                        )
                                         .child(
                                             Button::new("sftp-context-delete")
                                                 .ghost()

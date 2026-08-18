@@ -10,7 +10,7 @@
 | 优先级 | 编号 | 发现 | 处置与状态 |
 |---|---|---|---|
 | P0 | R-001 | tar/tar.gz 目录归档解包疑似路径穿越（`sftp/mod.rs`） | **已核实为 crate 层防护**：`tar` 0.4.46 `unpack_in` 跳过 `..` 条目并经 canonicalize 拒绝符号链接逃逸；zip 分支有 `enclosed_name()`。本次以 4 项回归测试锁定行为 + 函数注释说明，防止未来重构破坏。✅ 已闭环 |
-| P0 | R-002 | CI `cargo audit --deny warnings` 因 10 条「unmaintained」告警红灯（8× GTK3 链 + `paste` + `proc-macro-error`），无豁免配置 | ✅ 新增 `.cargo/audit.toml` 按 ID 豁免并注明理由（Linux 专用托盘链，见 AUDIT_REPORT 第 5 节）；`--deny warnings` 本地复验通过 |
+| P0 | R-002 | CI `cargo audit --deny warnings` 因依赖告警红灯，无逐项风险记录 | ✅ `.cargo/audit.toml` 精确记录并豁免 9 条 `unmaintained` 与 1 条 `unsound`；`RUSTSEC-2024-0429` 作为 Linux GTK3/glib 残余风险保留，见 AUDIT_REPORT 第 7 节；本地 `--deny warnings` 通过 |
 | P1 | R-003 | i18n 缺键：`confirm` 在 zh-CN 存在、en.yml 缺失（en 为 fallback，英文界面会显示键名） | ✅ en.yml 补 `confirm: "Confirm"`，新增 locale 键对齐测试防复发 |
 | P1 | R-004 | TOFU 主机密钥首次自动接受、无用户确认弹窗（设计文档已记录该取舍） | ⏳ 保留现状；v1.0 安全评审项（TEST_PLAN S-010），后续版本评估"提示确认"设置项 |
 | P1 | R-005 | v1 配置加密硬件 UUID 检测失败的兜底常量公开可知（`session/config.rs`） | ⏳ 仅限旧版 v1 迁移路径；建议后续 fail-closed 或告警，本次不动（避免迁移兼容风险） |
@@ -22,7 +22,7 @@
 
 | 编号 | 建议 | 说明 |
 |---|---|---|
-| O-001 | CI 平台矩阵补 `cargo test` | 现四平台只构建；单测多为纯逻辑，低成本发现平台差异（host_keys 权限、single_instance） |
+| O-001 | macOS Intel 实机测试 | CI 已在 Windows/Linux/macOS aarch64 原生运行测试，macOS x86_64 受 runner 架构限制只做 `cargo test --no-run`，发布前宜补 Intel 实机运行 |
 | O-002 | llvm-cov 覆盖率接入 quality job + 下限阈值 | 防回归；当前无任何覆盖率度量 |
 | O-003 | 高亮引擎性能 | `terminal/highlight.rs` 每帧正则：建议行级结果缓存/预编译；`render_snapshot` 评估 scrollback 上限；先按 TEST_PLAN 第 2 节实测再优化 |
 | O-004 | cargo-deny 许可证合规 | GPL-3.0 项目依赖多，补 license 检查 |
@@ -64,7 +64,7 @@ TOFU 确认弹窗（R-004）、v1 兜底密钥加固（R-005）、WM_ENDSESSION�
 1. 版本升级：`Cargo.toml` → `1.0.0`，同步 `Cargo.lock`；`packaging/arch/PKGBUILD` `pkgver=1.0.0`、`pkgrel=1` ✅
 2. README.md / README.en.md 版本引用 → v1.0.0（历史审计文档保留原版本号）✅
 3. 撰写 `.github/release-notes/v1.0.0.zh-CN.md`（发布必需）✅
-4. `scripts/verify.sh` 全量门禁 + `scripts/smoke-linux.sh` 冒烟 ✅（全绿；冒烟 9/9）
+4. `scripts/verify.sh` 全量门禁 + Linux keyring/fallback 双场景冒烟 ✅（2026-08-19：Debug/release 各 442/442；两种冒烟各 11/11）
 5. 提交 → push `main` → CI 绿 ✅（PR #1：质量门禁 + 四平台构建全绿）
 6. tag `v1.0.0` 并 push（无 `-`，`release.yml` 自动发布为正式版 latest；tag 与 Cargo 版本一致性由 workflow 校验）✅（2026-08-13 发布成功）
 7. 发布后核查：Release 页非 prerelease、四平台产物齐全、PKGBUILD 版本一致 ✅（v1.0.0 为 latest 正式版；windows/linux/macos×2 四个产物齐全；PKGBUILD pkgver=1.0.0）
