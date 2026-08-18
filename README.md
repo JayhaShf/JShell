@@ -83,7 +83,7 @@ C:\Users\<用户名>\.config\jshell\sessions.json
 
 ## 开发与构建
 
-要求 Rust `1.92.0` 或更高版本，以及目标平台所需的 GPUI 系统依赖。
+要求 Rust `1.95.0` 或更高版本，以及目标平台所需的 GPUI 系统依赖。
 
 ```bash
 cargo run --locked

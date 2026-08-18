@@ -109,7 +109,7 @@
 | macOS aarch64 | `macos-15` 原生 test/build；bundle/plist/codesign/license/lipo；启动及 SIGTERM 5 秒退出码 0 | 工作流已静态校验；需以推送后的 Apple Silicon runner 结果为准 |
 | macOS x86_64 | `macos-15` 上交叉 `cargo test --no-run` + build；bundle/codesign/license/lipo | 不能在 aarch64 runner 执行 x86_64 测试；需在 Intel 机器补实机运行 |
 
-声明的 MSRV 为 Rust 1.92.0，CI 有独立 Ubuntu 22.04 MSRV `cargo check --all-targets` job；当前主机没有 rustup，因此本地未重复安装 1.92.0。
+声明的 MSRV 为 Rust 1.95.0。当前 pinned GPUI revision 同时使用 `slice::as_array` 和 `std::hint::cold_path`；前者在 Rust 1.93.0 稳定，后者在 Rust 1.95.0 稳定，因此项目最低版本为 Rust 1.95.0。CI 通过独立 Ubuntu 22.04 MSRV `cargo check --all-targets` job 固定验证此最低版本。当前主机没有 rustup，因此未在本地重复安装 1.95.0。
 
 ## 7. 依赖安全与残余风险
 

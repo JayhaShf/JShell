@@ -5,7 +5,7 @@ edition = "2024"
 authors = ["JShell contributors"]
 description = "A cross-platform SSH, SFTP, serial, and local terminal workspace"
 license = "GPL-3.0-or-later"
-rust-version = "1.92.0"
+rust-version = "1.95.0"
 
 [dependencies]
 anyhow = "1"

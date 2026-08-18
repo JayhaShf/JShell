@@ -48,7 +48,7 @@ The default configuration file is `~/.config/jshell/sessions.json`. JShell migra
 
 ## Development
 
-Rust `1.92.0` or newer is required.
+Rust `1.95.0` or newer is required.
 
 ```bash
 cargo run --locked
