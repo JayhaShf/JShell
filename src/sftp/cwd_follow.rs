@@ -456,11 +456,10 @@ impl Ashell {
         sync_active_path: bool,
     ) {
         match action {
-            Some(CwdFollowAction::AlreadyCurrent(path)) => {
-                if sync_active_path {
-                    self.pending_sftp_path_sync = Some(path);
-                }
+            Some(CwdFollowAction::AlreadyCurrent(path)) if sync_active_path => {
+                self.pending_sftp_path_sync = Some(path);
             }
+            Some(CwdFollowAction::AlreadyCurrent(_)) => {}
             Some(CwdFollowAction::Dispatch(dispatch)) => {
                 self.dispatch_sftp_cwd_follow(dispatch);
             }
