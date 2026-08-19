@@ -15,7 +15,7 @@
 - Debug 与 release 两套测试各 442 项全部通过，Clippy 在 `-D warnings` 下通过。
 - Linux 安全存储可用和不可用两种真实启动冒烟均通过；双实例、SIGTERM、SIGINT、配置持久化/禁止持久化和残留进程均已验证。
 - 依赖审计无未豁免漏洞。锁文件仍有 9 条 `unmaintained` 和 1 条 `unsound` 告警，均逐项记录在 `.cargo/audit.toml`；其中 `RUSTSEC-2024-0429` 是不能表述为“无内存安全风险”的 Linux GTK3/glib 残余风险。
-- Windows/macOS 最终行为不能由当前 Linux 主机宣称已实机通过；工作流已配置原生测试、构建和打包验证，必须以本次变更推送后的 GitHub Actions 结果为准。
+- 提交 `2e36846` 对应的 GitHub Actions run `32201408633` 全部通过：质量门、Rust 1.95 MSRV、Linux x86_64、Windows x86_64、macOS aarch64 和 macOS x86_64 交叉构建均成功；其中 Linux 原生测试 442/442、Windows 原生测试 441/441、macOS aarch64 原生测试 441/441。
 
 ## 2. 审计范围与方法
 
@@ -105,9 +105,9 @@
 | 平台 | 自动化策略 | 本轮本地结论 |
 |---|---|---|
 | Linux x86_64 | Ubuntu 22.04 原生 test/build；Xvfb 下 keyring/fallback 冒烟；appindicator runtime；release 包许可证检查 | 当前主机已实际通过两种 GUI 冒烟和完整 Rust 门禁 |
-| Windows x86_64 | 原生 `cargo test` + release build；解包、许可证和 5 秒启动存活检查 | 工作流已静态校验；需以推送后的 Windows runner 结果为准 |
-| macOS aarch64 | `macos-15` 原生 test/build；bundle/plist/codesign/license/lipo；启动及 SIGTERM 5 秒退出码 0 | 工作流已静态校验；需以推送后的 Apple Silicon runner 结果为准 |
-| macOS x86_64 | `macos-15` 上交叉 `cargo test --no-run` + build；bundle/codesign/license/lipo | 不能在 aarch64 runner 执行 x86_64 测试；需在 Intel 机器补实机运行 |
+| Windows x86_64 | 原生 `cargo test` + release build；发布工作流另行执行解包、许可证和 5 秒启动存活检查 | CI run `32201408633` 原生测试 441/441、release build 通过 |
+| macOS aarch64 | `macos-15` 原生 test/build；发布工作流另行执行 bundle/plist/codesign/license/lipo、启动及 SIGTERM 检查 | CI run `32201408633` 原生测试 441/441、release build 通过 |
+| macOS x86_64 | `macos-15` 上交叉 `cargo test --no-run` + build；发布工作流另行执行 bundle/codesign/license/lipo | CI run `32201408633` 交叉测试编译和 release build 通过；未执行 x86_64 原生测试，Intel 实机运行仍是发布前边界 |
 
 声明的 MSRV 为 Rust 1.95.0。当前 pinned GPUI revision 同时使用 `slice::as_array` 和 `std::hint::cold_path`；前者在 Rust 1.93.0 稳定，后者在 Rust 1.95.0 稳定，因此项目最低版本为 Rust 1.95.0。CI 通过独立 Ubuntu 22.04 MSRV `cargo check --all-targets` job 固定验证此最低版本。当前主机没有 rustup，因此未在本地重复安装 1.95.0。
 
@@ -130,9 +130,9 @@
 
 ## 8. 发布判定
 
-当前 Linux 可验证范围内，代码、逻辑、安全审计和功能冒烟均通过。发布前仍必须满足：
+当前 Linux 本地验证和四平台 CI 门禁均通过。发布前仍必须满足：
 
-1. 推送当前工作树并确认最新 GitHub Actions 的 quality、MSRV、Windows、Linux、macOS aarch64/x86_64 全部通过。
+1. 已完成：推送提交 `2e36846` 并确认 GitHub Actions run `32201408633` 的 quality、MSRV、Windows、Linux、macOS aarch64/x86_64 全部通过。
 2. 在非生产 SSH/SFTP 主机执行连接、权限、上传/下载、删除、静默断线重连和远程编辑冲突测试。
 3. 有测试凭据时执行真实 WebDAV/S3/R2 条件覆盖与冲突测试。
 4. 明确接受第 7 节 TOFU、glib unsound、签名/公证和平台 UI 限制后再发布。
