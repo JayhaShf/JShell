@@ -3,8 +3,9 @@ use gpui::{App, Context, Font, Hsla, Rgba, SharedString, TextRun, Window, black,
 use gpui_component::{ActiveTheme as _, Theme, ThemeMode, ThemeRegistry};
 
 use crate::{
-    Ashell, app::constants::terminal_cell_width_from_measurement,
-    session::config::SYSTEM_MONOSPACE_FONT,
+    Ashell,
+    app::constants::terminal_cell_width_from_measurement,
+    session::config::{ConfigStore, SYSTEM_MONOSPACE_FONT},
 };
 
 pub(crate) const JSHELL_LIGHT_THEME: &str = "JShell Light";
@@ -105,6 +106,72 @@ pub(crate) fn measure_terminal_cell_width(
     );
     let measured = shaped.width().as_f32() / SAMPLE.len() as f32;
     terminal_cell_width_from_measurement(measured, font_size)
+}
+
+pub(crate) fn configured_theme_mode(mode: &str) -> ThemeMode {
+    match mode {
+        "dark" => ThemeMode::Dark,
+        _ => ThemeMode::Light,
+    }
+}
+
+/// Install the application theme definitions before a window is created.
+///
+/// GPUI Component starts with its built-in light theme. Installing the
+/// persisted definitions first prevents a newly created window from briefly
+/// using that default palette while `Ashell` is being constructed.
+fn install_theme_preferences(
+    light_theme_name: &str,
+    dark_theme_name: &str,
+    ui_font_size: f32,
+    ui_font_family: &str,
+    terminal_font_family: &str,
+    cx: &mut App,
+) -> (SharedString, SharedString) {
+    let light_name: SharedString = validated_theme_name(light_theme_name, false).into();
+    let dark_name: SharedString = validated_theme_name(dark_theme_name, true).into();
+    let (light_theme, dark_theme) = {
+        let themes = ThemeRegistry::global(cx).themes();
+        let light_theme = themes
+            .get(&light_name)
+            .cloned()
+            .expect("JShell Light theme must be registered");
+        let dark_theme = themes
+            .get(&dark_name)
+            .cloned()
+            .expect("JShell Dark theme must be registered");
+        (light_theme, dark_theme)
+    };
+
+    let theme = Theme::global_mut(cx);
+    theme.light_theme = light_theme;
+    theme.dark_theme = dark_theme;
+    theme.font_size = px(ui_font_size);
+    set_theme_font_names(theme, ui_font_family, terminal_font_family);
+
+    (light_name, dark_name)
+}
+
+/// Prepare the persisted theme before `App::open_window` exposes a native
+/// window. System-following mode is intentionally resolved later from the
+/// window's concrete appearance, which is more reliable on Linux than the
+/// application-wide appearance during platform startup.
+pub(crate) fn prepare_startup_theme(config: &ConfigStore, cx: &mut App) {
+    let installed_fonts = cx.text_system().all_font_names();
+    let terminal_font_family =
+        resolve_terminal_font_family(config.terminal_font_family(), &installed_fonts);
+    install_theme_preferences(
+        config.light_theme_name(),
+        config.dark_theme_name(),
+        config.ui_font_size(),
+        config.ui_font_family(),
+        &terminal_font_family,
+        cx,
+    );
+
+    if !config.follow_system_theme() {
+        Theme::change(configured_theme_mode(config.theme_mode()), None, cx);
+    }
 }
 
 pub(crate) fn load_fonts(cx: &mut App) -> Result<()> {
@@ -294,23 +361,16 @@ impl Ashell {
     }
 
     pub(crate) fn apply_theme_preferences(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.light_theme_name = validated_theme_name(&self.light_theme_name, false).into();
-        self.dark_theme_name = validated_theme_name(&self.dark_theme_name, true).into();
-        let light_theme = ThemeRegistry::global(cx)
-            .themes()
-            .get(&self.light_theme_name)
-            .cloned()
-            .expect("JShell Light theme must be registered");
-        let dark_theme = ThemeRegistry::global(cx)
-            .themes()
-            .get(&self.dark_theme_name)
-            .cloned()
-            .expect("JShell Dark theme must be registered");
-        let theme = Theme::global_mut(cx);
-        theme.light_theme = light_theme;
-        theme.dark_theme = dark_theme;
-        theme.font_size = px(self.ui_font_size);
-        set_theme_font_names(theme, &self.ui_font_family, &self.terminal_font_family);
+        let (light_theme_name, dark_theme_name) = install_theme_preferences(
+            &self.light_theme_name,
+            &self.dark_theme_name,
+            self.ui_font_size,
+            &self.ui_font_family,
+            &self.terminal_font_family,
+            cx,
+        );
+        self.light_theme_name = light_theme_name;
+        self.dark_theme_name = dark_theme_name;
 
         if self.follow_system_theme {
             Theme::sync_system_appearance(Some(window), cx);
@@ -337,6 +397,14 @@ impl Ashell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_theme_mode_defaults_invalid_values_to_light() {
+        assert_eq!(configured_theme_mode("light"), ThemeMode::Light);
+        assert_eq!(configured_theme_mode("dark"), ThemeMode::Dark);
+        assert_eq!(configured_theme_mode(""), ThemeMode::Light);
+        assert_eq!(configured_theme_mode("unexpected"), ThemeMode::Light);
+    }
 
     #[test]
     fn allowed_theme_names_are_the_only_selectable_themes() {

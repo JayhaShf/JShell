@@ -313,6 +313,8 @@ pub(crate) fn open_main_window_with_config(
         window_options.icon = Some(std::sync::Arc::new(img.into_rgba8()));
     }
 
+    crate::app::theme::prepare_startup_theme(config, cx);
+
     if let Some(bounds) = config.window_bounds() {
         window_options.window_bounds = Some(match bounds {
             crate::session::config::SavedWindowBounds::Fullscreen {
@@ -364,7 +366,10 @@ pub(crate) fn open_main_window_with_config(
     cx.open_window(window_options, move |window, cx| {
         window.activate_window();
         window.set_window_title("JShell");
-        gpui_component::Theme::sync_system_appearance(Some(window), cx);
+        // `Ashell::new` applies the persisted theme after installing the
+        // application-specific light/dark theme definitions. Applying the
+        // system theme here first would briefly expose GPUI Component's
+        // default light theme during startup.
         let view =
             cx.new(|cx| Ashell::new(window, cx, startup_config, instance_events, signal_events));
 
