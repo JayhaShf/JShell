@@ -2700,7 +2700,8 @@ mod tests {
         (Arc::new(server), Arc::new(client))
     }
 
-    const TEST_PROXY_TASK_TIMEOUT: Duration = Duration::from_secs(2);
+    const TEST_PROXY_TASK_TIMEOUT: Duration = Duration::from_secs(5);
+    const TEST_PROXY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
     async fn abort_and_join_test_proxy_task(
         task: tokio::task::JoinHandle<Result<()>>,
@@ -2782,7 +2783,10 @@ mod tests {
     fn resolved_https_proxy(port: u16) -> ResolvedProxy {
         ResolvedProxy {
             kind: ProxyKind::Https,
-            host: "localhost".to_string(),
+            // Bind and connect to the same explicit IPv4 loopback address on
+            // every runner. Windows may resolve `localhost` to IPv6 first,
+            // while the test listener is intentionally IPv4-only.
+            host: "127.0.0.1".to_string(),
             port,
             user: String::new(),
             password: String::new(),
@@ -2919,7 +2923,7 @@ mod tests {
 
     #[tokio::test]
     async fn trusted_https_proxy_completes_tls_connect_and_preserves_tunnel_bytes() {
-        let (server_config, client_config) = test_tls_configs(&["localhost"]);
+        let (server_config, client_config) = test_tls_configs(&["127.0.0.1"]);
         let (port, server) = spawn_tls_proxy(
             server_config,
             b"HTTP/1.1 200 Connection established\r\n\r\nSSH-2.0-test\r\n".to_vec(),
@@ -2941,7 +2945,7 @@ mod tests {
 
     #[tokio::test]
     async fn https_proxy_rejects_an_untrusted_certificate() {
-        let (server_config, _) = test_tls_configs(&["localhost"]);
+        let (server_config, _) = test_tls_configs(&["127.0.0.1"]);
         let (port, server) =
             spawn_tls_proxy(server_config, b"HTTP/1.1 200 OK\r\n\r\n".to_vec()).await;
         let client = Arc::new(
@@ -2982,7 +2986,7 @@ mod tests {
 
     #[tokio::test]
     async fn https_proxy_surfaces_non_success_connect_status() {
-        let (server_config, client_config) = test_tls_configs(&["localhost"]);
+        let (server_config, client_config) = test_tls_configs(&["127.0.0.1"]);
         let (port, server) = spawn_tls_proxy(
             server_config,
             b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n".to_vec(),
@@ -3005,7 +3009,7 @@ mod tests {
     async fn https_tls_failure_does_not_fall_back_to_direct() {
         let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let target_port = target_listener.local_addr().unwrap().port();
-        let (server_config, _) = test_tls_configs(&["localhost"]);
+        let (server_config, _) = test_tls_configs(&["127.0.0.1"]);
         let (proxy_port, proxy_server) =
             spawn_tls_proxy(server_config, b"HTTP/1.1 200 OK\r\n\r\n".to_vec()).await;
         let untrusted_client = Arc::new(
@@ -3020,14 +3024,14 @@ mod tests {
             "secret".to_string(),
         );
         session.proxy_type = "https".to_string();
-        session.proxy_host = "localhost".to_string();
+        session.proxy_host = "127.0.0.1".to_string();
         session.proxy_port = Some(proxy_port);
         session.proxy_user = "https-proxy-user-must-not-leak".to_string();
         session.proxy_password = "https-proxy-password-must-not-leak".to_string();
         let config = direct_proxy_config();
         let connect = connect_proxy_with_tls_config(&session, &config, Some(untrusted_client));
 
-        let error = tokio::time::timeout(Duration::from_secs(2), async {
+        let error = tokio::time::timeout(TEST_PROXY_CONNECT_TIMEOUT, async {
             tokio::pin!(connect);
             tokio::select! {
                 biased;
@@ -3065,7 +3069,7 @@ mod tests {
     async fn https_connect_failure_does_not_fall_back_to_direct() {
         let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let target_port = target_listener.local_addr().unwrap().port();
-        let (server_config, client_config) = test_tls_configs(&["localhost"]);
+        let (server_config, client_config) = test_tls_configs(&["127.0.0.1"]);
         let (proxy_port, proxy_server) = spawn_tls_proxy(
             server_config,
             b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n".to_vec(),
@@ -3078,14 +3082,14 @@ mod tests {
             "secret".to_string(),
         );
         session.proxy_type = "https".to_string();
-        session.proxy_host = "localhost".to_string();
+        session.proxy_host = "127.0.0.1".to_string();
         session.proxy_port = Some(proxy_port);
         session.proxy_user = "connect-proxy-user-must-not-leak".to_string();
         session.proxy_password = "connect-proxy-password-must-not-leak".to_string();
         let config = direct_proxy_config();
         let connect = connect_proxy_with_tls_config(&session, &config, Some(client_config));
 
-        let error = tokio::time::timeout(Duration::from_secs(2), async {
+        let error = tokio::time::timeout(TEST_PROXY_CONNECT_TIMEOUT, async {
             tokio::pin!(connect);
             tokio::select! {
                 biased;

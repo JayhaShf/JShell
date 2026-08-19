@@ -230,10 +230,21 @@ fn read_exact_until<R: Read>(
         ensure_before_deadline(deadline)?;
         match reader.read(buffer) {
             Ok(0) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "single instance peer closed during handshake",
-                ));
+                // Windows named pipes in `PIPE_NOWAIT` mode report an empty
+                // read while no bytes are available. Treat that as a poll,
+                // not EOF, so a stalled peer still reaches the deadline.
+                #[cfg(windows)]
+                {
+                    wait_for_io(deadline)?;
+                    continue;
+                }
+                #[cfg(not(windows))]
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "single instance peer closed during handshake",
+                    ));
+                }
             }
             Ok(read) => buffer = &mut buffer[read..],
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
@@ -353,6 +364,12 @@ mod tests {
         let error = request_activation(&mut stream)
             .expect_err("a listener that sends no acknowledgement is not a running instance");
 
+        #[cfg(windows)]
+        assert!(matches!(
+            error.kind(),
+            io::ErrorKind::TimedOut | io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
+        ));
+        #[cfg(not(windows))]
         assert!(matches!(
             error.kind(),
             io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
