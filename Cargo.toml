@@ -1,6 +1,6 @@
 [package]
 name = "jshell"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 authors = ["JShell contributors"]
 description = "A cross-platform SSH, SFTP, serial, and local terminal workspace"
