@@ -1,6 +1,8 @@
 use crate::terminal::RenderCell;
 use gpui::Hsla;
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::DefaultHasher};
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 trait HslaExt {
     fn into_rgba_like(self, r: u8, g: u8, b: u8) -> Self;
@@ -175,20 +177,28 @@ fn highlight_keywords(
     keywords: &[&str],
     color: Hsla,
 ) {
+    // Case-insensitive matching without allocating a lower-cased copy of the row for
+    // every keyword. The previous version copied the entire row once per keyword, which
+    // made it the hottest allocation site while scrolling high-volume output.
+    let text_bytes = text.as_bytes();
     for &kw in keywords {
-        let kw_lower: Vec<u8> = kw.bytes().map(|b| b.to_ascii_lowercase()).collect();
-        let text_bytes = text.as_bytes();
-        let text_lower: Vec<u8> = text_bytes.iter().map(|b| b.to_ascii_lowercase()).collect();
+        let kw_bytes = kw.as_bytes();
+        if kw_bytes.is_empty() || kw_bytes.len() > text_bytes.len() {
+            continue;
+        }
         let mut start = 0;
-        while start + kw_lower.len() <= text_lower.len() {
-            if text_lower[start..].starts_with(&kw_lower) {
-                let abs = start;
-                let start_col = byte_to_col[abs];
-                let end_col = byte_to_col[(abs + kw.len() - 1).min(byte_to_col.len() - 1)];
+        while start + kw_bytes.len() <= text_bytes.len() {
+            let matched = text_bytes[start..start + kw_bytes.len()]
+                .iter()
+                .zip(kw_bytes)
+                .all(|(text_byte, kw_byte)| text_byte.eq_ignore_ascii_case(kw_byte));
+            if matched {
+                let start_col = byte_to_col[start];
+                let end_col = byte_to_col[(start + kw_bytes.len() - 1).min(byte_to_col.len() - 1)];
                 for c in start_col..=end_col {
                     map.entry((row_i32, c)).or_insert(color);
                 }
-                start = abs + kw.len();
+                start += kw_bytes.len();
             } else {
                 start += 1;
             }
@@ -280,522 +290,494 @@ fn highlight_http_codes(
     }
 }
 
-pub fn highlight_cells(cells: &[RenderCell], rows: usize) -> HashMap<(i32, i32), Hsla> {
-    let colors = highlight_colors();
+/// Highlight the keyword groups of a single rendered row.
+fn highlight_row(
+    map: &mut HashMap<(i32, i32), Hsla>,
+    text: &str,
+    byte_to_col: &[i32],
+    row_i32: i32,
+    colors: &HighlightColors,
+) {
+    // ── 1. Critical errors (highest priority) ──────────────
+    highlight_keywords(
+        map,
+        text,
+        byte_to_col,
+        row_i32,
+        &[
+            "PANIC",
+            "EMERGENCY",
+            "FATAL",
+            "SEGFAULT",
+            "CRITICAL",
+            "OOM",
+            "OUT OF MEMORY",
+            "KERNEL PANIC",
+            "CORE DUMPED",
+            "BUS ERROR",
+        ],
+        colors.critical,
+    );
 
-    let mut row_chars: Vec<Vec<(i32, char)>> = vec![Vec::with_capacity(128); rows];
-    for rc in cells {
-        if rc.row < 0 || (rc.row as usize) >= rows {
-            continue;
-        }
-        row_chars[rc.row as usize].push((rc.col, rc.cell.c));
-    }
-    for row in row_chars.iter_mut() {
-        row.sort_by_key(|&(col, _)| col);
-    }
+    // ── 2. Error keywords ──────────────────────────────────
+    highlight_keywords(
+        map,
+        text,
+        byte_to_col,
+        row_i32,
+        &["ERROR", "ERR"],
+        colors.error,
+    );
 
-    let mut map = HashMap::new();
+    // ── 3. Alert ───────────────────────────────────────────
+    highlight_keywords(map, text, byte_to_col, row_i32, &["ALERT"], colors.alert);
 
-    let mut chars_buf = String::with_capacity(128);
-    let mut byte_to_col: Vec<i32> = Vec::with_capacity(128);
+    // ── 4. Warning keywords ────────────────────────────────
+    highlight_keywords(
+        map,
+        text,
+        byte_to_col,
+        row_i32,
+        &["WARNING", "WARN"],
+        colors.warning,
+    );
 
-    for (row_idx, row) in row_chars.iter().enumerate() {
-        if row.is_empty() {
-            continue;
-        }
-        let row_i32 = row_idx as i32;
+    // ── 5. Info keywords ───────────────────────────────────
+    highlight_keywords(
+        map,
+        text,
+        byte_to_col,
+        row_i32,
+        &["INFO", "INFORMATION", "NOTICE"],
+        colors.info,
+    );
 
-        chars_buf.clear();
-        byte_to_col.clear();
+    // ── 6. Debug keywords ──────────────────────────────────
+    highlight_keywords(
+        map,
+        text,
+        byte_to_col,
+        row_i32,
+        &["DEBUG", "DBG", "TRACE"],
+        colors.debug,
+    );
 
-        for &(col, c) in row {
-            chars_buf.push(c);
-            while byte_to_col.len() < chars_buf.len() {
-                byte_to_col.push(col);
-            }
-        }
-        let text = chars_buf.as_str();
+    // ── 7. Success status ──────────────────────────────────
+    highlight_keywords(
+        map,
+        text,
+        byte_to_col,
+        row_i32,
+        &[
+            "SUCCESS",
+            "SUCCEEDED",
+            "SUCCESSFUL",
+            "PASSED",
+            "PASS",
+            "OK",
+            "DONE",
+            "COMPLETED",
+            "FINISHED",
+            "COMPLETE",
+        ],
+        colors.success,
+    );
 
-        // ── 1. Critical errors (highest priority) ──────────────
-        highlight_keywords(
-            &mut map,
-            text,
-            &byte_to_col,
-            row_i32,
-            &[
-                "PANIC",
-                "EMERGENCY",
-                "FATAL",
-                "SEGFAULT",
-                "CRITICAL",
-                "OOM",
-                "OUT OF MEMORY",
-                "KERNEL PANIC",
-                "CORE DUMPED",
-                "BUS ERROR",
-            ],
-            colors.critical,
-        );
+    // ── 8. Failure status ──────────────────────────────────
+    highlight_keywords(
+        map,
+        text,
+        byte_to_col,
+        row_i32,
+        &["FAILED", "FAILURE", "FAIL", "NOT OK"],
+        colors.failure,
+    );
 
-        // ── 2. Error keywords ──────────────────────────────────
-        highlight_keywords(
-            &mut map,
-            text,
-            &byte_to_col,
-            row_i32,
-            &["ERROR", "ERR"],
-            colors.error,
-        );
+    // ── 9. Pending / Waiting ───────────────────────────────
+    highlight_keywords(
+        map,
+        text,
+        byte_to_col,
+        row_i32,
+        &["PENDING", "WAITING", "PROCESSING", "IN PROGRESS", "QUEUED"],
+        colors.pending,
+    );
 
-        // ── 3. Alert ───────────────────────────────────────────
-        highlight_keywords(
-            &mut map,
-            text,
-            &byte_to_col,
-            row_i32,
-            &["ALERT"],
-            colors.alert,
-        );
+    // ── 10. Running / Active ───────────────────────────────
+    highlight_keywords(
+        map,
+        text,
+        byte_to_col,
+        row_i32,
+        &["RUNNING", "ACTIVE", "EXECUTING", "IN_PROGRESS", "LIVE"],
+        colors.running,
+    );
 
-        // ── 4. Warning keywords ────────────────────────────────
-        highlight_keywords(
-            &mut map,
-            text,
-            &byte_to_col,
-            row_i32,
-            &["WARNING", "WARN"],
-            colors.warning,
-        );
+    // ── 11. Stopped / Inactive ─────────────────────────────
+    highlight_keywords(
+        map,
+        text,
+        byte_to_col,
+        row_i32,
+        &["STOPPED", "INACTIVE", "HALTED", "IDLE", "PAUSED"],
+        colors.stopped,
+    );
 
-        // ── 5. Info keywords ───────────────────────────────────
-        highlight_keywords(
-            &mut map,
-            text,
-            &byte_to_col,
-            row_i32,
-            &["INFO", "INFORMATION", "NOTICE"],
-            colors.info,
-        );
+    // ── 12. Skipped ────────────────────────────────────────
+    highlight_keywords(
+        map,
+        text,
+        byte_to_col,
+        row_i32,
+        &["SKIPPED", "SKIP", "SKIPPING"],
+        colors.skipped,
+    );
 
-        // ── 6. Debug keywords ──────────────────────────────────
-        highlight_keywords(
-            &mut map,
-            text,
-            &byte_to_col,
-            row_i32,
-            &["DEBUG", "DBG", "TRACE"],
-            colors.debug,
-        );
+    // ── 13. Network UP ─────────────────────────────────────
+    highlight_keywords(
+        map,
+        text,
+        byte_to_col,
+        row_i32,
+        &[
+            "UP",
+            "ONLINE",
+            "CONNECTED",
+            "REACHABLE",
+            "LISTENING",
+            "ESTABLISHED",
+            "LINK UP",
+        ],
+        colors.network_up,
+    );
 
-        // ── 7. Success status ──────────────────────────────────
-        highlight_keywords(
-            &mut map,
-            text,
-            &byte_to_col,
-            row_i32,
-            &[
-                "SUCCESS",
-                "SUCCEEDED",
-                "SUCCESSFUL",
-                "PASSED",
-                "PASS",
-                "OK",
-                "DONE",
-                "COMPLETED",
-                "FINISHED",
-                "COMPLETE",
-            ],
-            colors.success,
-        );
+    // ── 14. Network DOWN ───────────────────────────────────
+    highlight_keywords(
+        map,
+        text,
+        byte_to_col,
+        row_i32,
+        &[
+            "DOWN",
+            "OFFLINE",
+            "UNREACHABLE",
+            "DISCONNECTED",
+            "NOT LISTENING",
+            "LINK DOWN",
+            "NO CARRIER",
+        ],
+        colors.network_down,
+    );
 
-        // ── 8. Failure status ──────────────────────────────────
-        highlight_keywords(
-            &mut map,
-            text,
-            &byte_to_col,
-            row_i32,
-            &["FAILED", "FAILURE", "FAIL", "NOT OK"],
-            colors.failure,
-        );
+    // ── 15. Timeout ────────────────────────────────────────
+    highlight_keywords(
+        map,
+        text,
+        byte_to_col,
+        row_i32,
+        &[
+            "TIMEOUT",
+            "TIMED OUT",
+            "TIMEOUTS",
+            "ETIMEDOUT",
+            "SLOW",
+            "LATENCY",
+        ],
+        colors.timeout,
+    );
 
-        // ── 9. Pending / Waiting ───────────────────────────────
-        highlight_keywords(
-            &mut map,
-            text,
-            &byte_to_col,
-            row_i32,
-            &["PENDING", "WAITING", "PROCESSING", "IN PROGRESS", "QUEUED"],
-            colors.pending,
-        );
+    // ── 16. Refused / Denied ───────────────────────────────
+    highlight_keywords(
+        map,
+        text,
+        byte_to_col,
+        row_i32,
+        &[
+            "REFUSED",
+            "REJECTED",
+            "DENIED",
+            "PERMISSION DENIED",
+            "ACCESS DENIED",
+            "FORBIDDEN",
+            "BLOCKED",
+            "DROP",
+        ],
+        colors.refused,
+    );
 
-        // ── 10. Running / Active ───────────────────────────────
-        highlight_keywords(
-            &mut map,
-            text,
-            &byte_to_col,
-            row_i32,
-            &["RUNNING", "ACTIVE", "EXECUTING", "IN_PROGRESS", "LIVE"],
-            colors.running,
-        );
+    // ── 17. Security / Protocol ────────────────────────────
+    highlight_keywords(
+        map,
+        text,
+        byte_to_col,
+        row_i32,
+        &[
+            "SSH",
+            "SSHD",
+            "SSL",
+            "TLS",
+            "HTTPS",
+            "CERTIFICATE",
+            "CERT",
+            "FIREWALL",
+            "IPTABLES",
+            "ACL",
+            "WAF",
+        ],
+        colors.security,
+    );
 
-        // ── 11. Stopped / Inactive ─────────────────────────────
-        highlight_keywords(
-            &mut map,
-            text,
-            &byte_to_col,
-            row_i32,
-            &["STOPPED", "INACTIVE", "HALTED", "IDLE", "PAUSED"],
-            colors.stopped,
-        );
+    // ── 18. Authentication ─────────────────────────────────
+    highlight_keywords(
+        map,
+        text,
+        byte_to_col,
+        row_i32,
+        &[
+            "AUTHENTICATED",
+            "ACCEPTED",
+            "AUTHORIZED",
+            "LOGIN",
+            "LOGOUT",
+            "LOGGED IN",
+            "LOGGED OUT",
+            "SESSION",
+        ],
+        colors.auth,
+    );
 
-        // ── 12. Skipped ────────────────────────────────────────
-        highlight_keywords(
-            &mut map,
-            text,
-            &byte_to_col,
-            row_i32,
-            &["SKIPPED", "SKIP", "SKIPPING"],
-            colors.skipped,
-        );
+    // ── 19. Danger (root/sudo/secrets) ─────────────────────
+    highlight_keywords(
+        map,
+        text,
+        byte_to_col,
+        row_i32,
+        &[
+            "ROOT",
+            "SUDO",
+            "UID=0",
+            "PASSWORD",
+            "SECRET",
+            "TOKEN",
+            "API_KEY",
+            "APIKEY",
+            "PRIVATE KEY",
+            "CREDENTIALS",
+        ],
+        colors.danger,
+    );
 
-        // ── 13. Network UP ─────────────────────────────────────
-        highlight_keywords(
-            &mut map,
-            text,
-            &byte_to_col,
-            row_i32,
-            &[
-                "UP",
-                "ONLINE",
-                "CONNECTED",
-                "REACHABLE",
-                "LISTENING",
-                "ESTABLISHED",
-                "LINK UP",
-            ],
-            colors.network_up,
-        );
+    // ── 20. Operations: Start ──────────────────────────────
+    highlight_keywords(
+        map,
+        text,
+        byte_to_col,
+        row_i32,
+        &[
+            "STARTED", "START", "STARTING", "BOOT", "BOOTING", "LAUNCHED", "LAUNCH",
+        ],
+        colors.started,
+    );
 
-        // ── 14. Network DOWN ───────────────────────────────────
-        highlight_keywords(
-            &mut map,
-            text,
-            &byte_to_col,
-            row_i32,
-            &[
-                "DOWN",
-                "OFFLINE",
-                "UNREACHABLE",
-                "DISCONNECTED",
-                "NOT LISTENING",
-                "LINK DOWN",
-                "NO CARRIER",
-            ],
-            colors.network_down,
-        );
+    // ── 21. Operations: Stop ───────────────────────────────
+    highlight_keywords(
+        map,
+        text,
+        byte_to_col,
+        row_i32,
+        &[
+            "STOPPED",
+            "STOP",
+            "STOPPING",
+            "SHUTDOWN",
+            "SHUTTING DOWN",
+            "TERMINATED",
+        ],
+        colors.stopped_op,
+    );
 
-        // ── 15. Timeout ────────────────────────────────────────
-        highlight_keywords(
-            &mut map,
-            text,
-            &byte_to_col,
-            row_i32,
-            &[
-                "TIMEOUT",
-                "TIMED OUT",
-                "TIMEOUTS",
-                "ETIMEDOUT",
-                "SLOW",
-                "LATENCY",
-            ],
-            colors.timeout,
-        );
+    // ── 22. Operations: Restart ────────────────────────────
+    highlight_keywords(
+        map,
+        text,
+        byte_to_col,
+        row_i32,
+        &[
+            "RESTARTED",
+            "RESTART",
+            "RESTARTING",
+            "RELOAD",
+            "RELOADED",
+            "RELOADING",
+        ],
+        colors.restart,
+    );
 
-        // ── 16. Refused / Denied ───────────────────────────────
-        highlight_keywords(
-            &mut map,
-            text,
-            &byte_to_col,
-            row_i32,
-            &[
-                "REFUSED",
-                "REJECTED",
-                "DENIED",
-                "PERMISSION DENIED",
-                "ACCESS DENIED",
-                "FORBIDDEN",
-                "BLOCKED",
-                "DROP",
-            ],
-            colors.refused,
-        );
+    // ── 23. Operations: Deploy ─────────────────────────────
+    highlight_keywords(
+        map,
+        text,
+        byte_to_col,
+        row_i32,
+        &[
+            "DEPLOYED",
+            "DEPLOYMENT",
+            "DEPLOYING",
+            "DEPLOY",
+            "ROLLBACK",
+            "ROLLED BACK",
+            "ROLLING BACK",
+            "UPGRADE",
+            "UPGRADED",
+        ],
+        colors.deploy,
+    );
 
-        // ── 17. Security / Protocol ────────────────────────────
-        highlight_keywords(
-            &mut map,
-            text,
-            &byte_to_col,
-            row_i32,
-            &[
-                "SSH",
-                "SSHD",
-                "SSL",
-                "TLS",
-                "HTTPS",
-                "CERTIFICATE",
-                "CERT",
-                "FIREWALL",
-                "IPTABLES",
-                "ACL",
-                "WAF",
-            ],
-            colors.security,
-        );
+    // ── 24. Operations: Crash ──────────────────────────────
+    highlight_keywords(
+        map,
+        text,
+        byte_to_col,
+        row_i32,
+        &[
+            "CRASH",
+            "CRASHED",
+            "CRASHING",
+            "SIGSEGV",
+            "SIGABRT",
+            "SIGKILL",
+            "DIED",
+            "EXITED",
+            "EXIT CODE",
+            "CORE DUMP",
+        ],
+        colors.crashed,
+    );
 
-        // ── 18. Authentication ─────────────────────────────────
-        highlight_keywords(
-            &mut map,
-            text,
-            &byte_to_col,
-            row_i32,
-            &[
-                "AUTHENTICATED",
-                "ACCEPTED",
-                "AUTHORIZED",
-                "LOGIN",
-                "LOGOUT",
-                "LOGGED IN",
-                "LOGGED OUT",
-                "SESSION",
-            ],
-            colors.auth,
-        );
+    // ── 25. Resources: Memory ──────────────────────────────
+    highlight_keywords(
+        map,
+        text,
+        byte_to_col,
+        row_i32,
+        &["MEMORY", "RAM", "HEAP", "STACK", "SWAP", "MEM"],
+        colors.memory,
+    );
 
-        // ── 19. Danger (root/sudo/secrets) ─────────────────────
-        highlight_keywords(
-            &mut map,
-            text,
-            &byte_to_col,
-            row_i32,
-            &[
-                "ROOT",
-                "SUDO",
-                "UID=0",
-                "PASSWORD",
-                "SECRET",
-                "TOKEN",
-                "API_KEY",
-                "APIKEY",
-                "PRIVATE KEY",
-                "CREDENTIALS",
-            ],
-            colors.danger,
-        );
+    // ── 26. Resources: CPU ─────────────────────────────────
+    highlight_keywords(
+        map,
+        text,
+        byte_to_col,
+        row_i32,
+        &[
+            "CPU",
+            "PROCESSOR",
+            "CORE",
+            "CORES",
+            "THREAD",
+            "THREADS",
+            "LOAD",
+        ],
+        colors.cpu,
+    );
 
-        // ── 20. Operations: Start ──────────────────────────────
-        highlight_keywords(
-            &mut map,
-            text,
-            &byte_to_col,
-            row_i32,
-            &[
-                "STARTED", "START", "STARTING", "BOOT", "BOOTING", "LAUNCHED", "LAUNCH",
-            ],
-            colors.started,
-        );
+    // ── 27. Resources: Disk ────────────────────────────────
+    highlight_keywords(
+        map,
+        text,
+        byte_to_col,
+        row_i32,
+        &[
+            "DISK",
+            "STORAGE",
+            "PARTITION",
+            "MOUNT",
+            "FILESYSTEM",
+            "INODE",
+            "IOPS",
+            "READ",
+            "WRITE",
+        ],
+        colors.disk,
+    );
 
-        // ── 21. Operations: Stop ───────────────────────────────
-        highlight_keywords(
-            &mut map,
-            text,
-            &byte_to_col,
-            row_i32,
-            &[
-                "STOPPED",
-                "STOP",
-                "STOPPING",
-                "SHUTDOWN",
-                "SHUTTING DOWN",
-                "TERMINATED",
-            ],
-            colors.stopped_op,
-        );
+    // ── 28. Dev: Exceptions ────────────────────────────────
+    highlight_keywords(
+        map,
+        text,
+        byte_to_col,
+        row_i32,
+        &[
+            "EXCEPTION",
+            "TRACEBACK",
+            "THROW",
+            "THROWN",
+            "STACKTRACE",
+            "TYPEERROR",
+            "VALUEERROR",
+            "KEYERROR",
+            "ATTRIBUTEERROR",
+            "INDEXERROR",
+            "RUNTIMEERROR",
+            "IOERROR",
+            "OSERROR",
+            "NULLPOINTER",
+            "NPE",
+            "SEGFAULT",
+        ],
+        colors.exception,
+    );
 
-        // ── 22. Operations: Restart ────────────────────────────
-        highlight_keywords(
-            &mut map,
-            text,
-            &byte_to_col,
-            row_i32,
-            &[
-                "RESTARTED",
-                "RESTART",
-                "RESTARTING",
-                "RELOAD",
-                "RELOADED",
-                "RELOADING",
-            ],
-            colors.restart,
-        );
+    // ── 29. Dev: Deprecated / TODO ─────────────────────────
+    highlight_keywords(
+        map,
+        text,
+        byte_to_col,
+        row_i32,
+        &[
+            "DEPRECATED",
+            "TODO",
+            "FIXME",
+            "HACK",
+            "XXX",
+            "WORKAROUND",
+            "TEMPORARY",
+        ],
+        colors.deprecated,
+    );
 
-        // ── 23. Operations: Deploy ─────────────────────────────
-        highlight_keywords(
-            &mut map,
-            text,
-            &byte_to_col,
-            row_i32,
-            &[
-                "DEPLOYED",
-                "DEPLOYMENT",
-                "DEPLOYING",
-                "DEPLOY",
-                "ROLLBACK",
-                "ROLLED BACK",
-                "ROLLING BACK",
-                "UPGRADE",
-                "UPGRADED",
-            ],
-            colors.deploy,
-        );
+    // ── 30. HTTP status codes ──────────────────────────────
+    highlight_http_codes(map, text, byte_to_col, row_i32, colors);
 
-        // ── 24. Operations: Crash ──────────────────────────────
-        highlight_keywords(
-            &mut map,
-            text,
-            &byte_to_col,
-            row_i32,
-            &[
-                "CRASH",
-                "CRASHED",
-                "CRASHING",
-                "SIGSEGV",
-                "SIGABRT",
-                "SIGKILL",
-                "DIED",
-                "EXITED",
-                "EXIT CODE",
-                "CORE DUMP",
-            ],
-            colors.crashed,
-        );
-
-        // ── 25. Resources: Memory ──────────────────────────────
-        highlight_keywords(
-            &mut map,
-            text,
-            &byte_to_col,
-            row_i32,
-            &["MEMORY", "RAM", "HEAP", "STACK", "SWAP", "MEM"],
-            colors.memory,
-        );
-
-        // ── 26. Resources: CPU ─────────────────────────────────
-        highlight_keywords(
-            &mut map,
-            text,
-            &byte_to_col,
-            row_i32,
-            &[
-                "CPU",
-                "PROCESSOR",
-                "CORE",
-                "CORES",
-                "THREAD",
-                "THREADS",
-                "LOAD",
-            ],
-            colors.cpu,
-        );
-
-        // ── 27. Resources: Disk ────────────────────────────────
-        highlight_keywords(
-            &mut map,
-            text,
-            &byte_to_col,
-            row_i32,
-            &[
-                "DISK",
-                "STORAGE",
-                "PARTITION",
-                "MOUNT",
-                "FILESYSTEM",
-                "INODE",
-                "IOPS",
-                "READ",
-                "WRITE",
-            ],
-            colors.disk,
-        );
-
-        // ── 28. Dev: Exceptions ────────────────────────────────
-        highlight_keywords(
-            &mut map,
-            text,
-            &byte_to_col,
-            row_i32,
-            &[
-                "EXCEPTION",
-                "TRACEBACK",
-                "THROW",
-                "THROWN",
-                "STACKTRACE",
-                "TYPEERROR",
-                "VALUEERROR",
-                "KEYERROR",
-                "ATTRIBUTEERROR",
-                "INDEXERROR",
-                "RUNTIMEERROR",
-                "IOERROR",
-                "OSERROR",
-                "NULLPOINTER",
-                "NPE",
-                "SEGFAULT",
-            ],
-            colors.exception,
-        );
-
-        // ── 29. Dev: Deprecated / TODO ─────────────────────────
-        highlight_keywords(
-            &mut map,
-            text,
-            &byte_to_col,
-            row_i32,
-            &[
-                "DEPRECATED",
-                "TODO",
-                "FIXME",
-                "HACK",
-                "XXX",
-                "WORKAROUND",
-                "TEMPORARY",
-            ],
-            colors.deprecated,
-        );
-
-        // ── 30. HTTP status codes ──────────────────────────────
-        highlight_http_codes(&mut map, text, &byte_to_col, row_i32, &colors);
-
-        // ── 31. IP addresses ───────────────────────────────────
-        for m in find_ip_addresses(text) {
-            let ip_len = find_ip_len(&text[m..]);
-            let start_col = byte_to_col[m];
-            let end_col = byte_to_col[(m + ip_len - 1).min(byte_to_col.len() - 1)];
-            for c in start_col..=end_col {
-                map.entry((row_i32, c)).or_insert(colors.network);
-            }
-        }
-
-        // ── 33. Port numbers ───────────────────────────────────
-        for m in find_ports(text) {
-            let port_len = find_port_len(&text[m..]);
-            let start_col = byte_to_col[m];
-            let end_col = byte_to_col[(m + port_len - 1).min(byte_to_col.len() - 1)];
-            for c in start_col..=end_col {
-                map.entry((row_i32, c)).or_insert(colors.port);
-            }
+    // ── 31. IP addresses ───────────────────────────────────
+    for m in find_ip_addresses(text) {
+        let ip_len = find_ip_len(&text[m..]);
+        let start_col = byte_to_col[m];
+        let end_col = byte_to_col[(m + ip_len - 1).min(byte_to_col.len() - 1)];
+        for c in start_col..=end_col {
+            map.entry((row_i32, c)).or_insert(colors.network);
         }
     }
-    // ── 32. URLs (Logical lines for wrapping support) ───────────
+
+    // ── 33. Port numbers ───────────────────────────────────
+    for m in find_ports(text) {
+        let port_len = find_port_len(&text[m..]);
+        let start_col = byte_to_col[m];
+        let end_col = byte_to_col[(m + port_len - 1).min(byte_to_col.len() - 1)];
+        for c in start_col..=end_col {
+            map.entry((row_i32, c)).or_insert(colors.port);
+        }
+    }
+}
+
+/// Highlight URLs across logical lines so wrapped rows are still detected.
+fn highlight_urls(
+    map: &mut HashMap<(i32, i32), Hsla>,
+    cells: &[RenderCell],
+    rows: usize,
+    colors: &HighlightColors,
+) {
     let logical_lines = build_logical_lines(cells, rows);
     for line in &logical_lines {
         let text = line.text.as_str();
@@ -810,7 +792,136 @@ pub fn highlight_cells(cells: &[RenderCell], rows: usize) -> HashMap<(i32, i32),
             }
         }
     }
+}
 
+/// Uncached entry point kept for tests; production paths use [`highlight_cells_cached`].
+#[cfg(test)]
+pub fn highlight_cells(cells: &[RenderCell], rows: usize) -> HashMap<(i32, i32), Hsla> {
+    let mut cache = HighlightCache::default();
+    let shared = highlight_cells_cached(&mut cache, cells, rows);
+    Arc::try_unwrap(shared).unwrap_or_else(|shared| (*shared).clone())
+}
+
+/// Cached keyword highlighting, keyed per rendered row.
+///
+/// A terminal redraws far more often than its content changes (cursor blink, hover,
+/// SFTP progress), and the uncached implementation re-scanned every row for ~30 keyword
+/// groups on every frame. Rows are now keyed by a content signature: only rows whose
+/// text changed are re-scanned, and a frame where nothing changed returns the cached map
+/// without rebuilding it. The map is shared through `Arc`, so snapshot clones are cheap.
+#[derive(Default)]
+pub struct HighlightCache {
+    rows: Vec<RowHighlights>,
+    map: Option<Arc<HashMap<(i32, i32), Hsla>>>,
+    recomputed: usize,
+}
+
+#[derive(Default, Clone)]
+struct RowHighlights {
+    valid: bool,
+    /// 64-bit hash of the row's `(column, character)` pairs. Rows are compared by this
+    /// signature instead of by text so an unchanged frame costs no allocation; a hash
+    /// collision would at worst reuse the previous highlighting for an identical-looking
+    /// row, never corrupt the buffer or the terminal state.
+    signature: u64,
+    entries: Vec<((i32, i32), Hsla)>,
+}
+
+impl HighlightCache {
+    /// Rows re-scanned by the most recent call. Test-only observability.
+    #[cfg(test)]
+    pub(crate) fn recomputed_rows(&self) -> usize {
+        self.recomputed
+    }
+}
+
+pub fn highlight_cells_cached(
+    cache: &mut HighlightCache,
+    cells: &[RenderCell],
+    rows: usize,
+) -> Arc<HashMap<(i32, i32), Hsla>> {
+    let colors = highlight_colors();
+
+    let mut row_chars: Vec<Vec<(i32, char)>> = vec![Vec::new(); rows];
+    for rc in cells {
+        if rc.row < 0 || (rc.row as usize) >= rows {
+            continue;
+        }
+        row_chars[rc.row as usize].push((rc.col, rc.cell.c));
+    }
+
+    if cache.rows.len() != rows {
+        cache.rows.resize_with(rows, RowHighlights::default);
+        cache.rows.truncate(rows);
+    }
+
+    let mut chars_buf = String::with_capacity(128);
+    let mut byte_to_col: Vec<i32> = Vec::with_capacity(128);
+    let mut recomputed = 0usize;
+    let mut changed = false;
+
+    for (row_idx, row) in row_chars.iter_mut().enumerate() {
+        let mut hasher = DefaultHasher::new();
+        for &(col, c) in row.iter() {
+            col.hash(&mut hasher);
+            c.hash(&mut hasher);
+        }
+        let signature = hasher.finish();
+
+        let cached = &mut cache.rows[row_idx];
+        if cached.valid && cached.signature == signature {
+            continue;
+        }
+
+        changed = true;
+        recomputed += 1;
+
+        if row.is_empty() {
+            cached.valid = true;
+            cached.signature = signature;
+            cached.entries.clear();
+            continue;
+        }
+
+        row.sort_by_key(|&(col, _)| col);
+        chars_buf.clear();
+        byte_to_col.clear();
+        for &(col, c) in row.iter() {
+            chars_buf.push(c);
+            while byte_to_col.len() < chars_buf.len() {
+                byte_to_col.push(col);
+            }
+        }
+
+        let mut entries = HashMap::new();
+        highlight_row(
+            &mut entries,
+            chars_buf.as_str(),
+            &byte_to_col,
+            row_idx as i32,
+            &colors,
+        );
+        cached.valid = true;
+        cached.signature = signature;
+        cached.entries = entries.into_iter().collect();
+    }
+
+    if !changed && let Some(map) = cache.map.as_ref() {
+        cache.recomputed = 0;
+        return map.clone();
+    }
+
+    let mut map = HashMap::new();
+    for row in &cache.rows {
+        for (key, color) in &row.entries {
+            map.entry(*key).or_insert(*color);
+        }
+    }
+    highlight_urls(&mut map, cells, rows, &colors);
+
+    let map = Arc::new(map);
+    cache.map = Some(map.clone());
+    cache.recomputed = recomputed;
     map
 }
 
@@ -1223,5 +1334,124 @@ mod tests {
         assert_eq!(url, "http://example.com/x");
         assert_eq!(url_cells.first(), Some(&(0, 3)));
         assert_eq!(url_cells.last(), Some(&(1, 9)));
+    }
+
+    fn sample_cells() -> Vec<RenderCell> {
+        let mut cells = Vec::new();
+        for (row, text) in ["ERROR one", "ok", "WARNING http://example.com:22"]
+            .iter()
+            .enumerate()
+        {
+            cells.extend(
+                text.chars()
+                    .enumerate()
+                    .map(|(col, c)| cell_at(row as i32, col as i32, c, false)),
+            );
+        }
+        cells
+    }
+
+    #[test]
+    #[ignore = "manual micro-benchmark; run with: cargo test -- --ignored --nocapture"]
+    fn bench_cached_vs_uncached_highlighting() {
+        use std::time::Instant;
+
+        const ROWS: usize = 40;
+        let lines: Vec<String> = (0..ROWS)
+            .map(|index| {
+                format!(
+                    "{index:02} 2026-10-22T10:00:00Z ERROR request failed host=10.0.0.{} \
+                     port=22 url=http://example.com/path status=500",
+                    index % 200
+                )
+            })
+            .collect();
+
+        let mut cells: Vec<RenderCell> = Vec::new();
+        for (row, line) in lines.iter().enumerate() {
+            cells.extend(
+                line.chars()
+                    .take(120)
+                    .enumerate()
+                    .map(|(col, c)| cell_at(row as i32, col as i32, c, false)),
+            );
+        }
+
+        const ITERATIONS: u32 = 200;
+
+        let start = Instant::now();
+        for _ in 0..ITERATIONS {
+            let _ = highlight_cells(&cells, ROWS);
+        }
+        let uncached = start.elapsed();
+
+        let mut cache = HighlightCache::default();
+        let last_row_start = cells
+            .iter()
+            .position(|cell| cell.row == ROWS as i32 - 1)
+            .unwrap();
+        let start = Instant::now();
+        for iteration in 0..ITERATIONS {
+            // One line of new output per frame, like `tail -f` on a busy log.
+            cells[last_row_start].cell.c = if iteration % 2 == 0 { 'X' } else { 'Y' };
+            let _ = highlight_cells_cached(&mut cache, &cells, ROWS);
+        }
+        let cached = start.elapsed();
+
+        println!("full scan     : {:?}/frame", uncached / ITERATIONS);
+        println!("1-row update  : {:?}/frame", cached / ITERATIONS);
+        println!(
+            "speedup       : {:.1}x",
+            uncached.as_secs_f64() / cached.as_secs_f64()
+        );
+
+        assert!(
+            cached < uncached,
+            "row cache must be faster than a full scan"
+        );
+    }
+
+    #[test]
+    fn cached_highlighting_recomputes_only_changed_rows() {
+        let mut cells = sample_cells();
+        let mut cache = HighlightCache::default();
+
+        let first = highlight_cells_cached(&mut cache, &cells, 3);
+        assert_eq!(cache.recomputed_rows(), 3, "first pass scans every row");
+        assert!(!first.is_empty(), "sample text contains highlights");
+
+        let second = highlight_cells_cached(&mut cache, &cells, 3);
+        assert_eq!(
+            cache.recomputed_rows(),
+            0,
+            "unchanged frame reuses the cache"
+        );
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "unchanged frames must share the cached map instead of cloning it"
+        );
+
+        // Touch a single character in the last row: only that row may be re-scanned.
+        let last_row_start = cells.iter().position(|cell| cell.row == 2).unwrap();
+        cells[last_row_start].cell.c = 'E';
+        let third = highlight_cells_cached(&mut cache, &cells, 3);
+        assert_eq!(
+            cache.recomputed_rows(),
+            1,
+            "only the modified row is re-scanned"
+        );
+        assert!(
+            !Arc::ptr_eq(&second, &third),
+            "changed content rebuilds the map"
+        );
+    }
+
+    #[test]
+    fn cached_highlighting_matches_uncached_results() {
+        let cells = sample_cells();
+        let expected = highlight_cells(&cells, 3);
+        let mut cache = HighlightCache::default();
+        let cached = highlight_cells_cached(&mut cache, &cells, 3);
+        assert_eq!(&*cached, &expected);
     }
 }

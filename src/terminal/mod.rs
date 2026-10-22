@@ -19,12 +19,7 @@ use crate::session::config::Session;
 use crate::sftp::{PreviewData, RemoteEntry};
 use crate::system::SystemSnapshot;
 
-type HighlightCache = std::cell::RefCell<
-    Option<(
-        Vec<RenderCell>,
-        std::collections::HashMap<(i32, i32), gpui::Hsla>,
-    )>,
->;
+type HighlightCache = std::cell::RefCell<crate::terminal::highlight::HighlightCache>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TabKind {
@@ -239,7 +234,7 @@ pub struct RenderSnapshot {
     pub history_size: usize,
     pub rows: usize,
     pub cols: usize,
-    pub highlights: std::collections::HashMap<(i32, i32), gpui::Hsla>,
+    pub highlights: std::sync::Arc<std::collections::HashMap<(i32, i32), gpui::Hsla>>,
 }
 
 #[derive(Clone, Copy)]
@@ -538,7 +533,7 @@ impl TerminalTab {
             rows: 30,
             backend: shared_backend,
             scroll_pixel_y: 0.0,
-            highlight_cache: std::cell::RefCell::new(None),
+            highlight_cache: std::cell::RefCell::new(Default::default()),
         }
     }
 
@@ -632,23 +627,14 @@ impl TerminalTab {
             });
         }
 
-        // Get highlights from cache or recompute, only if keyword_highlight is enabled.
-        let is_enabled = keyword_highlight;
-
-        let highlights = if is_enabled {
+        // Keyword highlights are cached per row; only rows whose content changed are
+        // re-scanned, and the map is shared through an `Arc` so cloning a snapshot no
+        // longer duplicates it on every frame.
+        let highlights = if keyword_highlight {
             let mut cache = self.highlight_cache.borrow_mut();
-            let cache_valid = cache
-                .as_ref()
-                .is_some_and(|(cached_cells, _)| cached_cells == &cells);
-            if cache_valid {
-                cache.as_ref().unwrap().1.clone()
-            } else {
-                let computed = self::highlight::highlight_cells(&cells, rows as usize);
-                *cache = Some((cells.clone(), computed.clone()));
-                computed
-            }
+            self::highlight::highlight_cells_cached(&mut cache, &cells, rows as usize)
         } else {
-            std::collections::HashMap::new()
+            std::sync::Arc::new(std::collections::HashMap::new())
         };
 
         RenderSnapshot {

@@ -401,11 +401,11 @@ impl TerminalElement {
         let mut underlines = Vec::new();
         let mut current_run: Option<BatchedTextRun> = None;
 
-        // Retrieve cached keyword highlights and merge with search highlights
-        let mut highlights = self.snapshot.highlights.clone();
-        if let Some(sm) = self.search_highlights.as_ref() {
-            highlights.extend(sm.iter().map(|(k, v)| (*k, *v)));
-        }
+        // Keyword highlights are shared through the snapshot; search highlights are
+        // small and override them. Look both up per cell instead of merging two maps
+        // into a third one on every frame.
+        let keyword_highlights = self.snapshot.highlights.as_ref();
+        let search_highlights = self.search_highlights.as_ref();
 
         for render_cell in &self.snapshot.cells {
             let cell = &render_cell.cell;
@@ -444,7 +444,11 @@ impl TerminalElement {
             let mut style = self.cell_run_style(cell, cx);
 
             // Apply keyword highlight color if this cell was matched.
-            if let Some(&hl_color) = highlights.get(&(render_cell.row, render_cell.col)) {
+            if let Some(hl_color) = search_highlights
+                .and_then(|highlights| highlights.get(&(render_cell.row, render_cell.col)))
+                .or_else(|| keyword_highlights.get(&(render_cell.row, render_cell.col)))
+                .copied()
+            {
                 style.color = hl_color;
             }
 
