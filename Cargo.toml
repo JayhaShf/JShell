@@ -55,7 +55,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "local-time", "time"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 walkdir = "2"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 image = { version = "0.25.9", default-features = false, features = ["png"] }
 futures = "0.3.32"
 zeroize = "1.8"
@@ -73,7 +73,7 @@ hex = "0.4"
 serialport = "4"
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
-rustls = { version = "=0.23.40", default-features = false, features = ["ring", "std", "tls12"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "=0.8.4"
 sha1 = "0.10"
 sha2 = "0.10"
