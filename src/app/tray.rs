@@ -179,10 +179,15 @@ impl TrayController {
                 // Pump the thread's main context so both GTK and D-Bus sources
                 // are processed: the StatusNotifier registration and menu events
                 // are delivered over D-Bus, which `gtk::events_pending()` ignores.
+                //
+                // Poll instead of blocking because the events may arrive on a context
+                // other than `MainContext::default()`. Sleep longer when the previous
+                // iteration dispatched nothing: an idle tray wakes the CPU ~20 times per
+                // second instead of ~125, while an active menu still gets 8 ms latency.
                 let main_context = gtk::glib::MainContext::default();
                 while !thread_shutdown.load(Ordering::Relaxed) {
-                    main_context.iteration(false);
-                    std::thread::sleep(std::time::Duration::from_millis(8));
+                    let interval = linux_tray_poll_interval(main_context.iteration(false));
+                    std::thread::sleep(std::time::Duration::from_millis(interval));
                 }
                 drop(icon);
             })
@@ -204,6 +209,15 @@ impl TrayController {
     }
 }
 
+/// Poll interval for the Linux tray pump: stay responsive for a few milliseconds after
+/// dispatching events, then back off while the tray is idle.
+///
+/// Compiled for tests on every platform so the backoff stays covered where GTK is absent.
+#[cfg(any(target_os = "linux", test))]
+fn linux_tray_poll_interval(dispatched_events: bool) -> u64 {
+    if dispatched_events { 8 } else { 50 }
+}
+
 impl Drop for TrayController {
     fn drop(&mut self) {
         clear_request_tx();
@@ -214,5 +228,20 @@ impl Drop for TrayController {
                 let _ = thread.join();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn idle_tray_polling_backs_off_but_stays_responsive() {
+        assert_eq!(linux_tray_poll_interval(true), 8);
+        assert_eq!(linux_tray_poll_interval(false), 50);
+        assert!(
+            linux_tray_poll_interval(false) > linux_tray_poll_interval(true),
+            "an idle tray must poll more slowly than one that just dispatched events"
+        );
     }
 }
