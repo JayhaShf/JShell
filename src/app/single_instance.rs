@@ -154,14 +154,27 @@ struct ConnectionPermit {
 
 impl ConnectionPermit {
     fn try_acquire(active: &Arc<AtomicUsize>) -> Option<Self> {
-        active
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                (current < MAX_ACTIVE_CONNECTIONS).then_some(current + 1)
-            })
-            .ok()?;
-        Some(Self {
-            active: Arc::clone(active),
-        })
+        // Hand-rolled compare-exchange loop instead of `fetch_update`: the latter is
+        // deprecated on newer toolchains and its replacement is newer than our MSRV.
+        let mut current = active.load(Ordering::Acquire);
+        loop {
+            if current >= MAX_ACTIVE_CONNECTIONS {
+                return None;
+            }
+            match active.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(Self {
+                        active: Arc::clone(active),
+                    });
+                }
+                Err(observed) => current = observed,
+            }
+        }
     }
 }
 
