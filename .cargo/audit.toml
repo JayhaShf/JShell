@@ -1,7 +1,7 @@
 # cargo-audit 豁免配置（CI 使用 `cargo audit --deny warnings --file Cargo.lock`）。
 #
-# 当前锁文件包含 9 条「unmaintained」和 1 条「unsound」警告级告警。
-# 前者来自 Linux 托盘的 GTK3 依赖链及构建期宏传递依赖；后者是
+# 当前锁文件包含若干「unmaintained」「yanked」和 1 条「unsound」警告级告警。
+# 前者来自 Linux 托盘的 GTK3 依赖链、D-Bus 拼装 crate 及构建期宏传递依赖；后者是
 # glib 0.18 中 VariantStrIter 的迭代方法可能触发未定义行为。项目源码
 # 与当前 Linux 托盘路径未直接调用受影响方法，但 GTK3 依赖链尚无法
 # 升级到已修复的 glib 0.20，因此仍作为残余风险记录。Windows/macOS
@@ -26,4 +26,12 @@ ignore = [
     "RUSTSEC-2024-0370", # proc-macro-error
     # glib 0.18 VariantStrIter 迭代方法的未定义行为（Linux GTK3 链）
     "RUSTSEC-2024-0429", # glib; fixed in 0.20, current code has no direct call
+    # 2026-10 依赖刷新后并入 zbus 的 D-Bus 拼装 crate：zvariant/zbus_names 自 zbus
+    # 6.0.0 起合并进 zbus 本体，但 keyring 4 的 zbus 安全存储后端与 secret-service 5
+    # 仍固定依赖 zbus 5，上游尚无 zbus 6 版本可迁移。仅影响 Linux 安全存储链，
+    # Windows/macOS 产物不引入；迁移前作为残余风险记录。
+    "RUSTSEC-2026-0370", # zvariant
+    "RUSTSEC-2026-0371", # zbus_names
+    "RUSTSEC-2026-0372", # zvariant_derive
 ]
+
