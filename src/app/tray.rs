@@ -1,7 +1,12 @@
 use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    Mutex,
     mpsc::{self, Receiver, Sender},
+};
+
+#[cfg(target_os = "linux")]
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
 };
 
 use rust_i18n::t;

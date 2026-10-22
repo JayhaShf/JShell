@@ -88,7 +88,12 @@ pub(crate) fn acquire() -> AcquireOutcome {
     }
 
     // The lock could not be established: run unlocked instead of failing to start.
-    tracing::warn!("could not establish single instance lock, running unlocked");
+    // This is deliberately fail-open (startability beats strict exclusivity), but it
+    // must be loud: two instances share the same config file and tray menu.
+    tracing::error!(
+        "could not establish the single instance lock after {ACQUIRE_ATTEMPTS} attempts; \
+         continuing without it, so multiple JShell instances may run at the same time"
+    );
     AcquireOutcome::First(closed_receiver())
 }
 

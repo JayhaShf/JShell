@@ -1,4 +1,4 @@
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::Receiver;
 
 /// Installs termination signal handling (SIGINT/SIGTERM on Unix) and returns a
 /// channel that delivers a notification when the process is asked to shut down.
@@ -10,6 +10,7 @@ pub(crate) fn install() -> Option<Receiver<()>> {
     #[cfg(unix)]
     {
         use signal_hook::consts::{SIGINT, SIGTERM};
+        use std::sync::mpsc;
         let mut signals = match signal_hook::iterator::Signals::new([SIGINT, SIGTERM]) {
             Ok(signals) => signals,
             Err(error) => {
