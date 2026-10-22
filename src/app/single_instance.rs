@@ -221,9 +221,135 @@ fn verify_peer_user(stream: &LocalSocketStream) -> io::Result<()> {
             ));
         }
     }
-    #[cfg(not(unix))]
+    // The named pipe ACL already limits connections to the creating user, administrators
+    // and SYSTEM. Verify the actual process owner as well so an administrator or a
+    // service cannot make another user's window pop up by sending an activation request.
+    #[cfg(windows)]
+    {
+        let peer_pid = stream.peer_creds()?.pid().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "single instance peer has no process id",
+            )
+        })?;
+        match peer_shares_current_user(peer_pid) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "single instance peer belongs to another user",
+                ));
+            }
+            Err(error) => {
+                // Fail open on API errors: querying the token of a process in another
+                // integrity level can be denied even for the same user, and the pipe
+                // ACL is still the primary boundary.
+                tracing::warn!(
+                    "could not verify the single instance peer's user ({error}); \
+                     relying on the named pipe ACL"
+                );
+            }
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     let _ = stream;
     Ok(())
+}
+
+/// Returns whether `peer_pid` runs as the same user as the current process.
+///
+/// Only available on Windows, where the local socket exposes the peer's process id but no
+/// user id. Fails with an I/O error when the peer's token cannot be queried.
+#[cfg(windows)]
+fn peer_shares_current_user(peer_pid: u32) -> io::Result<bool> {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::{
+        CopySid, EqualSid, GetLengthSid, GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    /// Closes a Win32 handle when it goes out of scope.
+    struct OwnedHandle(HANDLE);
+    impl Drop for OwnedHandle {
+        fn drop(&mut self) {
+            // SAFETY: the handle is owned by this wrapper and closed exactly once.
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    fn open_process_token(process: HANDLE) -> io::Result<OwnedHandle> {
+        let mut token: HANDLE = std::ptr::null_mut();
+        // SAFETY: `process` is a live handle and `token` is a valid out-pointer.
+        let opened = unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) };
+        if opened == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(OwnedHandle(token))
+    }
+
+    /// Copies the token's user SID into an owned, suitably aligned buffer.
+    fn user_sid(token: HANDLE) -> io::Result<Vec<usize>> {
+        let mut needed = 0u32;
+        // First call sized the buffer; a zero length is expected to fail with
+        // ERROR_INSUFFICIENT_BUFFER and only `needed` matters here.
+        // SAFETY: passing a null buffer with length 0 is the documented sizing query.
+        unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed) };
+        if needed == 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let mut buffer = vec![0usize; (needed as usize).div_ceil(std::mem::size_of::<usize>())];
+        // SAFETY: the buffer is at least `needed` bytes and aligned for `TOKEN_USER`
+        // because `usize` has the same alignment as the pointer members it contains.
+        let filled = unsafe {
+            GetTokenInformation(
+                token,
+                TokenUser,
+                buffer.as_mut_ptr().cast(),
+                needed,
+                &mut needed,
+            )
+        };
+        if filled == 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        // SAFETY: on success the buffer holds a `TOKEN_USER` whose `Sid` points inside it.
+        let sid = unsafe { (*(buffer.as_ptr() as *const TOKEN_USER)).User.Sid };
+        // SAFETY: `sid` is a valid SID produced by the API above.
+        let sid_len = unsafe { GetLengthSid(sid) };
+        let mut owned = vec![0usize; (sid_len as usize).div_ceil(std::mem::size_of::<usize>())];
+        // SAFETY: `owned` is large enough for `sid_len` bytes and aligned for a SID.
+        let copied = unsafe { CopySid(sid_len, owned.as_mut_ptr().cast(), sid) };
+        if copied == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(owned)
+    }
+
+    // SAFETY: plain Win32 call; the returned handle is checked before use.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, peer_pid) };
+    if process.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let process = OwnedHandle(process);
+
+    let peer_sid = user_sid(open_process_token(process.0)?.0)?;
+    // `GetCurrentProcess` returns a pseudo-handle that must not be closed; the token
+    // opened from it is a real handle owned by `OwnedHandle`.
+    // SAFETY: `GetCurrentProcess` takes no arguments and always succeeds.
+    let current_sid = user_sid(open_process_token(unsafe { GetCurrentProcess() })?.0)?;
+
+    // SAFETY: both buffers contain SIDs copied by `CopySid`.
+    let same = unsafe {
+        EqualSid(
+            peer_sid.as_ptr().cast_mut().cast(),
+            current_sid.as_ptr().cast_mut().cast(),
+        )
+    };
+    Ok(same != 0)
 }
 
 fn read_exact_until<R: Read>(
@@ -445,5 +571,23 @@ mod tests {
         drop(permits);
         assert_eq!(active.load(Ordering::Acquire), 0);
         assert!(ConnectionPermit::try_acquire(&active).is_some());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn peer_process_of_the_same_user_is_accepted() {
+        assert!(
+            peer_shares_current_user(std::process::id())
+                .expect("querying the current process token must succeed"),
+            "a peer in this process must share the current user"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unqueryable_peer_process_surfaces_an_error() {
+        // PID 0 is the System Idle Process and cannot be opened without kernel privileges;
+        // the caller treats this as "cannot verify" rather than "same user".
+        assert!(peer_shares_current_user(0).is_err());
     }
 }

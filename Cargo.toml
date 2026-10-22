@@ -89,6 +89,13 @@ serde_yaml = "0.9"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 winreg = "0.52"
+# Used to verify that a single-instance activation request comes from a process owned by
+# the same user (the named pipe ACL alone also admits administrators and SYSTEM).
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18"
