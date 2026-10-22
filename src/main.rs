@@ -96,7 +96,7 @@ mod tests {
             .join(name);
         let content = std::fs::read_to_string(&path)
             .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
-        serde_yaml::from_str::<BTreeMap<String, String>>(&content)
+        serde_saphyr::from_str::<BTreeMap<String, String>>(&content)
             .unwrap_or_else(|err| panic!("failed to parse {}: {err}", path.display()))
     }
 

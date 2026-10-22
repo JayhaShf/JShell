@@ -42,7 +42,7 @@ portable-pty = "0.9"
 rfd = "0.15"
 russh = { version = "0.60.3", git = "https://github.com/JayhaShf/russh.git", rev = "705e92dfb551e458d376016ecc83f43be71b0aa1", default-features = false, features = ["ring", "flate2", "rsa"] }
 russh-sftp = "2"
-rust-i18n = "3"
+rust-i18n = "4"
 sys-locale = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -60,7 +60,7 @@ image = { version = "0.25.9", default-features = false, features = ["png"] }
 futures = "0.3.32"
 zeroize = "1.8"
 libc = "0.2"
-keyring = { version = "3.6.3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust", "vendored"] }
+keyring = "4"
 open = "5.1"
 time = { version = "0.3.47", features = ["formatting", "local-offset"] }
 tracing-appender = "0.2.5"
@@ -85,7 +85,7 @@ signal-hook = "0.4"
 [dev-dependencies]
 libc = "0.2"
 rcgen = "0.13"
-serde_yaml = "0.9"
+serde-saphyr = "2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 winreg = "0.52"
